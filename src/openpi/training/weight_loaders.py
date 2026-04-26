@@ -43,15 +43,25 @@ class CheckpointWeightLoader(WeightLoader):
         example: "./checkpoints/<config>/<exp>/<step>/params"
       released checkpoints:
         example: "gs://openpi-assets/checkpoints/<model>/params"
+
+    missing_regex: regex for params absent in the checkpoint that should fall back to
+      random-initialised values from the model. Defaults to ".*" so that any new params
+      (e.g. meta-action head weights) not present in a pre-trained checkpoint are kept at
+      their random init rather than causing a structural-mismatch error. Use ".*lora.*" to
+      restrict fallback to LoRA weights only when loading a non-meta checkpoint into a
+      non-meta model.
     """
 
     params_path: str
+    missing_regex: str = ".*"
 
     def load(self, params: at.Params) -> at.Params:
         # We are loading np.ndarray and relying on the training code to properly convert and shard the params.
         loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        # Add all missing LoRA weights.
-        return _merge_params(loaded_params, params, missing_regex=".*lora.*")
+        # Any params absent from the checkpoint (e.g. new meta-action head weights) fall back
+        # to their random-initialised ShapeDtypeStruct; _load_weights_and_validate will strip
+        # those out so the model keeps its random init for those keys.
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
 
 
 @dataclasses.dataclass(frozen=True)
