@@ -971,7 +971,7 @@ _CONFIGS = [
             action_horizon=50,
         ),
         data=LeRobotXTrainerMetaDataConfig(
-            repo_id=".",
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/tool_adaptation/black_ring_hook60_stick10_10_noised_meta_delta",
             base_config=DataConfig(prompt_from_task=True),
             output_action_dim=32,
             max_meta_areas=1,
@@ -979,7 +979,7 @@ _CONFIGS = [
             default_prompt="use the tool affordance to complete the task",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
-        num_train_steps=80_000,
+        num_train_steps=50_000,
         batch_size=32,
     ),
     TrainConfig(
