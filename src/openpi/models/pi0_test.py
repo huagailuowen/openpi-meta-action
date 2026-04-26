@@ -44,3 +44,22 @@ def test_pi0_all_lora():
     assert len(state) == 17
     assert all("lora" not in p for p in state)
     assert all("llm" in p for p in state)
+
+
+def test_pi05_meta_model_builds():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        meta_model=True,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = nnx.eval_shape(config.create, jax.random.key(0))
+    assert model.max_meta_areas == 3
+
+
+def test_pi05_meta_inputs_spec_contains_meta_areas():
+    config = _pi0_config.Pi0Config(pi05=True, meta_model=True, paligemma_variant="dummy", action_expert_variant="dummy")
+    observation_spec, _ = config.inputs_spec()
+    assert observation_spec.meta_area_poses is not None
+    assert observation_spec.meta_area_types is not None
+    assert observation_spec.meta_area_masks is not None

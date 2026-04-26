@@ -106,12 +106,21 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Optional structured meta-area inputs.
+    meta_area_poses: at.Float[ArrayT, "*b m 6"] | None = None
+    meta_area_types: at.Int[ArrayT, "*b m"] | None = None
+    meta_area_masks: at.Bool[ArrayT, "*b m"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        if ("meta_areas" in data) != (
+            "meta_areas" in data and {"pose6d", "type", "mask"}.issubset(data["meta_areas"])
+        ):
+            raise ValueError("meta_areas must contain pose6d, type, and mask when provided.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -126,6 +135,9 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            meta_area_poses=data.get("meta_areas", {}).get("pose6d"),
+            meta_area_types=data.get("meta_areas", {}).get("type"),
+            meta_area_masks=data.get("meta_areas", {}).get("mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -133,6 +145,15 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        meta_area_poses = result.pop("meta_area_poses")
+        meta_area_types = result.pop("meta_area_types")
+        meta_area_masks = result.pop("meta_area_masks")
+        if meta_area_poses is not None or meta_area_types is not None or meta_area_masks is not None:
+            result["meta_areas"] = {
+                "pose6d": meta_area_poses,
+                "type": meta_area_types,
+                "mask": meta_area_masks,
+            }
         return result
 
 
@@ -205,6 +226,9 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        meta_area_poses=observation.meta_area_poses,
+        meta_area_types=observation.meta_area_types,
+        meta_area_masks=observation.meta_area_masks,
     )
 
 

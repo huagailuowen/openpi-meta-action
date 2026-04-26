@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.xtrainer_meta_policy as xtrainer_meta_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -236,6 +237,7 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     # the space used by the pi internal runtime which was used to train the base model. People who
     # use standard Aloha data should set this to true.
     adapt_to_pi: bool = True
+    output_action_dim: int = 14
 
     # Repack transforms.
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -258,10 +260,76 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         data_transforms = _transforms.Group(
             inputs=[aloha_policy.AlohaInputs(adapt_to_pi=self.adapt_to_pi)],
-            outputs=[aloha_policy.AlohaOutputs(adapt_to_pi=self.adapt_to_pi)],
+            outputs=[
+                aloha_policy.AlohaOutputs(
+                    adapt_to_pi=self.adapt_to_pi,
+                    action_dim=self.output_action_dim,
+                )
+            ],
         )
         if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            if self.output_action_dim == 14:
+                delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1)
+            else:
+                #26
+                delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1,3,-9,-6)
+
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
+    use_delta_joint_actions: bool = False
+    default_prompt: str | None = None
+    output_action_dim: int = 32
+    max_meta_areas: int = 3
+    derive_meta_from_state_if_missing: bool = True
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.top",
+                            "cam_left_wrist": "observation.images.left_wrist",
+                            "cam_right_wrist": "observation.images.right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                xtrainer_meta_policy.XTrainerMetaInputs(
+                    max_meta_areas=self.max_meta_areas,
+                    derive_meta_from_state_if_missing=self.derive_meta_from_state_if_missing,
+                )
+            ],
+            outputs=[xtrainer_meta_policy.XTrainerMetaOutputs(action_dim=self.output_action_dim)],
+        )
+        if self.use_delta_joint_actions:
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1, 3, -9, -6)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
@@ -760,6 +828,190 @@ _CONFIGS = [
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
+    ),
+    #
+    # Fine-tuning x-trainer meta32 configs.
+    #
+    TrainConfig(
+        name="pi0_xtrainer_meta",
+        model=pi0_config.Pi0Config(
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="/home/cy/shared_project/funcPoint4VLAadp/datasets_lerobot/dataset_cy_hook_ring_1_meta",
+            base_config=DataConfig(prompt_from_task=True),
+            adapt_to_pi=False,
+            output_action_dim=32,
+            use_delta_joint_actions=False,
+            default_prompt="use the tool affordance to complete the task",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.top",
+                                "cam_left_wrist": "observation.images.left_wrist",
+                                "cam_right_wrist": "observation.images.right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_meta_delta",
+        model=pi0_config.Pi0Config(
+            max_token_len=300,
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id=".",
+            base_config=DataConfig(prompt_from_task=True),
+            adapt_to_pi=False,
+            output_action_dim=32,
+            use_delta_joint_actions=True,
+            default_prompt="use the tool affordance to complete the task",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.top",
+                                "cam_left_wrist": "observation.images.left_wrist",
+                                "cam_right_wrist": "observation.images.right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        # batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_meta",
+        model=pi0_config.Pi0Config(
+            max_token_len=300,
+            pi05=True,
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id=".",
+            base_config=DataConfig(prompt_from_task=True),
+            adapt_to_pi=False,
+            output_action_dim=32,
+            use_delta_joint_actions=False,
+            default_prompt="use the tool affordance to complete the task",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.top",
+                                "cam_left_wrist": "observation.images.left_wrist",
+                                "cam_right_wrist": "observation.images.right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_meta_aux",
+        model=pi0_config.Pi0Config(
+            max_token_len=300,
+            pi05=True,
+            meta_model=True,
+            meta_dropout_prob=0.25,
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotXTrainerMetaDataConfig(
+            repo_id=".",
+            base_config=DataConfig(prompt_from_task=True),
+            output_action_dim=32,
+            max_meta_areas=1,
+            use_delta_joint_actions=False,
+            default_prompt="use the tool affordance to complete the task",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_meta_aux_delta",
+        model=pi0_config.Pi0Config(
+            max_token_len=300,
+            pi05=True,
+            meta_model=True,
+            meta_dropout_prob=0.25,
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotXTrainerMetaDataConfig(
+            repo_id=".",
+            base_config=DataConfig(prompt_from_task=True),
+            output_action_dim=32,
+            max_meta_areas=1,
+            use_delta_joint_actions=True,
+            default_prompt="use the tool affordance to complete the task",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=80_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_meta_aux_low_mem_finetune",
+        model=pi0_config.Pi0Config(
+            max_token_len=300,
+            pi05=True,
+            meta_model=True,
+            meta_dropout_prob=0.25,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotXTrainerMetaDataConfig(
+            repo_id=".",
+            base_config=DataConfig(prompt_from_task=True),
+            output_action_dim=32,
+            max_meta_areas=1,
+            use_delta_joint_actions=False,
+            default_prompt="use the tool affordance to complete the task",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        freeze_filter=pi0_config.Pi0Config(
+            max_token_len=300,
+            pi05=True,
+            meta_model=True,
+            meta_dropout_prob=0.25,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=32,
+            action_horizon=50,
+        ).get_freeze_filter(),
+        ema_decay=None,
+        num_train_steps=80_000,
+        batch_size=8,
     ),
     #
     # Fine-tuning Aloha configs.

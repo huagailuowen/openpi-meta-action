@@ -31,6 +31,14 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    meta_model: bool = False
+    max_meta_areas: int = 3
+    meta_area_type_vocab_size: int = 3
+    num_meta_special_tokens: int = 4
+    meta_loss_weight: float = 1.0
+    meta_action_start_dim: int = 14
+    meta_action_dim: int = 6
+    meta_dropout_prob: float = 0.0
 
     pytorch_compile_mode: str | None = "max-autotune"
 
@@ -56,6 +64,12 @@ class Pi0Config(_model.BaseModelConfig):
 
     @override
     def create(self, rng: at.KeyArrayLike) -> "Pi0":
+        if self.meta_model:
+            if not self.pi05:
+                raise ValueError("The meta model path is only implemented for PI0.5.")
+            from openpi.models.pi0_meta import Pi0Meta
+
+            return Pi0Meta(self, rngs=nnx.Rngs(rng))
         from openpi.models.pi0 import Pi0
 
         return Pi0(self, rngs=nnx.Rngs(rng))
@@ -80,6 +94,15 @@ class Pi0Config(_model.BaseModelConfig):
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
+                meta_area_poses=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, 6], jnp.float32) if self.meta_model else None
+                ),
+                meta_area_types=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.int32) if self.meta_model else None
+                ),
+                meta_area_masks=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.bool_) if self.meta_model else None
+                ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
 
