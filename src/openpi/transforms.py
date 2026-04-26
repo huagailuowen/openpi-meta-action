@@ -136,7 +136,12 @@ class Normalize(DataTransformFn):
 
     def _normalize(self, x, stats: NormStats):
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]
-        return (x - mean) / (std + 1e-6)
+        # Clamp std from below: dimensions with near-zero variance (e.g. a joint that
+        # never moves in the training set) would produce normalized values in the
+        # thousands with the bare 1e-6 floor, blowing up the flow-matching loss.
+        # 0.01 keeps any constant dimension within ±1 of the mean.
+        safe_std = np.maximum(std, 0.01)
+        return (x - mean) / (safe_std + 1e-6)
 
     def _normalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
@@ -170,7 +175,8 @@ class Unnormalize(DataTransformFn):
     def _unnormalize(self, x, stats: NormStats):
         mean = pad_to_dim(stats.mean, x.shape[-1], axis=-1, value=0.0)
         std = pad_to_dim(stats.std, x.shape[-1], axis=-1, value=1.0)
-        return x * (std + 1e-6) + mean
+        safe_std = np.maximum(std, 0.01)
+        return x * (safe_std + 1e-6) + mean
 
     def _unnormalize_quantile(self, x, stats: NormStats):
         assert stats.q01 is not None
