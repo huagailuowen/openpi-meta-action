@@ -94,6 +94,7 @@ class Pi0Meta(_model.BaseModel):
         self.meta_action_start_dim = config.meta_action_start_dim
         self.meta_action_dim = config.meta_action_dim
         self.meta_dropout_prob = config.meta_dropout_prob
+        self.meta_stop_backbone_grad = config.meta_stop_backbone_grad
 
         backbone_action_mask = [0.0] * config.action_dim
         for i in range(self.meta_action_start_dim):
@@ -345,7 +346,12 @@ class Pi0Meta(_model.BaseModel):
         squared_error = jnp.square(v_t - u_t) * backbone_action_mask[None, None, :]
         base_loss = jnp.sum(squared_error, axis=-1) / jnp.maximum(jnp.sum(backbone_action_mask), 1.0)
 
-        meta_pred = self._decode_meta_actions(prefix_out, suffix_out)
+        # Optionally stop gradients from the meta loss flowing back into the backbone.
+        # This protects pre-trained backbone weights from being corrupted by a randomly
+        # initialised meta head during the early phase of fine-tuning.
+        prefix_for_meta = jax.lax.stop_gradient(prefix_out) if self.meta_stop_backbone_grad else prefix_out
+        suffix_for_meta = jax.lax.stop_gradient(suffix_out) if self.meta_stop_backbone_grad else suffix_out
+        meta_pred = self._decode_meta_actions(prefix_for_meta, suffix_for_meta)
         meta_target = jnp.zeros_like(meta_pred)
         meta_target = meta_target.at[:, :, 0, :].set(
             actions[:, :, self.meta_action_start_dim : self.meta_action_start_dim + self.meta_action_dim]

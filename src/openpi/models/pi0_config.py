@@ -35,10 +35,17 @@ class Pi0Config(_model.BaseModelConfig):
     max_meta_areas: int = 3
     meta_area_type_vocab_size: int = 3
     num_meta_special_tokens: int = 4
-    meta_loss_weight: float = 1.0
+    # Weight applied to the meta MSE loss term. Keep small (0.1) while the meta head
+    # is randomly initialised; set to 1.0 only after the head has warmed up.
+    meta_loss_weight: float = 0.1
     meta_action_start_dim: int = 14
     meta_action_dim: int = 6
     meta_dropout_prob: float = 0.0
+    # When True, stop gradients from the meta loss from flowing back into the shared
+    # backbone (prefix_out / suffix_out). The meta head still receives full gradients
+    # through its own new parameters. Recommended while loading from a pre-trained
+    # backbone so the pre-trained weights are not corrupted by the random meta head.
+    meta_stop_backbone_grad: bool = True
 
     pytorch_compile_mode: str | None = "max-autotune"
 
