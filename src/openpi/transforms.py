@@ -147,7 +147,8 @@ class Normalize(DataTransformFn):
         assert stats.q01 is not None
         assert stats.q99 is not None
         q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
-        return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        safe_range = np.maximum(q99 - q01, 0.01)
+        return (x - q01) / (safe_range + 1e-6) * 2.0 - 1.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -182,9 +183,10 @@ class Unnormalize(DataTransformFn):
         assert stats.q01 is not None
         assert stats.q99 is not None
         q01, q99 = stats.q01, stats.q99
+        safe_range = np.maximum(q99 - q01, 0.01)
         if (dim := q01.shape[-1]) < x.shape[-1]:
-            return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01, x[..., dim:]], axis=-1)
-        return (x + 1.0) / 2.0 * (q99 - q01 + 1e-6) + q01
+            return np.concatenate([(x[..., :dim] + 1.0) / 2.0 * (safe_range[:dim] + 1e-6) + q01[:dim], x[..., dim:]], axis=-1)
+        return (x + 1.0) / 2.0 * (safe_range + 1e-6) + q01
 
 
 @dataclasses.dataclass(frozen=True)
