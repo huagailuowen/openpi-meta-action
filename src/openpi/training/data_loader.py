@@ -245,7 +245,7 @@ def create_data_loader(
     if data_config.rlds_data_dir is not None:
         return create_rlds_data_loader(
             data_config,
-            action_horizon=config.model.action_horizon,
+            action_horizon=data_config.data_action_horizon_override or config.model.action_horizon,
             batch_size=config.batch_size,
             sharding=sharding,
             shuffle=shuffle,
@@ -256,7 +256,7 @@ def create_data_loader(
     return create_torch_data_loader(
         data_config,
         model_config=config.model,
-        action_horizon=config.model.action_horizon,
+        action_horizon=data_config.data_action_horizon_override or config.model.action_horizon,
         batch_size=config.batch_size,
         sharding=sharding,
         shuffle=shuffle,

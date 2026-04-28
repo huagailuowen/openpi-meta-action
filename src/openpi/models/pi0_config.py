@@ -35,6 +35,8 @@ class Pi0Config(_model.BaseModelConfig):
     max_meta_areas: int = 3
     meta_area_type_vocab_size: int = 3
     num_meta_special_tokens: int = 4
+    # Weight applied to the backbone flow-matching loss term.
+    action_loss_weight: float = 1.0
     # Weight applied to the meta MSE loss term. Keep small (0.1) while the meta head
     # is randomly initialised; set to 1.0 only after the head has warmed up.
     meta_loss_weight: float = 0.1

@@ -90,6 +90,7 @@ class Pi0Meta(_model.BaseModel):
         self.max_meta_areas = config.max_meta_areas
         self.num_meta_special_tokens = config.num_meta_special_tokens
         self.meta_area_type_vocab_size = config.meta_area_type_vocab_size
+        self.action_loss_weight = config.action_loss_weight
         self.meta_loss_weight = config.meta_loss_weight
         self.meta_action_start_dim = config.meta_action_start_dim
         self.meta_action_dim = config.meta_action_dim
@@ -362,7 +363,7 @@ class Pi0Meta(_model.BaseModel):
         denom = jnp.maximum(jnp.sum(meta_loss_mask, axis=-1, keepdims=True), 1)
         meta_loss = jnp.sum(meta_loss * meta_loss_mask[:, None, :], axis=-1) / denom
 
-        return base_loss + self.meta_loss_weight * meta_loss
+        return self.action_loss_weight * base_loss + self.meta_loss_weight * meta_loss
 
     def sample_actions_with_aux(
         self,

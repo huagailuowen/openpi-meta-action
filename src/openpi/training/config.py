@@ -88,6 +88,11 @@ class DataConfig:
     # LeRobot dataset is using different keys to represent the action.
     action_sequence_keys: Sequence[str] = ("actions",)
 
+    # If set, overrides model.action_horizon when building the dataset delta_timestamps slice.
+    # Use this with action_stride > 1 so the data loader loads stride × model_horizon raw
+    # frames, which SubsampleActions then reduces back to model_horizon steps.
+    data_action_horizon_override: int | None = None
+
     # If true, will use the LeRobot dataset task to define the prompt.
     prompt_from_task: bool = False
 
@@ -298,6 +303,12 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     max_meta_areas: int = 3
     derive_meta_from_state_if_missing: bool = True
     action_sequence_keys: Sequence[str] = ("action",)
+    # Subsample the action horizon: keep only every N-th frame.
+    # action_stride=1 (default) is no-op. action_stride=2 means the model predicts
+    # at t+0, t+2, t+4, ... covering twice the time window with the same number of
+    # output steps. The data loader automatically loads stride × model.action_horizon
+    # raw frames so that SubsampleActions reduces it back to model.action_horizon steps.
+    action_stride: int = 1
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -328,6 +339,15 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
             ],
             outputs=[xtrainer_meta_policy.XTrainerMetaOutputs(action_dim=self.output_action_dim)],
         )
+        if self.action_stride > 1:
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.SubsampleActions(self.action_stride)],
+            )
+
+        data_action_horizon_override = (
+            model_config.action_horizon * self.action_stride if self.action_stride > 1 else None
+        )
+
         if self.use_delta_joint_actions:
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1, 3, -9, -6)
             data_transforms = data_transforms.push(
@@ -343,6 +363,7 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
             data_transforms=data_transforms,
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
+            data_action_horizon_override=data_action_horizon_override,
         )
 
 
@@ -965,8 +986,9 @@ _CONFIGS = [
             pi05=True,
             meta_model=True,
             meta_dropout_prob=0.25,
-            meta_loss_weight=0.1,
-            meta_stop_backbone_grad=True,
+            action_loss_weight=1.0,
+            meta_loss_weight=1,
+            meta_stop_backbone_grad=False,
             action_dim=32,
             action_horizon=50,
         ),
@@ -976,6 +998,7 @@ _CONFIGS = [
             output_action_dim=32,
             max_meta_areas=1,
             use_delta_joint_actions=True,
+            action_stride=1,
             default_prompt="use the tool affordance to complete the task",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
