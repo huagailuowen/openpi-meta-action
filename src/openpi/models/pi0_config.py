@@ -49,6 +49,19 @@ class Pi0Config(_model.BaseModelConfig):
     # backbone so the pre-trained weights are not corrupted by the random meta head.
     meta_stop_backbone_grad: bool = True
 
+    # When True, freeze the VLM backbone (PaliGemma image encoder + first LLM expert)
+    # during training. The action expert and meta head still receive gradients.
+    freeze_vlm_backbone: bool = False
+    # Fine-grained freezing of the action flow-matching head. The VLM backbone and
+    # meta head still receive gradients regardless of these flags.
+    # - freeze_action_expert_llm: freezes the action expert LLM (and time MLP, which
+    #   conditions the expert via adaRMSNorm).
+    # - freeze_action_in_proj: freezes the noisy-action input projection.
+    # - freeze_action_out_proj: freezes the velocity output projection.
+    freeze_action_expert_llm: bool = False
+    freeze_action_in_proj: bool = False
+    freeze_action_out_proj: bool = False
+
     pytorch_compile_mode: str | None = "max-autotune"
 
     def __post_init__(self):
@@ -144,6 +157,40 @@ class Pi0Config(_model.BaseModelConfig):
             filters.append(
                 nnx.Not(nnx_utils.PathRegex(".*lora.*")),
             )
-        if not filters:
+
+        lora_filter = nnx.All(*filters) if filters else None
+
+        extra_filters = []
+        if self.freeze_vlm_backbone:
+            # PaliGemma image encoder + first LLM expert (the action expert lives in the
+            # second LLM module whose params include `_1` in their path).
+            extra_filters.append(
+                nnx.Any(
+                    nnx_utils.PathRegex(".*PaliGemma/img.*"),
+                    nnx.All(
+                        nnx_utils.PathRegex(".*PaliGemma/llm.*"),
+                        nnx.Not(nnx_utils.PathRegex(".*llm.*_1.*")),
+                    ),
+                )
+            )
+        if self.freeze_action_expert_llm:
+            extra_filters.append(
+                nnx.Any(
+                    nnx_utils.PathRegex(".*llm.*_1.*"),
+                    nnx_utils.PathRegex(".*time_mlp.*"),
+                )
+            )
+        if self.freeze_action_in_proj:
+            extra_filters.append(nnx_utils.PathRegex(".*action_in_proj.*"))
+        if self.freeze_action_out_proj:
+            extra_filters.append(nnx_utils.PathRegex(".*action_out_proj.*"))
+
+        if extra_filters:
+            combined = nnx.Any(*extra_filters)
+            if lora_filter is not None:
+                return nnx.Any(lora_filter, combined)
+            return combined
+
+        if lora_filter is None:
             return nnx.Nothing
-        return nnx.All(*filters)
+        return lora_filter
