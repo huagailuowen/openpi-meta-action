@@ -309,6 +309,12 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     # output steps. The data loader automatically loads stride × model.action_horizon
     # raw frames so that SubsampleActions reduces it back to model.action_horizon steps.
     action_stride: int = 1
+    # Per-camera dropout probabilities. Each camera is independently zeroed (and its
+    # image_mask cleared) with the listed probability. Defaults to 0 for all cameras
+    # (no drop). Camera names match the model-side keys produced by XTrainerMetaInputs.
+    cam_high_drop_prob: float = 0.0
+    cam_left_wrist_drop_prob: float = 0.0
+    cam_right_wrist_drop_prob: float = 0.0
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -344,12 +350,24 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
                 inputs=[_transforms.SubsampleActions(self.action_stride)],
             )
 
+        cam_drop_probs = {
+            "base_0_rgb": self.cam_high_drop_prob,
+            "left_wrist_0_rgb": self.cam_left_wrist_drop_prob,
+            "right_wrist_0_rgb": self.cam_right_wrist_drop_prob,
+        }
+        if any(p > 0.0 for p in cam_drop_probs.values()):
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.ImageDropout(drop_probs=cam_drop_probs)],
+            )
+
         data_action_horizon_override = (
             model_config.action_horizon * self.action_stride if self.action_stride > 1 else None
         )
 
         if self.use_delta_joint_actions:
-            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1, 3, -9, -6)
+            # Block layout kept as -3/-9/-6 so individual segments are easy to flip:
+            # -3 = meta xyz (14:17), -9 = meta rpy + camera (17:26), -6 = trailing (26:32).
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1, -3, -9, -6)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],

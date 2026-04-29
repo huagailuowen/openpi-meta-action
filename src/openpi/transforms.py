@@ -200,6 +200,36 @@ class ResizeImages(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class ImageDropout(DataTransformFn):
+    """Per-camera image dropout: with probability `p[name]`, zero the image and clear its mask.
+
+    Drops are independent per camera per sample. Probabilities default to 0 (no drop)
+    for any camera not listed.
+    """
+
+    drop_probs: Mapping[str, float] = dataclasses.field(default_factory=dict)
+
+    def __call__(self, data: DataDict) -> DataDict:
+        images = data.get("image")
+        if not images or not self.drop_probs:
+            return data
+        masks = data.get("image_mask", {})
+        new_images = dict(images)
+        new_masks = dict(masks)
+        for name, prob in self.drop_probs.items():
+            if prob <= 0.0 or name not in new_images:
+                continue
+            if np.random.random() < prob:
+                new_images[name] = np.zeros_like(new_images[name])
+                if name in new_masks:
+                    new_masks[name] = np.bool_(False)
+        data["image"] = new_images
+        if new_masks:
+            data["image_mask"] = new_masks
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class SubsampleActions(DataTransformFn):
     stride: int
 
