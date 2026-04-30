@@ -296,6 +296,69 @@ class LeRobotAlohaDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class LeRobotXTrainerRaw14DataConfig(DataConfigFactory):
+    """Joints-only control config: keeps just the first 14 dims of state and actions.
+
+    State and action arrays are sliced to dims 0..13 then zero-padded back up to the
+    model's full ``action_dim`` (so ``Pi0Config.action_dim=32`` stays unchanged). The
+    18 padded dims are trained against zero targets — harmless for a baseline. The
+    output transform truncates predictions to ``output_action_dim`` (14) again so
+    downstream consumers only see the joint channels.
+    """
+
+    use_delta_joint_actions: bool = True
+    default_prompt: str | None = None
+    output_action_dim: int = 14
+    # Must match ``Pi0Config.action_dim``; state/actions are zero-padded up to this width.
+    model_action_dim: int = 32
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.top",
+                            "cam_left_wrist": "observation.images.left_wrist",
+                            "cam_right_wrist": "observation.images.right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[xtrainer_meta_policy.XTrainerRaw14Inputs(model_action_dim=self.model_action_dim)],
+            outputs=[xtrainer_meta_policy.XTrainerMetaOutputs(action_dim=self.output_action_dim)],
+        )
+        if self.use_delta_joint_actions:
+            # Delta only on the two arm-joint blocks (6 each); grippers and the padded
+            # tail remain absolute. Total length = model_action_dim.
+            pad = self.model_action_dim - 14
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1, -pad) if pad > 0 else _transforms.make_bool_mask(6, -1, 6, -1)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     use_delta_joint_actions: bool = False
     default_prompt: str | None = None
@@ -1017,6 +1080,26 @@ _CONFIGS = [
             max_meta_areas=1,
             use_delta_joint_actions=True,
             action_stride=1,
+            default_prompt="use the tool affordance to complete the task",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_raw14",
+        model=pi0_config.Pi0Config(
+            max_token_len=300,
+            pi05=True,
+            meta_model=False,
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotXTrainerRaw14DataConfig(
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/tool_adaptation/black_ring_hook60_stick10_10_noised_meta_delta",
+            base_config=DataConfig(prompt_from_task=True),
+            output_action_dim=14,
+            use_delta_joint_actions=True,
             default_prompt="use the tool affordance to complete the task",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),

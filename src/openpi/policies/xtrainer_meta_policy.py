@@ -93,6 +93,52 @@ class XTrainerMetaInputs(transforms.DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class XTrainerRaw14Inputs(transforms.DataTransformFn):
+    """Joints-only baseline: take the first 14 dims of state and actions and zero-pad
+    them up to the model's full ``action_dim`` so the Pi0 architecture stays unchanged.
+
+    No meta information is read or injected. Use with ``meta_model=False``.
+    """
+
+    model_action_dim: int = 32
+
+    def __call__(self, data: dict) -> dict:
+        images = _get_first(data, "images", "image")
+        top_image = _parse_image(_get_first(images, "cam_high", "top", "base_0_rgb"))
+        left_wrist_image = _parse_image(_get_first(images, "cam_left_wrist", "left_wrist", "left_wrist_0_rgb"))
+        right_wrist_image = _parse_image(_get_first(images, "cam_right_wrist", "right_wrist", "right_wrist_0_rgb"))
+
+        raw_state = np.asarray(_get_first(data, "state", "observation.state"), dtype=np.float32)
+        state = np.zeros((self.model_action_dim,), dtype=np.float32)
+        state[:14] = raw_state[:14]
+
+        inputs = {
+            "state": state,
+            "image": {
+                "base_0_rgb": top_image,
+                "left_wrist_0_rgb": left_wrist_image,
+                "right_wrist_0_rgb": right_wrist_image,
+            },
+            "image_mask": {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_,
+            },
+        }
+
+        if "actions" in data or "action" in data:
+            raw_actions = np.asarray(_get_first(data, "actions", "action"), dtype=np.float32)
+            actions = np.zeros((raw_actions.shape[0], self.model_action_dim), dtype=np.float32)
+            actions[:, :14] = raw_actions[:, :14]
+            inputs["actions"] = actions
+
+        if "prompt" in data:
+            inputs["prompt"] = data["prompt"]
+
+        return inputs
+
+
+@dataclasses.dataclass(frozen=True)
 class XTrainerMetaOutputs(transforms.DataTransformFn):
     """Keep the packed action output and preserve structured meta side outputs when present."""
 
