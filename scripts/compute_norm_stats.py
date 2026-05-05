@@ -37,6 +37,12 @@ def create_torch_dataloader(
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
+        ],
+    )
+    dataset = _data_loader.maybe_wrap_retarget_cache_dataset(dataset, data_config)
+    dataset = _data_loader.TransformedDataset(
+        dataset,
+        [
             # Remove strings since they are not supported by JAX and are not needed to compute norm stats.
             RemoveStrings(),
         ],

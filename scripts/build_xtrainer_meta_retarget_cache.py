@@ -1,0 +1,299 @@
+"""Build an offline x-trainer geometry meta retarget cache.
+
+The cache is chunk-centric. For each LeRobot dataset index, this script first
+loads the same action horizon that OpenPI training would see, canonicalizes old
+and structured meta formats into ``state/actions/meta_areas``, and then
+optionally writes one or more retargeted variants.
+
+Training can later sample this cache with:
+
+  data.meta_retarget_cache_dir=<cache-dir>
+  data.meta_retarget_cache_prob=<p>
+
+No IK is run during training.
+"""
+
+from __future__ import annotations
+
+from concurrent import futures
+import dataclasses
+import json
+import pathlib
+import shutil
+from typing import Any
+
+import numpy as np
+import tqdm
+import tyro
+
+import openpi.policies.xtrainer_meta_retarget as _retarget
+
+
+def _apply_transforms(data: dict[str, Any], transforms) -> dict[str, Any]:
+    for transform in transforms:
+        data = transform(data)
+    return data
+
+
+def _infer_max_meta_areas(data_config: Any) -> int:
+    for transform in data_config.data_transforms.inputs:
+        if hasattr(transform, "max_meta_areas"):
+            return int(getattr(transform, "max_meta_areas"))
+    return 1
+
+
+def _infer_action_stride(data_config: Any) -> int:
+    for transform in data_config.data_transforms.inputs:
+        if transform.__class__.__name__ == "SubsampleActions":
+            return int(transform.stride)
+    return 1
+
+
+def _canonicalize_sample(
+    raw_sample: dict[str, Any],
+    data_config: Any,
+    *,
+    max_meta_areas: int,
+    action_stride: int,
+) -> dict[str, Any]:
+    repacked = _apply_transforms(raw_sample, data_config.repack_transforms.inputs)
+    canonical = _retarget.canonicalize_repacked_xtrainer_chunk(
+        repacked,
+        max_meta_areas=max_meta_areas,
+    )
+    if action_stride > 1:
+        canonical["actions"] = canonical["actions"][::action_stride]
+    return canonical
+
+
+def _load_existing_pairs(cache_dir: pathlib.Path) -> set[tuple[int, int]]:
+    manifest_path = cache_dir / "manifest.jsonl"
+    if not manifest_path.exists():
+        return set()
+    pairs: set[tuple[int, int]] = set()
+    with manifest_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            if bool(record.get("accepted", True)):
+                pairs.add((int(record["base_index"]), int(record["variant_id"])))
+    return pairs
+
+
+def _variant_relpath(base_index: int, variant_id: int) -> pathlib.Path:
+    shard = base_index // 1000
+    return pathlib.Path("variants") / f"{shard:06d}" / f"{base_index:09d}_{variant_id:02d}.npz"
+
+
+def _generate_variant_worker(
+    *,
+    base_index: int,
+    variant_id: int,
+    seed: int,
+    sample: dict[str, Any],
+    cache_dir: str,
+    generator_config: dict[str, Any],
+    max_attempts: int,
+) -> dict[str, Any]:
+    config = _retarget.MetaRetargetGeneratorConfig(**generator_config)
+    relpath = _variant_relpath(base_index, variant_id)
+    base_record = {
+        "base_index": int(base_index),
+        "variant_id": int(variant_id),
+        "path": str(relpath),
+    }
+
+    last_record: dict[str, Any] | None = None
+    for attempt in range(max(1, int(max_attempts))):
+        attempt_seed = int(seed + attempt * 9973)
+        rng = np.random.default_rng(attempt_seed)
+        result = _retarget.generate_retargeted_chunk(sample, rng=rng, config=config)
+        record = {
+            **base_record,
+            "seed": attempt_seed,
+            "attempt": int(attempt),
+            "attempts": int(attempt + 1),
+        }
+        if result is None:
+            last_record = {**record, "accepted": False, "reason": "sample_not_usable"}
+            continue
+
+        diagnostics = result.diagnostics.to_json_dict()
+        if not result.diagnostics.accepted:
+            last_record = {**record, "accepted": False, **diagnostics}
+            continue
+
+        _retarget.save_retarget_result(pathlib.Path(cache_dir) / relpath, result)
+        return {**record, "accepted": True, **diagnostics}
+
+    assert last_record is not None
+    return last_record
+
+
+def _write_jsonl_record(path: pathlib.Path, record: dict[str, Any]) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
+
+
+def main(
+    config_name: str,
+    output_dir: str,
+    *,
+    retarget_prob: float = 1.0,
+    variants_per_selected_chunk: int = 1,
+    seed: int = 0,
+    num_workers: int = 8,
+    max_chunks: int | None = None,
+    overwrite: bool = False,
+    max_attempts_per_variant: int = 8,
+    position_noise_max_m: float = 0.04,
+    direction_noise_max_deg: float = 25.0,
+    approach_joint_step_rad: float = 0.04,
+    max_approach_steps: int | None = None,
+    ik_max_iters: int = 80,
+    ik_tolerance: float = 1e-3,
+    accept_max_position_error_m: float = 0.015,
+    accept_max_direction_error_rad: float = 0.25,
+    accept_max_step_joint_delta_rad: float = 0.35,
+) -> None:
+    """Build a reusable retarget cache for one OpenPI training config."""
+
+    if not 0.0 <= retarget_prob <= 1.0:
+        raise ValueError(f"retarget_prob must be in [0, 1], got {retarget_prob}")
+    if variants_per_selected_chunk < 1:
+        raise ValueError("--variants-per-selected-chunk must be >= 1")
+
+    cache_dir = pathlib.Path(output_dir).expanduser().resolve()
+    if overwrite and cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = cache_dir / "manifest.jsonl"
+    failure_path = cache_dir / "failures.jsonl"
+
+    import openpi.training.config as _config
+    import openpi.training.data_loader as _data_loader
+
+    train_config = _config.get_config(config_name)
+    data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    # Cache generation must not sample from an existing cache while building it.
+    data_config = dataclasses.replace(
+        data_config,
+        repo_id=str(pathlib.Path.cwd().resolve()) if data_config.repo_id == "." else data_config.repo_id,
+        meta_retarget_cache_dir=None,
+        meta_retarget_cache_prob=0.0,
+    )
+
+    action_horizon = data_config.data_action_horizon_override or train_config.model.action_horizon
+    dataset = _data_loader.create_torch_dataset(data_config, action_horizon, train_config.model)
+    max_meta_areas = _infer_max_meta_areas(data_config)
+    action_stride = _infer_action_stride(data_config)
+
+    generator_config = _retarget.MetaRetargetGeneratorConfig(
+        position_noise_max_m=position_noise_max_m,
+        direction_noise_max_deg=direction_noise_max_deg,
+        approach_joint_step_rad=approach_joint_step_rad,
+        max_approach_steps=max_approach_steps,
+        ik_max_iters=ik_max_iters,
+        ik_tolerance=ik_tolerance,
+        accept_max_position_error_m=accept_max_position_error_m,
+        accept_max_direction_error_rad=accept_max_direction_error_rad,
+        accept_max_step_joint_delta_rad=accept_max_step_joint_delta_rad,
+    )
+
+    metadata = {
+        "config_name": config_name,
+        "repo_id": data_config.repo_id,
+        "retarget_prob": retarget_prob,
+        "variants_per_selected_chunk": variants_per_selected_chunk,
+        "seed": seed,
+        "num_workers": num_workers,
+        "max_chunks": max_chunks,
+        "max_attempts_per_variant": max_attempts_per_variant,
+        "dataset_len": len(dataset),
+        "raw_action_horizon": action_horizon,
+        "model_action_horizon": train_config.model.action_horizon,
+        "action_stride": action_stride,
+        "max_meta_areas": max_meta_areas,
+        "generator_config": generator_config.to_json_dict(),
+    }
+    (cache_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=True, indent=2), encoding="utf-8")
+
+    existing_pairs = set() if overwrite else _load_existing_pairs(cache_dir)
+    selection_rng = np.random.default_rng(seed)
+    submitted = 0
+    accepted = 0
+    rejected = 0
+    skipped_existing = 0
+    skipped_probability = 0
+
+    pending: dict[futures.Future, tuple[int, int]] = {}
+
+    def drain_one() -> None:
+        nonlocal accepted, rejected
+        done = next(futures.as_completed(pending))
+        pending.pop(done)
+        record = done.result()
+        if bool(record.get("accepted", False)):
+            accepted += 1
+            _write_jsonl_record(manifest_path, record)
+        else:
+            rejected += 1
+            _write_jsonl_record(failure_path, record)
+
+    total = len(dataset) if max_chunks is None else min(max_chunks, len(dataset))
+    with futures.ProcessPoolExecutor(max_workers=max(1, int(num_workers))) as executor:
+        for base_index in tqdm.trange(total, desc="Submitting retarget chunks"):
+            if selection_rng.random() > retarget_prob:
+                skipped_probability += variants_per_selected_chunk
+                continue
+
+            raw_sample = dataset[base_index]
+            canonical = _canonicalize_sample(
+                raw_sample,
+                data_config,
+                max_meta_areas=max_meta_areas,
+                action_stride=action_stride,
+            )
+
+            for variant_id in range(variants_per_selected_chunk):
+                pair = (base_index, variant_id)
+                if pair in existing_pairs:
+                    skipped_existing += 1
+                    continue
+                variant_seed = int(seed + base_index * 10007 + variant_id * 101)
+                pending[
+                    executor.submit(
+                        _generate_variant_worker,
+                        base_index=base_index,
+                        variant_id=variant_id,
+                        seed=variant_seed,
+                        sample=canonical,
+                        cache_dir=str(cache_dir),
+                        generator_config=generator_config.to_json_dict(),
+                        max_attempts=max_attempts_per_variant,
+                    )
+                ] = pair
+                submitted += 1
+                if len(pending) >= max(1, num_workers * 4):
+                    drain_one()
+
+        while pending:
+            drain_one()
+
+    summary = {
+        "submitted": submitted,
+        "accepted": accepted,
+        "rejected": rejected,
+        "skipped_existing": skipped_existing,
+        "skipped_probability": skipped_probability,
+        "manifest_path": str(manifest_path),
+        "failure_path": str(failure_path),
+    }
+    (cache_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=True, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+
+
+if __name__ == "__main__":
+    tyro.cli(main)

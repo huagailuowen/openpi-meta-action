@@ -103,6 +103,13 @@ class DataConfig:
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
 
+    # Optional offline x-trainer meta-retarget chunk cache. When enabled, the
+    # map-style dataloader applies repack/data transforms first, then samples a
+    # cached retargeted canonical chunk before normalization and tokenization.
+    meta_retarget_cache_dir: str | None = None
+    meta_retarget_cache_prob: float = 0.0
+    meta_retarget_cache_seed: int = 0
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -378,6 +385,9 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     cam_high_drop_prob: float = 0.0
     cam_left_wrist_drop_prob: float = 0.0
     cam_right_wrist_drop_prob: float = 0.0
+    meta_retarget_cache_dir: str | None = None
+    meta_retarget_cache_prob: float = 0.0
+    meta_retarget_cache_seed: int = 0
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -445,6 +455,119 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
             model_transforms=model_transforms,
             action_sequence_keys=self.action_sequence_keys,
             data_action_horizon_override=data_action_horizon_override,
+            meta_retarget_cache_dir=self.meta_retarget_cache_dir,
+            meta_retarget_cache_prob=self.meta_retarget_cache_prob,
+            meta_retarget_cache_seed=self.meta_retarget_cache_seed,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
+    """Structured-meta LeRobot data config.
+
+    This is the new interface path and intentionally does not replace
+    ``LeRobotXTrainerMetaDataConfig``. It reads explicit
+    ``observation.meta_areas.*`` and ``action.meta_targets.*`` fields from the
+    LeRobot dataset. The current Pi0Meta loss still consumes the legacy
+    ``actions[..., 14:20]`` slot, so ``XTrainerStructuredMetaInputs`` writes that
+    slot from ``action.meta_targets.pose6d`` as a compatibility adapter.
+    """
+
+    use_delta_joint_actions: bool = False
+    default_prompt: str | None = None
+    output_action_dim: int = 32
+    max_meta_areas: int = 3
+    require_structured_meta: bool = True
+    action_sequence_keys: Sequence[str] = (
+        "action",
+        "action.meta_targets.pose6d",
+        "action.meta_targets.mask",
+    )
+    action_stride: int = 1
+    cam_high_drop_prob: float = 0.0
+    cam_left_wrist_drop_prob: float = 0.0
+    cam_right_wrist_drop_prob: float = 0.0
+    meta_retarget_cache_dir: str | None = None
+    meta_retarget_cache_prob: float = 0.0
+    meta_retarget_cache_seed: int = 0
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default=_transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {
+                            "cam_high": "observation.images.top",
+                            "cam_left_wrist": "observation.images.left_wrist",
+                            "cam_right_wrist": "observation.images.right_wrist",
+                        },
+                        "state": "observation.state",
+                        "actions": "action",
+                        "meta_areas": {
+                            "pose6d": "observation.meta_areas.pose6d",
+                            "type": "observation.meta_areas.type",
+                            "mask": "observation.meta_areas.mask",
+                        },
+                        "meta_action_targets": {
+                            "pose6d": "action.meta_targets.pose6d",
+                            "mask": "action.meta_targets.mask",
+                        },
+                    }
+                )
+            ]
+        )
+    )
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                xtrainer_meta_policy.XTrainerStructuredMetaInputs(
+                    max_meta_areas=self.max_meta_areas,
+                    require_structured_meta=self.require_structured_meta,
+                )
+            ],
+            outputs=[xtrainer_meta_policy.XTrainerMetaOutputs(action_dim=self.output_action_dim)],
+        )
+        if self.action_stride > 1:
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.SubsampleActions(self.action_stride)],
+            )
+
+        cam_drop_probs = {
+            "base_0_rgb": self.cam_high_drop_prob,
+            "left_wrist_0_rgb": self.cam_left_wrist_drop_prob,
+            "right_wrist_0_rgb": self.cam_right_wrist_drop_prob,
+        }
+        if any(p > 0.0 for p in cam_drop_probs.values()):
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.ImageDropout(drop_probs=cam_drop_probs)],
+            )
+
+        data_action_horizon_override = (
+            model_config.action_horizon * self.action_stride if self.action_stride > 1 else None
+        )
+
+        if self.use_delta_joint_actions:
+            # Keep robot joints as deltas and leave meta/camera channels absolute.
+            delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1, -3, -9, -6)
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+            data_action_horizon_override=data_action_horizon_override,
+            meta_retarget_cache_dir=self.meta_retarget_cache_dir,
+            meta_retarget_cache_prob=self.meta_retarget_cache_prob,
+            meta_retarget_cache_seed=self.meta_retarget_cache_seed,
         )
 
 
@@ -1075,6 +1198,32 @@ _CONFIGS = [
         ),
         data=LeRobotXTrainerMetaDataConfig(
             repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/tool_adaptation/black_ring_hook60_stick10_10_noised_meta_delta",
+            base_config=DataConfig(prompt_from_task=True),
+            output_action_dim=32,
+            max_meta_areas=1,
+            use_delta_joint_actions=True,
+            action_stride=1,
+            default_prompt="use the tool affordance to complete the task",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_meta_aux_structured_delta",
+        model=pi0_config.Pi0Config(
+            max_token_len=300,
+            pi05=True,
+            meta_model=True,
+            meta_dropout_prob=0.25,
+            action_loss_weight=1.0,
+            meta_loss_weight=1,
+            meta_stop_backbone_grad=False,
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotXTrainerStructuredMetaDataConfig(
+            repo_id=".",
             base_config=DataConfig(prompt_from_task=True),
             output_action_dim=32,
             max_meta_areas=1,

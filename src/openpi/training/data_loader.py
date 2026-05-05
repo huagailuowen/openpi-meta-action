@@ -1,7 +1,9 @@
 from collections.abc import Iterator, Sequence
+import json
 import logging
 import multiprocessing
 import os
+import pathlib
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -60,6 +62,92 @@ class TransformedDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+
+class RetargetCacheDataset(Dataset[T_co]):
+    """Sample precomputed x-trainer meta-retarget chunks before normalization.
+
+    The wrapped dataset is expected to already be in canonical OpenPI format
+    with ``state``, ``actions`` and ``meta_areas`` fields. Images and prompts are
+    kept from the original sample; cached files only replace the low-dimensional
+    supervision fields.
+    """
+
+    def __init__(self, dataset: Dataset, cache_dir: str | pathlib.Path, sample_prob: float, seed: int):
+        self._dataset = dataset
+        self._cache_dir = pathlib.Path(cache_dir).expanduser()
+        self._sample_prob = float(sample_prob)
+        self._rng = np.random.default_rng(seed)
+        self._records_by_index = self._load_manifest(self._cache_dir)
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        sample = self._dataset[index]
+        if self._sample_prob <= 0.0:
+            return sample
+
+        base_index = int(index.__index__())
+        records = self._records_by_index.get(base_index)
+        if not records or self._rng.random() >= self._sample_prob:
+            return sample
+
+        record = records[int(self._rng.integers(len(records)))]
+        variant_path = self._cache_dir / record["path"]
+        try:
+            with np.load(variant_path) as cached:
+                retargeted = {key: cached[key].copy() for key in cached.files}
+        except FileNotFoundError:
+            logging.warning("Retarget cache entry missing: %s", variant_path)
+            return sample
+
+        out = dict(sample)
+        out["state"] = retargeted["state"].astype(np.float32)
+        out["actions"] = retargeted["actions"].astype(np.float32)
+        meta_areas = dict(out.get("meta_areas", {}))
+        meta_areas["pose6d"] = retargeted["meta_area_pose6d"].astype(np.float32)
+        meta_areas["type"] = retargeted["meta_area_type"].astype(np.int32)
+        meta_areas["mask"] = retargeted["meta_area_mask"].astype(bool)
+        out["meta_areas"] = meta_areas
+        return typing.cast(T_co, out)
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    @staticmethod
+    def _load_manifest(cache_dir: pathlib.Path) -> dict[int, list[dict[str, typing.Any]]]:
+        manifest_path = cache_dir / "manifest.jsonl"
+        if not manifest_path.exists():
+            logging.warning("Retarget cache manifest not found: %s", manifest_path)
+            return {}
+
+        records_by_index: dict[int, list[dict[str, typing.Any]]] = {}
+        with manifest_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if not bool(record.get("accepted", True)):
+                    continue
+                base_index = int(record["base_index"])
+                records_by_index.setdefault(base_index, []).append(record)
+        logging.info(
+            "Loaded %d retarget cache variants for %d base chunks from %s",
+            sum(len(v) for v in records_by_index.values()),
+            len(records_by_index),
+            manifest_path,
+        )
+        return records_by_index
+
+
+def maybe_wrap_retarget_cache_dataset(dataset: Dataset, data_config: _config.DataConfig) -> Dataset:
+    if not data_config.meta_retarget_cache_dir or data_config.meta_retarget_cache_prob <= 0.0:
+        return dataset
+    return RetargetCacheDataset(
+        dataset,
+        data_config.meta_retarget_cache_dir,
+        sample_prob=data_config.meta_retarget_cache_prob,
+        seed=data_config.meta_retarget_cache_seed,
+    )
 
 
 class IterableTransformedDataset(IterableDataset[T_co]):
@@ -180,11 +268,17 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
             )
         norm_stats = data_config.norm_stats
 
-    return TransformedDataset(
+    dataset = TransformedDataset(
         dataset,
         [
             *data_config.repack_transforms.inputs,
             *data_config.data_transforms.inputs,
+        ],
+    )
+    dataset = maybe_wrap_retarget_cache_dataset(dataset, data_config)
+    return TransformedDataset(
+        dataset,
+        [
             _transforms.Normalize(norm_stats, use_quantiles=data_config.use_quantile_norm),
             *data_config.model_transforms.inputs,
         ],
@@ -207,6 +301,9 @@ def transform_iterable_dataset(
                 "Make sure to run `scripts/compute_norm_stats.py --config-name=<your-config>`."
             )
         norm_stats = data_config.norm_stats
+
+    if data_config.meta_retarget_cache_dir and data_config.meta_retarget_cache_prob > 0.0:
+        logging.warning("meta_retarget_cache_dir is ignored for iterable/RLDS datasets.")
 
     return IterableTransformedDataset(
         dataset,
