@@ -67,3 +67,32 @@ def test_generate_retargeted_chunk_accepts_zero_noise_line_case():
     assert result.diagnostics.accepted
     assert result.actions.shape == (5, 32)
     assert result.meta_area_pose6d.shape == (1, 6)
+
+
+def test_matrix_to_rotvec_near_pi_is_bounded():
+    axis = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+    axis = axis / np.linalg.norm(axis)
+    rot_matrix = retarget._rotvec_to_matrix(axis * np.pi).astype(np.float64)  # noqa: SLF001
+    rot_matrix[0, 1] += 1e-6
+    rot_matrix[1, 0] -= 1e-6
+
+    rotvec = retarget._matrix_to_rotvec(rot_matrix)  # noqa: SLF001
+
+    assert np.all(np.isfinite(rotvec))
+    assert np.linalg.norm(rotvec) <= retarget.MetaRetargetGeneratorConfig().accept_max_camera_rotvec_norm_rad
+    np.testing.assert_allclose(np.linalg.norm(rotvec), np.pi, atol=1e-3)
+
+
+def test_action_value_diagnostics_rejects_bad_camera_rotvec():
+    actions = np.zeros((2, 32), dtype=np.float32)
+    actions[:, 23] = 1e12
+
+    ok, finite, _, max_camera_rotvec_norm, reason = retarget._action_value_diagnostics(  # noqa: SLF001
+        actions,
+        retarget.MetaRetargetGeneratorConfig(),
+    )
+
+    assert not ok
+    assert finite
+    assert max_camera_rotvec_norm > retarget.MetaRetargetGeneratorConfig().accept_max_camera_rotvec_norm_rad
+    assert "max_camera_rotvec_norm_rad" in reason

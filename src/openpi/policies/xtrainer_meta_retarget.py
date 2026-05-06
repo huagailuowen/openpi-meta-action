@@ -60,6 +60,8 @@ class MetaRetargetGeneratorConfig:
     accept_max_position_error_m: float = 0.015
     accept_max_direction_error_rad: float = 0.25
     accept_max_step_joint_delta_rad: float = 0.35
+    accept_max_abs_action_value: float = 1e4
+    accept_max_camera_rotvec_norm_rad: float = 3.143
     recompute_action_camera_pose: bool = True
 
     def to_json_dict(self) -> dict[str, Any]:
@@ -77,6 +79,9 @@ class MetaRetargetDiagnostics:
     max_direction_error_rad: float
     max_step_joint_delta_rad: float
     reason: str = ""
+    actions_finite: bool = True
+    max_abs_action_value: float = 0.0
+    max_camera_rotvec_norm_rad: float = 0.0
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -309,20 +314,31 @@ def generate_retargeted_chunk(
     max_position_error = float(max(position_errors, default=np.inf))
     max_direction_error = float(max(direction_errors, default=0.0))
     max_joint_delta = float(max(joint_step_deltas, default=0.0))
+    (
+        values_ok,
+        actions_finite,
+        max_abs_action,
+        max_camera_rotvec_norm,
+        value_reason,
+    ) = _action_value_diagnostics(out_actions, config)
 
     accepted = (
         max_position_error <= config.accept_max_position_error_m
         and max_direction_error <= config.accept_max_direction_error_rad
         and max_joint_delta <= config.accept_max_step_joint_delta_rad
+        and values_ok
     )
     reason = ""
     if not accepted:
-        reason = (
-            f"ik_nonconverged={ik_nonconverged}, "
-            f"max_position_error_m={max_position_error:.6f}, "
-            f"max_direction_error_rad={max_direction_error:.6f}, "
-            f"max_step_joint_delta_rad={max_joint_delta:.6f}"
-        )
+        reason_parts = [
+            f"ik_nonconverged={ik_nonconverged}",
+            f"max_position_error_m={max_position_error:.6f}",
+            f"max_direction_error_rad={max_direction_error:.6f}",
+            f"max_step_joint_delta_rad={max_joint_delta:.6f}",
+        ]
+        if value_reason:
+            reason_parts.append(value_reason)
+        reason = ", ".join(reason_parts)
 
     diagnostics = MetaRetargetDiagnostics(
         accepted=accepted,
@@ -334,6 +350,9 @@ def generate_retargeted_chunk(
         max_direction_error_rad=max_direction_error,
         max_step_joint_delta_rad=max_joint_delta,
         reason=reason,
+        actions_finite=actions_finite,
+        max_abs_action_value=max_abs_action,
+        max_camera_rotvec_norm_rad=max_camera_rotvec_norm,
     )
     return MetaRetargetResult(
         state=state.astype(np.float32),
@@ -358,13 +377,17 @@ def generate_retargeted_chunks_batch(
     if not data_batch:
         return []
     if config.ik_backend != "jax":
-        return [generate_retargeted_chunk(data, rng=rng, config=config) for data, rng in zip(data_batch, rngs)]
+        return [
+            generate_retargeted_chunk(data, rng=rng, config=config)
+            for data, rng in zip(data_batch, rngs, strict=True)
+        ]
     if config.approach_joint_step_rad <= 0:
         raise ValueError(f"approach_joint_step_rad must be positive, got {config.approach_joint_step_rad}")
 
     helpers = _load_xtrainer_helpers()
     prepared: list[dict[str, Any] | None] = [
-        _prepare_retarget_chunk(data, rng=rng, config=config, helpers=helpers) for data, rng in zip(data_batch, rngs)
+        _prepare_retarget_chunk(data, rng=rng, config=config, helpers=helpers)
+        for data, rng in zip(data_batch, rngs, strict=True)
     ]
     results: list[MetaRetargetResult | None] = [None] * len(data_batch)
 
@@ -623,19 +646,30 @@ def _assemble_retarget_result(
     max_position_error = float(max(position_errors, default=np.inf))
     max_direction_error = float(max(direction_errors, default=0.0))
     max_joint_delta = float(max(joint_step_deltas, default=0.0))
+    (
+        values_ok,
+        actions_finite,
+        max_abs_action,
+        max_camera_rotvec_norm,
+        value_reason,
+    ) = _action_value_diagnostics(out_actions, config)
     accepted = (
         max_position_error <= config.accept_max_position_error_m
         and max_direction_error <= config.accept_max_direction_error_rad
         and max_joint_delta <= config.accept_max_step_joint_delta_rad
+        and values_ok
     )
     reason = ""
     if not accepted:
-        reason = (
-            f"ik_nonconverged={ik_nonconverged}, "
-            f"max_position_error_m={max_position_error:.6f}, "
-            f"max_direction_error_rad={max_direction_error:.6f}, "
-            f"max_step_joint_delta_rad={max_joint_delta:.6f}"
-        )
+        reason_parts = [
+            f"ik_nonconverged={ik_nonconverged}",
+            f"max_position_error_m={max_position_error:.6f}",
+            f"max_direction_error_rad={max_direction_error:.6f}",
+            f"max_step_joint_delta_rad={max_joint_delta:.6f}",
+        ]
+        if value_reason:
+            reason_parts.append(value_reason)
+        reason = ", ".join(reason_parts)
 
     diagnostics = MetaRetargetDiagnostics(
         accepted=accepted,
@@ -647,6 +681,9 @@ def _assemble_retarget_result(
         max_direction_error_rad=max_direction_error,
         max_step_joint_delta_rad=max_joint_delta,
         reason=reason,
+        actions_finite=actions_finite,
+        max_abs_action_value=max_abs_action,
+        max_camera_rotvec_norm_rad=max_camera_rotvec_norm,
     )
     return MetaRetargetResult(
         state=state.astype(np.float32),
@@ -689,17 +726,79 @@ def _rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
     return R.astype(np.float32)
 
 
-def _matrix_to_rotvec(R: np.ndarray) -> np.ndarray:
-    R = np.asarray(R, dtype=np.float64).reshape(3, 3)
-    cos_theta = float(np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0))
-    theta = float(np.arccos(cos_theta))
-    if theta < 1e-8:
+def _matrix_to_rotvec(matrix: np.ndarray) -> np.ndarray:
+    rot_matrix = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
+    if not np.all(np.isfinite(rot_matrix)):
+        return np.full(3, np.nan, dtype=np.float32)
+
+    # Project through SO(3) first. FK products are close to rotations but are
+    # often float32; the direct axis formula divides by sin(theta), which is
+    # singular near 180 degrees and can turn tiny skew noise into huge rotvecs.
+    u, _, vt = np.linalg.svd(rot_matrix)
+    rot_matrix = u @ vt
+    if np.linalg.det(rot_matrix) < 0:
+        u[:, -1] *= -1.0
+        rot_matrix = u @ vt
+
+    trace = float(np.trace(rot_matrix))
+    if trace > 0.0:
+        scale = 2.0 * np.sqrt(max(trace + 1.0, 0.0))
+        quat = np.array(
+            [
+                0.25 * scale,
+                (rot_matrix[2, 1] - rot_matrix[1, 2]) / scale,
+                (rot_matrix[0, 2] - rot_matrix[2, 0]) / scale,
+                (rot_matrix[1, 0] - rot_matrix[0, 1]) / scale,
+            ],
+            dtype=np.float64,
+        )
+    elif rot_matrix[0, 0] >= rot_matrix[1, 1] and rot_matrix[0, 0] >= rot_matrix[2, 2]:
+        scale = 2.0 * np.sqrt(max(1.0 + rot_matrix[0, 0] - rot_matrix[1, 1] - rot_matrix[2, 2], 0.0))
+        quat = np.array(
+            [
+                (rot_matrix[2, 1] - rot_matrix[1, 2]) / scale,
+                0.25 * scale,
+                (rot_matrix[0, 1] + rot_matrix[1, 0]) / scale,
+                (rot_matrix[0, 2] + rot_matrix[2, 0]) / scale,
+            ],
+            dtype=np.float64,
+        )
+    elif rot_matrix[1, 1] >= rot_matrix[2, 2]:
+        scale = 2.0 * np.sqrt(max(1.0 + rot_matrix[1, 1] - rot_matrix[0, 0] - rot_matrix[2, 2], 0.0))
+        quat = np.array(
+            [
+                (rot_matrix[0, 2] - rot_matrix[2, 0]) / scale,
+                (rot_matrix[0, 1] + rot_matrix[1, 0]) / scale,
+                0.25 * scale,
+                (rot_matrix[1, 2] + rot_matrix[2, 1]) / scale,
+            ],
+            dtype=np.float64,
+        )
+    else:
+        scale = 2.0 * np.sqrt(max(1.0 + rot_matrix[2, 2] - rot_matrix[0, 0] - rot_matrix[1, 1], 0.0))
+        quat = np.array(
+            [
+                (rot_matrix[1, 0] - rot_matrix[0, 1]) / scale,
+                (rot_matrix[0, 2] + rot_matrix[2, 0]) / scale,
+                (rot_matrix[1, 2] + rot_matrix[2, 1]) / scale,
+                0.25 * scale,
+            ],
+            dtype=np.float64,
+        )
+
+    quat_norm = float(np.linalg.norm(quat))
+    if quat_norm < 1e-12:
         return np.zeros(3, dtype=np.float32)
-    axis = np.array(
-        [R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]],
-        dtype=np.float64,
-    ) / (2.0 * np.sin(theta))
-    return (axis * theta).astype(np.float32)
+    quat /= quat_norm
+    if quat[0] < 0.0:
+        quat *= -1.0
+
+    vector = quat[1:4]
+    vector_norm = float(np.linalg.norm(vector))
+    if vector_norm < 1e-12:
+        return (2.0 * vector).astype(np.float32)
+    angle = 2.0 * np.arctan2(vector_norm, float(quat[0]))
+    return (vector / vector_norm * angle).astype(np.float32)
 
 
 def _random_small_rotation(rng: np.random.Generator, max_abs_deg: float) -> np.ndarray:
@@ -1357,6 +1456,38 @@ def _meta_tracking_errors(
         dot = float(np.clip(np.dot(_normalize(actual_pose[3:6]), _normalize(target_meta_pose[3:6])), -1.0, 1.0))
         direction_error = float(np.arccos(dot))
     return position_error, direction_error
+
+
+def _action_value_diagnostics(
+    actions: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+) -> tuple[bool, bool, float, float, str]:
+    actions = np.asarray(actions)
+    finite = bool(np.all(np.isfinite(actions)))
+    finite_values = actions[np.isfinite(actions)]
+    max_abs_action = float(np.max(np.abs(finite_values))) if finite_values.size else np.inf
+
+    if actions.ndim >= 2 and actions.shape[-1] >= ACTION_CAMERA_INPUT_SLICE.stop:
+        camera_rotvec = actions[..., ACTION_CAMERA_INPUT_SLICE][..., 3:6]
+        rot_norms = np.linalg.norm(camera_rotvec.astype(np.float64), axis=-1)
+        finite_rot_norms = rot_norms[np.isfinite(rot_norms)]
+        max_camera_rotvec_norm = float(np.max(finite_rot_norms)) if finite_rot_norms.size else np.inf
+    else:
+        max_camera_rotvec_norm = 0.0
+
+    ok = (
+        finite
+        and max_abs_action <= config.accept_max_abs_action_value
+        and max_camera_rotvec_norm <= config.accept_max_camera_rotvec_norm_rad
+    )
+    reason = ""
+    if not ok:
+        reason = (
+            f"actions_finite={finite}, "
+            f"max_abs_action_value={max_abs_action:.6f}, "
+            f"max_camera_rotvec_norm_rad={max_camera_rotvec_norm:.6f}"
+        )
+    return ok, finite, max_abs_action, max_camera_rotvec_norm, reason
 
 
 def _camera_pose_to_transform(pose6d: np.ndarray) -> np.ndarray:

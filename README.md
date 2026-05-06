@@ -342,10 +342,15 @@ Useful flags:
 | `--position-noise-max-m` | `0.04` | Max xyz perturbation in meters |
 | `--direction-noise-max-deg` | `25.0` | Max direction perturbation for line/surface meta areas |
 | `--approach-joint-step-rad` | `0.04` | Dynamic approach length is `ceil(max(|Δq_right|) / this)` |
+| `--accept-max-camera-rotvec-norm-rad` | `3.143` | Reject cached variants whose recomputed camera rotvec is outside the canonical near-π range |
+| `--accept-max-abs-action-value` | `1e4` | Reject catastrophic non-camera action values before cache write |
 
 The builder writes accepted retargeted chunks to `variants/` and records them in `manifest.jsonl`.
 If IK or validation fails, it retries random perturbations up to `--max-attempts-per-variant`; failed
-records go to `failures.jsonl` and are not sampled during training.
+records go to `failures.jsonl` and are not sampled during training. Validation also rejects
+non-finite or clearly out-of-range retarget actions; camera rotvecs are recomputed with a
+near-180-degree-stable SO(3) conversion and are bounded by
+`--accept-max-camera-rotvec-norm-rad` before cache write.
 
 Training-time sampling is independent from cache generation. The base `DataConfig` keeps retarget
 disabled by default, so old/non-meta training configs do not use this path. The x-trainer

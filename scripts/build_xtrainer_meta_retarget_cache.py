@@ -260,6 +260,8 @@ def main(
     accept_max_position_error_m: float = 0.015,
     accept_max_direction_error_rad: float = 0.25,
     accept_max_step_joint_delta_rad: float = 0.35,
+    accept_max_abs_action_value: float = 1e4,
+    accept_max_camera_rotvec_norm_rad: float = 3.143,
 ) -> None:
     """Build a reusable retarget cache for one OpenPI training config."""
 
@@ -312,6 +314,8 @@ def main(
         accept_max_position_error_m=accept_max_position_error_m,
         accept_max_direction_error_rad=accept_max_direction_error_rad,
         accept_max_step_joint_delta_rad=accept_max_step_joint_delta_rad,
+        accept_max_abs_action_value=accept_max_abs_action_value,
+        accept_max_camera_rotvec_norm_rad=accept_max_camera_rotvec_norm_rad,
     )
 
     metadata = {
