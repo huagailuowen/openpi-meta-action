@@ -334,11 +334,11 @@ records go to `failures.jsonl` and are not sampled during training.
 
 Training-time sampling is independent from cache generation. The base `DataConfig` keeps retarget
 disabled by default, so old/non-meta training configs do not use this path. The x-trainer
-meta-aware configs default to `meta_retarget_cache_prob=0.8`; when
+meta-aware configs default to `meta_retarget_cache_prob=0.5`; when
 `data.meta_retarget_cache_dir` is set, each access to a cached chunk independently returns a
-retarget variant with probability `0.8`, otherwise it returns the original chunk. With the default
+retarget variant with probability `0.5`, otherwise it returns the original chunk. With the default
 cache coverage `--retarget-prob=0.5`, the global expected retarget training ratio is about
-`0.5 × 0.8 = 0.4`. If a chunk has multiple cached variants, one variant is sampled randomly each
+`0.5 × 0.5 = 0.25`. If a chunk has multiple cached variants, one variant is sampled randomly each
 time.
 
 ### 4. Compute norm stats

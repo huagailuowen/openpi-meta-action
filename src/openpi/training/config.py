@@ -386,7 +386,7 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     cam_left_wrist_drop_prob: float = 0.0
     cam_right_wrist_drop_prob: float = 0.0
     meta_retarget_cache_dir: str | None = None
-    meta_retarget_cache_prob: float = 0.8
+    meta_retarget_cache_prob: float = 0.5
     meta_retarget_cache_seed: int = 0
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
@@ -488,7 +488,7 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     cam_left_wrist_drop_prob: float = 0.0
     cam_right_wrist_drop_prob: float = 0.0
     meta_retarget_cache_dir: str | None = None
-    meta_retarget_cache_prob: float = 0.8
+    meta_retarget_cache_prob: float = 0.5
     meta_retarget_cache_seed: int = 0
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
