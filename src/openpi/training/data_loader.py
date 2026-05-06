@@ -73,12 +73,20 @@ class RetargetCacheDataset(Dataset[T_co]):
     supervision fields.
     """
 
-    def __init__(self, dataset: Dataset, cache_dir: str | pathlib.Path, sample_prob: float, seed: int):
+    def __init__(
+        self,
+        dataset: Dataset,
+        cache_dir: str | pathlib.Path,
+        sample_prob: float,
+        seed: int,
+        expected_action_space: str,
+    ):
         self._dataset = dataset
         self._cache_dir = pathlib.Path(cache_dir).expanduser()
         self._sample_prob = float(sample_prob)
         self._rng = np.random.default_rng(seed)
         self._records_by_index = self._load_manifest(self._cache_dir)
+        self._warn_if_action_space_mismatch(self._cache_dir, expected_action_space)
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         sample = self._dataset[index]
@@ -122,10 +130,10 @@ class RetargetCacheDataset(Dataset[T_co]):
         records_by_index: dict[int, list[dict[str, typing.Any]]] = {}
         with manifest_path.open("r", encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line:
+                stripped_line = line.strip()
+                if not stripped_line:
                     continue
-                record = json.loads(line)
+                record = json.loads(stripped_line)
                 if not bool(record.get("accepted", True)):
                     continue
                 base_index = int(record["base_index"])
@@ -138,6 +146,48 @@ class RetargetCacheDataset(Dataset[T_co]):
         )
         return records_by_index
 
+    @staticmethod
+    def _warn_if_action_space_mismatch(cache_dir: pathlib.Path, expected_action_space: str) -> None:
+        metadata_path = cache_dir / "metadata.json"
+        if not metadata_path.exists():
+            if expected_action_space == "delta":
+                logging.warning(
+                    "Retarget cache metadata not found at %s; rebuild older delta caches to ensure cached actions "
+                    "are stored in delta action space.",
+                    metadata_path,
+                )
+            return
+
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logging.warning("Could not parse retarget cache metadata: %s", metadata_path)
+            return
+
+        actual_action_space = metadata.get("cache_action_space")
+        if actual_action_space is None:
+            if expected_action_space == "delta":
+                logging.warning(
+                    "Retarget cache metadata at %s does not record cache_action_space; rebuild older delta caches "
+                    "to avoid mixing absolute actions into a delta training pipeline.",
+                    metadata_path,
+                )
+            return
+
+        if actual_action_space != expected_action_space:
+            logging.warning(
+                "Retarget cache action space mismatch: cache has %s actions but this data config expects %s actions.",
+                actual_action_space,
+                expected_action_space,
+            )
+
+
+def _expected_retarget_cache_action_space(data_config: _config.DataConfig) -> str:
+    for transform in data_config.data_transforms.inputs:
+        if transform.__class__.__name__ == "DeltaActions" and transform.mask is not None:
+            return "delta"
+    return "absolute"
+
 
 def maybe_wrap_retarget_cache_dataset(dataset: Dataset, data_config: _config.DataConfig) -> Dataset:
     if not data_config.meta_retarget_cache_dir or data_config.meta_retarget_cache_prob <= 0.0:
@@ -147,6 +197,7 @@ def maybe_wrap_retarget_cache_dataset(dataset: Dataset, data_config: _config.Dat
         data_config.meta_retarget_cache_dir,
         sample_prob=data_config.meta_retarget_cache_prob,
         seed=data_config.meta_retarget_cache_seed,
+        expected_action_space=_expected_retarget_cache_action_space(data_config),
     )
 
 

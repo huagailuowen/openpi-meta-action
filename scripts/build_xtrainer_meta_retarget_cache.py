@@ -3,7 +3,9 @@
 The cache is chunk-centric. For each LeRobot dataset index, this script first
 loads the same action horizon that OpenPI training would see, canonicalizes old
 and structured meta formats into ``state/actions/meta_areas``, and then
-optionally writes one or more retargeted variants.
+optionally writes one or more retargeted variants. IK runs in absolute action
+space; cache files are saved in the action space expected by the selected
+training config.
 
 Training can later sample this cache with:
 
@@ -38,7 +40,7 @@ def _apply_transforms(data: dict[str, Any], transforms) -> dict[str, Any]:
 def _infer_max_meta_areas(data_config: Any) -> int:
     for transform in data_config.data_transforms.inputs:
         if hasattr(transform, "max_meta_areas"):
-            return int(getattr(transform, "max_meta_areas"))
+            return int(transform.max_meta_areas)
     return 1
 
 
@@ -47,6 +49,17 @@ def _infer_action_stride(data_config: Any) -> int:
         if transform.__class__.__name__ == "SubsampleActions":
             return int(transform.stride)
     return 1
+
+
+def _infer_delta_action_masks(data_config: Any) -> list[np.ndarray]:
+    masks: list[np.ndarray] = []
+    for transform in data_config.data_transforms.inputs:
+        if transform.__class__.__name__ != "DeltaActions":
+            continue
+        mask = getattr(transform, "mask", None)
+        if mask is not None:
+            masks.append(np.asarray(mask, dtype=bool))
+    return masks
 
 
 def _canonicalize_sample(
@@ -66,6 +79,28 @@ def _canonicalize_sample(
     return canonical
 
 
+def _apply_delta_action_masks(
+    result: _retarget.MetaRetargetResult,
+    delta_action_masks: list[list[bool]],
+) -> _retarget.MetaRetargetResult:
+    if not delta_action_masks:
+        return result
+
+    actions = result.actions.copy()
+    state = result.state
+    for mask_values in delta_action_masks:
+        mask = np.asarray(mask_values, dtype=bool)
+        dims = int(mask.shape[-1])
+        if actions.shape[-1] < dims or state.shape[-1] < dims:
+            raise ValueError(
+                f"Cannot apply DeltaActions mask with {dims} dims to "
+                f"state/actions shapes {state.shape}/{actions.shape}"
+            )
+        actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0.0), axis=-2)
+
+    return dataclasses.replace(result, actions=actions.astype(np.float32))
+
+
 def _load_existing_pairs(cache_dir: pathlib.Path) -> set[tuple[int, int]]:
     manifest_path = cache_dir / "manifest.jsonl"
     if not manifest_path.exists():
@@ -73,10 +108,10 @@ def _load_existing_pairs(cache_dir: pathlib.Path) -> set[tuple[int, int]]:
     pairs: set[tuple[int, int]] = set()
     with manifest_path.open("r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if not line:
+            stripped_line = line.strip()
+            if not stripped_line:
                 continue
-            record = json.loads(line)
+            record = json.loads(stripped_line)
             if bool(record.get("accepted", True)):
                 pairs.add((int(record["base_index"]), int(record["variant_id"])))
     return pairs
@@ -95,6 +130,7 @@ def _generate_variant_worker(
     sample: dict[str, Any],
     cache_dir: str,
     generator_config: dict[str, Any],
+    delta_action_masks: list[list[bool]],
     max_attempts: int,
 ) -> dict[str, Any]:
     config = _retarget.MetaRetargetGeneratorConfig(**generator_config)
@@ -125,6 +161,7 @@ def _generate_variant_worker(
             last_record = {**record, "accepted": False, **diagnostics}
             continue
 
+        result = _apply_delta_action_masks(result, delta_action_masks)
         _retarget.save_retarget_result(pathlib.Path(cache_dir) / relpath, result)
         return {**record, "accepted": True, **diagnostics}
 
@@ -137,6 +174,7 @@ def _generate_variant_batch(
     jobs: list[dict[str, Any]],
     cache_dir: str,
     generator_config: dict[str, Any],
+    delta_action_masks: list[list[bool]],
     max_attempts: int,
     pad_to_batch_size: int | None,
 ) -> list[dict[str, Any]]:
@@ -161,7 +199,7 @@ def _generate_variant_batch(
         results = _retarget.generate_retargeted_chunks_batch(samples, rngs=rngs, config=config)[:real_count]
 
         next_remaining: list[dict[str, Any]] = []
-        for job, result in zip(remaining, results):
+        for job, result in zip(remaining, results, strict=True):
             base_index = int(job["base_index"])
             variant_id = int(job["variant_id"])
             pair = (base_index, variant_id)
@@ -186,7 +224,8 @@ def _generate_variant_batch(
                 next_remaining.append(job)
                 continue
 
-            _retarget.save_retarget_result(pathlib.Path(cache_dir) / relpath, result)
+            cache_result = _apply_delta_action_masks(result, delta_action_masks)
+            _retarget.save_retarget_result(pathlib.Path(cache_dir) / relpath, cache_result)
             final_records[pair] = {**record, "accepted": True, **diagnostics}
 
         remaining = next_remaining
@@ -259,6 +298,8 @@ def main(
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, train_config.model)
     max_meta_areas = _infer_max_meta_areas(data_config)
     action_stride = _infer_action_stride(data_config)
+    delta_action_masks = _infer_delta_action_masks(data_config)
+    delta_action_masks_json = [mask.astype(bool).tolist() for mask in delta_action_masks]
 
     generator_config = _retarget.MetaRetargetGeneratorConfig(
         position_noise_max_m=position_noise_max_m,
@@ -287,6 +328,8 @@ def main(
         "raw_action_horizon": action_horizon,
         "model_action_horizon": train_config.model.action_horizon,
         "action_stride": action_stride,
+        "cache_action_space": "delta" if delta_action_masks else "absolute",
+        "delta_action_masks": delta_action_masks_json,
         "max_meta_areas": max_meta_areas,
         "generator_config": generator_config.to_json_dict(),
     }
@@ -341,6 +384,7 @@ def main(
                 jobs=jobs,
                 cache_dir=str(cache_dir),
                 generator_config=generator_config.to_json_dict(),
+                delta_action_masks=delta_action_masks_json,
                 max_attempts=max_attempts_per_variant,
                 pad_to_batch_size=batch_size,
             )
@@ -409,6 +453,7 @@ def main(
                             sample=canonical,
                             cache_dir=str(cache_dir),
                             generator_config=generator_config.to_json_dict(),
+                            delta_action_masks=delta_action_masks_json,
                             max_attempts=max_attempts_per_variant,
                         )
                     ] = pair

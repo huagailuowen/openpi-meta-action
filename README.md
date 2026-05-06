@@ -306,6 +306,21 @@ meta area as rigidly attached to the right wrist J6, and solves right-arm IK so 
 area follows the original meta-action trajectory. Line and surface areas constrain only their
 direction vector, with no roll constraint; point areas constrain position only.
 
+The cache builder follows the data interface selected by `--config-name`. Legacy meta configs such
+as `pi05_xtrainer_meta_aux` and `pi05_xtrainer_meta_aux_delta` repack only `state` and `actions`;
+the builder then derives the first meta area from the legacy state slice. Structured configs such as
+`pi05_xtrainer_meta_aux_structured_delta` repack `observation.meta_areas.*` and
+`action.meta_targets.*`, so the builder uses those structured fields directly. In both cases, IK and
+retargeting are computed in absolute, unnormalized coordinates after meta extraction.
+
+Cache action space also follows the training config. Non-delta configs write absolute retargeted
+actions. Delta configs still solve IK in absolute space, but the cache writer applies the same
+`DeltaActions` mask before saving each accepted variant; this keeps cached variants compatible with
+the dataloader, which wraps the cache after `data_transforms` and before normalization. Rebuild old
+delta caches generated before this behavior, because those files may contain absolute actions in a
+delta training pipeline. Training will warn when a delta config points to a cache that lacks the new
+`cache_action_space` metadata or records a mismatched action space.
+
 By default, the cache builder uses GPU JAX IK, creates one random variant per selected chunk
 (`V=1`), and selects chunks with probability `0.5`:
 
