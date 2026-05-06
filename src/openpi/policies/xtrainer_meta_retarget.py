@@ -18,6 +18,7 @@ from the cache rather than running IK in every dataloader worker.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import functools
 from pathlib import Path
 import sys
 from typing import Any
@@ -55,6 +56,7 @@ class MetaRetargetGeneratorConfig:
     ik_direction_weight: float = 0.35
     ik_finite_diff_eps: float = 1e-4
     ik_max_joint_step_rad: float = 0.08
+    ik_backend: str = "numpy"
     accept_max_position_error_m: float = 0.015
     accept_max_direction_error_rad: float = 0.25
     accept_max_step_joint_delta_rad: float = 0.35
@@ -229,38 +231,60 @@ def generate_retargeted_chunk(
     position_errors.append(align_pos_err)
     direction_errors.append(align_dir_err)
 
+    jax_follow: dict[str, Any] | None = None
+    if config.ik_backend == "jax" and approach_steps < horizon:
+        follow_seed_sim = (
+            helpers["real_to_sim_arm"](approach_plan.aligned_qpos_real[RIGHT_ARM_QPOS_SLICE], "right")
+            if approach_steps > 0
+            else seed_sim
+        )
+        jax_follow = _solve_right_arm_meta_ik_sequence_jax(
+            target_meta_poses=old_target_meta,
+            T_wrist_meta=T_wrist_meta_new,
+            area_type=area_type,
+            initial_qpos_sim=follow_seed_sim,
+            config=config,
+        )
+
     for step in range(horizon):
         if step < approach_steps:
             alpha = float(step + 1) / float(max(approach_steps, 1))
+            target_meta = _interpolate_meta_pose(area_type, new_input_pose, old_target_meta[0], alpha)
             out_action = actions[0].copy()
             out_action[:14] = state_qpos
             out_action[RIGHT_ARM_QPOS_SLICE] = (
                 (1.0 - alpha) * state_qpos[RIGHT_ARM_QPOS_SLICE]
                 + alpha * approach_plan.aligned_qpos_real[RIGHT_ARM_QPOS_SLICE]
             ).astype(np.float32)
-            T_action_wrist = np.asarray(helpers["fk"](out_action[:14], "right_wrist"), dtype=np.float32)
-            out_action[ACTION_META_SLICE] = _encode_meta_from_transform(area_type, T_action_wrist @ T_wrist_meta_new)
+            out_action[ACTION_META_SLICE] = target_meta
             seed_sim = helpers["real_to_sim_arm"](out_action[RIGHT_ARM_QPOS_SLICE], "right")
         else:
             source_idx = min(step - approach_steps, horizon - 1)
             out_action = actions[source_idx].copy()
             target_meta = old_target_meta[source_idx]
-            ik_result = _solve_right_arm_meta_ik(
-                template_qpos_real=out_action[:14],
-                target_meta_pose=target_meta,
-                T_wrist_meta=T_wrist_meta_new,
-                area_type=area_type,
-                initial_qpos_sim=seed_sim,
-                config=config,
-                helpers=helpers,
-            )
-            solved_sim = _wrap_near_seed(ik_result["qpos_sim"], seed_sim)
+
+            if jax_follow is None:
+                ik_result = _solve_right_arm_meta_ik(
+                    template_qpos_real=out_action[:14],
+                    target_meta_pose=target_meta,
+                    T_wrist_meta=T_wrist_meta_new,
+                    area_type=area_type,
+                    initial_qpos_sim=seed_sim,
+                    config=config,
+                    helpers=helpers,
+                )
+                solved_sim = _wrap_near_seed(ik_result["qpos_sim"], seed_sim)
+                converged = bool(ik_result["converged"])
+            else:
+                solved_sim = np.asarray(jax_follow["qpos_sim"][source_idx], dtype=np.float32)
+                converged = bool(jax_follow["converged"][source_idx])
+
             solved_real = _sim_to_real_right_arm_qpos(solved_sim, helpers)
 
             out_action[RIGHT_ARM_QPOS_SLICE] = solved_real
             out_action[ACTION_META_SLICE] = target_meta
             seed_sim = solved_sim
-            if not bool(ik_result["converged"]):
+            if not converged:
                 ik_nonconverged += 1
 
         if config.recompute_action_camera_pose and T_wrist_cam is not None and out_action.shape[-1] >= 26:
@@ -321,6 +345,104 @@ def generate_retargeted_chunk(
     )
 
 
+def generate_retargeted_chunks_batch(
+    data_batch: list[dict[str, Any]],
+    *,
+    rngs: list[np.random.Generator],
+    config: MetaRetargetGeneratorConfig,
+) -> list[MetaRetargetResult | None]:
+    """Generate a batch of retargeted chunks, using batched JAX IK when requested."""
+
+    if len(data_batch) != len(rngs):
+        raise ValueError(f"data_batch and rngs length mismatch: {len(data_batch)} != {len(rngs)}")
+    if not data_batch:
+        return []
+    if config.ik_backend != "jax":
+        return [generate_retargeted_chunk(data, rng=rng, config=config) for data, rng in zip(data_batch, rngs)]
+    if config.approach_joint_step_rad <= 0:
+        raise ValueError(f"approach_joint_step_rad must be positive, got {config.approach_joint_step_rad}")
+
+    helpers = _load_xtrainer_helpers()
+    prepared: list[dict[str, Any] | None] = [
+        _prepare_retarget_chunk(data, rng=rng, config=config, helpers=helpers) for data, rng in zip(data_batch, rngs)
+    ]
+    results: list[MetaRetargetResult | None] = [None] * len(data_batch)
+
+    for area_type in META_AREA_TYPE_TO_ID:
+        group_indices = [
+            idx
+            for idx, item in enumerate(prepared)
+            if item is not None and item["area_type"] == area_type
+        ]
+        if not group_indices:
+            continue
+
+        first_targets = np.stack([prepared[idx]["old_target_meta"][0] for idx in group_indices], axis=0)[:, None, :]
+        wrist_meta = np.stack([prepared[idx]["T_wrist_meta_new"] for idx in group_indices], axis=0)
+        initial_qpos = np.stack([prepared[idx]["initial_seed_sim"] for idx in group_indices], axis=0)
+        alignment = _solve_right_arm_meta_ik_sequence_batch_jax(
+            target_meta_poses=first_targets,
+            T_wrist_meta=wrist_meta,
+            area_type=area_type,
+            initial_qpos_sim=initial_qpos,
+            config=config,
+        )
+
+        aligned_real_right = np.stack(
+            [_sim_to_real_right_arm_qpos(qpos, helpers) for qpos in alignment["qpos_sim"][:, 0, :]],
+            axis=0,
+        )
+        approach_plans: list[_DynamicApproachPlan] = []
+        follow_initial_qpos = []
+        for group_offset, idx in enumerate(group_indices):
+            item = prepared[idx]
+            assert item is not None
+            aligned_qpos_real = item["state_qpos"].copy()
+            aligned_qpos_real[RIGHT_ARM_QPOS_SLICE] = aligned_real_right[group_offset]
+            right_delta = aligned_real_right[group_offset] - item["state_qpos"][RIGHT_ARM_QPOS_SLICE]
+            approach_steps = int(np.ceil(float(np.max(np.abs(right_delta))) / float(config.approach_joint_step_rad)))
+            if config.max_approach_steps is not None:
+                approach_steps = min(approach_steps, int(config.max_approach_steps))
+            approach_steps = min(max(approach_steps, 0), item["horizon"])
+            approach_plans.append(
+                _DynamicApproachPlan(
+                    steps=approach_steps,
+                    aligned_qpos_real=aligned_qpos_real.astype(np.float32),
+                    converged=bool(alignment["converged"][group_offset, 0]),
+                    final_error=float(alignment["final_error"][group_offset, 0]),
+                )
+            )
+            follow_initial_qpos.append(
+                alignment["qpos_sim"][group_offset, 0, :]
+                if approach_steps > 0
+                else item["initial_seed_sim"]
+            )
+
+        follow_initial_qpos = np.stack(follow_initial_qpos, axis=0).astype(np.float32)
+        follow_targets = np.stack([prepared[idx]["old_target_meta"] for idx in group_indices], axis=0)
+        follow = _solve_right_arm_meta_ik_sequence_batch_jax(
+            target_meta_poses=follow_targets,
+            T_wrist_meta=wrist_meta,
+            area_type=area_type,
+            initial_qpos_sim=follow_initial_qpos,
+            config=config,
+        )
+
+        for group_offset, idx in enumerate(group_indices):
+            item = prepared[idx]
+            assert item is not None
+            results[idx] = _assemble_retarget_result(
+                item,
+                approach_plan=approach_plans[group_offset],
+                follow_qpos_sim=np.asarray(follow["qpos_sim"][group_offset], dtype=np.float32),
+                follow_converged=np.asarray(follow["converged"][group_offset], dtype=bool),
+                config=config,
+                helpers=helpers,
+            )
+
+    return results
+
+
 def save_retarget_result(path: Path, result: MetaRetargetResult) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
@@ -366,6 +488,174 @@ def _load_xtrainer_helpers() -> dict[str, Any]:
         "real_to_sim_arm": real_to_sim_xtrainer_arm_qpos,
         "fk": xtrainer_forward_kinematics,
     }
+
+
+def _prepare_retarget_chunk(
+    data: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+) -> dict[str, Any] | None:
+    state = np.asarray(data["state"], dtype=np.float32).copy()
+    actions = np.asarray(data["actions"], dtype=np.float32).copy()
+    meta_areas = data["meta_areas"]
+    meta_area_pose6d = np.asarray(meta_areas["pose6d"], dtype=np.float32).copy()
+    meta_area_type = np.asarray(meta_areas["type"], dtype=np.int32).copy()
+    meta_area_mask = np.asarray(meta_areas["mask"], dtype=bool).copy()
+
+    if actions.ndim != 2 or actions.shape[0] == 0 or actions.shape[-1] < ACTION_META_SLICE.stop:
+        return None
+    if state.shape[-1] < 14 or actions.shape[-1] < 14:
+        return None
+    if meta_area_pose6d.shape[0] == 0 or not bool(meta_area_mask[0]):
+        return None
+
+    horizon = int(actions.shape[0])
+    area_type = META_AREA_ID_TO_TYPE.get(int(meta_area_type[0]), "line")
+    state_qpos = state[:14].copy()
+    T_state_wrist = np.asarray(helpers["fk"](state_qpos, "right_wrist"), dtype=np.float32)
+    old_input_pose = meta_area_pose6d[0].copy()
+    T_wrist_meta_old = _base_meta_pose_to_wrist_transform(area_type, old_input_pose, T_state_wrist)
+    T_wrist_meta_new = _perturb_wrist_meta_transform(area_type, T_wrist_meta_old, rng, config)
+    new_input_pose = _encode_meta_from_transform(area_type, T_state_wrist @ T_wrist_meta_new)
+
+    return {
+        "state": state,
+        "actions": actions,
+        "meta_area_pose6d": meta_area_pose6d,
+        "meta_area_type": meta_area_type,
+        "meta_area_mask": meta_area_mask,
+        "horizon": horizon,
+        "area_type": area_type,
+        "state_qpos": state_qpos,
+        "T_wrist_meta_new": T_wrist_meta_new,
+        "new_input_pose": new_input_pose,
+        "old_target_meta": actions[:, ACTION_META_SLICE].copy(),
+        "initial_seed_sim": helpers["real_to_sim_arm"](state_qpos[RIGHT_ARM_QPOS_SLICE], "right"),
+    }
+
+
+def _assemble_retarget_result(
+    item: dict[str, Any],
+    *,
+    approach_plan: _DynamicApproachPlan,
+    follow_qpos_sim: np.ndarray,
+    follow_converged: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+) -> MetaRetargetResult:
+    state = item["state"].copy()
+    actions = item["actions"]
+    meta_area_pose6d = item["meta_area_pose6d"].copy()
+    meta_area_type = item["meta_area_type"].copy()
+    meta_area_mask = item["meta_area_mask"].copy()
+    horizon = int(item["horizon"])
+    area_type = item["area_type"]
+    state_qpos = item["state_qpos"]
+    T_wrist_meta_new = item["T_wrist_meta_new"]
+    new_input_pose = item["new_input_pose"]
+    old_target_meta = item["old_target_meta"]
+
+    approach_steps = approach_plan.steps
+    out_actions = actions.copy()
+    previous_real_qpos = state_qpos.copy()
+    ik_nonconverged = 0 if approach_plan.converged else 1
+    position_errors: list[float] = []
+    direction_errors: list[float] = []
+    joint_step_deltas: list[float] = []
+    T_wrist_cam = _camera_pose_to_transform(state[STATE_CAMERA_INPUT_SLICE]) if state.shape[-1] >= 26 else None
+    align_pos_err, align_dir_err = _meta_tracking_errors(
+        area_type=area_type,
+        qpos_real=approach_plan.aligned_qpos_real,
+        T_wrist_meta=T_wrist_meta_new,
+        target_meta_pose=old_target_meta[0],
+        fk_fn=helpers["fk"],
+    )
+    position_errors.append(align_pos_err)
+    direction_errors.append(align_dir_err)
+
+    for step in range(horizon):
+        if step < approach_steps:
+            alpha = float(step + 1) / float(max(approach_steps, 1))
+            out_action = actions[0].copy()
+            out_action[:14] = state_qpos
+            out_action[RIGHT_ARM_QPOS_SLICE] = (
+                (1.0 - alpha) * state_qpos[RIGHT_ARM_QPOS_SLICE]
+                + alpha * approach_plan.aligned_qpos_real[RIGHT_ARM_QPOS_SLICE]
+            ).astype(np.float32)
+            out_action[ACTION_META_SLICE] = _interpolate_meta_pose(
+                area_type,
+                new_input_pose,
+                old_target_meta[0],
+                alpha,
+            )
+        else:
+            source_idx = min(step - approach_steps, horizon - 1)
+            out_action = actions[source_idx].copy()
+            target_meta = old_target_meta[source_idx]
+            solved_real = _sim_to_real_right_arm_qpos(follow_qpos_sim[source_idx], helpers)
+
+            out_action[RIGHT_ARM_QPOS_SLICE] = solved_real
+            out_action[ACTION_META_SLICE] = target_meta
+            if not bool(follow_converged[source_idx]):
+                ik_nonconverged += 1
+
+        if config.recompute_action_camera_pose and T_wrist_cam is not None and out_action.shape[-1] >= 26:
+            T_action_wrist = np.asarray(helpers["fk"](out_action[:14], "right_wrist"), dtype=np.float32)
+            out_action[ACTION_CAMERA_INPUT_SLICE] = _transform_to_camera_pose(T_action_wrist @ T_wrist_cam)
+
+        out_actions[step] = out_action
+
+        pos_err, dir_err = _meta_tracking_errors(
+            area_type=area_type,
+            qpos_real=out_action[:14],
+            T_wrist_meta=T_wrist_meta_new,
+            target_meta_pose=out_action[ACTION_META_SLICE],
+            fk_fn=helpers["fk"],
+        )
+        position_errors.append(pos_err)
+        direction_errors.append(dir_err)
+        joint_step_deltas.append(float(np.max(np.abs(out_action[:14] - previous_real_qpos[:14]))))
+        previous_real_qpos = out_action[:14].copy()
+
+    meta_area_pose6d[0] = new_input_pose
+    max_position_error = float(max(position_errors, default=np.inf))
+    max_direction_error = float(max(direction_errors, default=0.0))
+    max_joint_delta = float(max(joint_step_deltas, default=0.0))
+    accepted = (
+        max_position_error <= config.accept_max_position_error_m
+        and max_direction_error <= config.accept_max_direction_error_rad
+        and max_joint_delta <= config.accept_max_step_joint_delta_rad
+    )
+    reason = ""
+    if not accepted:
+        reason = (
+            f"ik_nonconverged={ik_nonconverged}, "
+            f"max_position_error_m={max_position_error:.6f}, "
+            f"max_direction_error_rad={max_direction_error:.6f}, "
+            f"max_step_joint_delta_rad={max_joint_delta:.6f}"
+        )
+
+    diagnostics = MetaRetargetDiagnostics(
+        accepted=accepted,
+        area_type=area_type,
+        horizon=horizon,
+        approach_steps=approach_steps,
+        ik_nonconverged=ik_nonconverged,
+        max_position_error_m=max_position_error,
+        max_direction_error_rad=max_direction_error,
+        max_step_joint_delta_rad=max_joint_delta,
+        reason=reason,
+    )
+    return MetaRetargetResult(
+        state=state.astype(np.float32),
+        actions=out_actions.astype(np.float32),
+        meta_area_pose6d=meta_area_pose6d.astype(np.float32),
+        meta_area_type=meta_area_type.astype(np.int32),
+        meta_area_mask=meta_area_mask.astype(bool),
+        diagnostics=diagnostics,
+    )
 
 
 def _sim_to_real_right_arm_qpos(sim_qpos_6: np.ndarray, helpers: dict[str, Any]) -> np.ndarray:
@@ -573,11 +863,67 @@ def _interpolate_meta_pose(area_type: str, a: np.ndarray, b: np.ndarray, alpha: 
     out = np.zeros(6, dtype=np.float32)
     out[:3] = (1.0 - alpha) * a[:3] + alpha * b[:3]
     if area_type != "point":
-        out[3:6] = _normalize((1.0 - alpha) * _normalize(a[3:6]) + alpha * _normalize(b[3:6]))
+        out[3:6] = _slerp_unit_vectors(_normalize(a[3:6]), _normalize(b[3:6]), alpha)
     return out
 
 
+def _slerp_unit_vectors(a: np.ndarray, b: np.ndarray, alpha: float) -> np.ndarray:
+    """Interpolate directed unit vectors along the great-circle arc."""
+
+    start = _normalize(a)
+    end = _normalize(b)
+    t = float(np.clip(alpha, 0.0, 1.0))
+    dot = float(np.clip(np.dot(start, end), -1.0, 1.0))
+    theta = float(np.arccos(dot))
+
+    if theta < 1e-6:
+        return start.astype(np.float32)
+    if np.pi - theta < 1e-5:
+        helper = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        if abs(float(np.dot(helper, start))) > 0.9:
+            helper = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        axis = _normalize(np.cross(start, helper))
+        return _normalize(_rotvec_to_matrix(axis * (theta * t)) @ start)
+
+    sin_theta = float(np.sin(theta))
+    return _normalize(
+        (np.sin((1.0 - t) * theta) / sin_theta) * start
+        + (np.sin(t * theta) / sin_theta) * end
+    )
+
+
 def _solve_right_arm_meta_ik(
+    *,
+    template_qpos_real: np.ndarray,
+    target_meta_pose: np.ndarray,
+    T_wrist_meta: np.ndarray,
+    area_type: str,
+    initial_qpos_sim: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+) -> dict[str, Any]:
+    if config.ik_backend == "jax":
+        return _solve_right_arm_meta_ik_jax(
+            target_meta_pose=target_meta_pose,
+            T_wrist_meta=T_wrist_meta,
+            area_type=area_type,
+            initial_qpos_sim=initial_qpos_sim,
+            config=config,
+        )
+    if config.ik_backend != "numpy":
+        raise ValueError(f"Unsupported ik_backend={config.ik_backend!r}; expected 'numpy' or 'jax'")
+    return _solve_right_arm_meta_ik_numpy(
+        template_qpos_real=template_qpos_real,
+        target_meta_pose=target_meta_pose,
+        T_wrist_meta=T_wrist_meta,
+        area_type=area_type,
+        initial_qpos_sim=initial_qpos_sim,
+        config=config,
+        helpers=helpers,
+    )
+
+
+def _solve_right_arm_meta_ik_numpy(
     *,
     template_qpos_real: np.ndarray,
     target_meta_pose: np.ndarray,
@@ -629,6 +975,306 @@ def _solve_right_arm_meta_ik(
         "iterations": iterations,
         "final_error": final_error,
     }
+
+
+def _solve_right_arm_meta_ik_jax(
+    *,
+    target_meta_pose: np.ndarray,
+    T_wrist_meta: np.ndarray,
+    area_type: str,
+    initial_qpos_sim: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+) -> dict[str, Any]:
+    result = _solve_right_arm_meta_ik_sequence_jax(
+        target_meta_poses=np.asarray(target_meta_pose, dtype=np.float32).reshape(1, 6),
+        T_wrist_meta=T_wrist_meta,
+        area_type=area_type,
+        initial_qpos_sim=initial_qpos_sim,
+        config=config,
+    )
+    return {
+        "qpos_sim": result["qpos_sim"][0],
+        "converged": bool(result["converged"][0]),
+        "iterations": int(config.ik_max_iters),
+        "final_error": float(result["final_error"][0]),
+    }
+
+
+def _solve_right_arm_meta_ik_sequence_jax(
+    *,
+    target_meta_poses: np.ndarray,
+    T_wrist_meta: np.ndarray,
+    area_type: str,
+    initial_qpos_sim: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+) -> dict[str, np.ndarray]:
+    solver = _get_jax_ik_sequence_solver(
+        area_type=area_type,
+        ik_max_iters=int(config.ik_max_iters),
+        ik_tolerance=float(config.ik_tolerance),
+        ik_damping=float(config.ik_damping),
+        ik_step_scale=float(config.ik_step_scale),
+        ik_position_weight=float(config.ik_position_weight),
+        ik_direction_weight=float(config.ik_direction_weight),
+        ik_max_joint_step_rad=float(config.ik_max_joint_step_rad),
+    )
+    jax = _import_jax()
+    qpos_sim, converged, final_error = solver(
+        np.asarray(target_meta_poses, dtype=np.float32).reshape(-1, 6),
+        np.asarray(T_wrist_meta, dtype=np.float32).reshape(4, 4),
+        np.asarray(initial_qpos_sim, dtype=np.float32).reshape(6),
+    )
+    qpos_sim, converged, final_error = jax.device_get((qpos_sim, converged, final_error))
+    return {
+        "qpos_sim": np.asarray(qpos_sim, dtype=np.float32),
+        "converged": np.asarray(converged, dtype=bool),
+        "final_error": np.asarray(final_error, dtype=np.float32),
+    }
+
+
+def _solve_right_arm_meta_ik_sequence_batch_jax(
+    *,
+    target_meta_poses: np.ndarray,
+    T_wrist_meta: np.ndarray,
+    area_type: str,
+    initial_qpos_sim: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+) -> dict[str, np.ndarray]:
+    solver = _get_jax_ik_batch_sequence_solver(
+        area_type=area_type,
+        ik_max_iters=int(config.ik_max_iters),
+        ik_tolerance=float(config.ik_tolerance),
+        ik_damping=float(config.ik_damping),
+        ik_step_scale=float(config.ik_step_scale),
+        ik_position_weight=float(config.ik_position_weight),
+        ik_direction_weight=float(config.ik_direction_weight),
+        ik_max_joint_step_rad=float(config.ik_max_joint_step_rad),
+    )
+    jax = _import_jax()
+    qpos_sim, converged, final_error = solver(
+        np.asarray(target_meta_poses, dtype=np.float32),
+        np.asarray(T_wrist_meta, dtype=np.float32),
+        np.asarray(initial_qpos_sim, dtype=np.float32),
+    )
+    qpos_sim, converged, final_error = jax.device_get((qpos_sim, converged, final_error))
+    return {
+        "qpos_sim": np.asarray(qpos_sim, dtype=np.float32),
+        "converged": np.asarray(converged, dtype=bool),
+        "final_error": np.asarray(final_error, dtype=np.float32),
+    }
+
+
+def _import_jax():
+    try:
+        import jax  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError("ik_backend='jax' requires JAX to be installed.") from exc
+    return jax
+
+
+@functools.lru_cache(maxsize=64)
+def _get_jax_ik_batch_sequence_solver(
+    *,
+    area_type: str,
+    ik_max_iters: int,
+    ik_tolerance: float,
+    ik_damping: float,
+    ik_step_scale: float,
+    ik_position_weight: float,
+    ik_direction_weight: float,
+    ik_max_joint_step_rad: float,
+):
+    jax = _import_jax()
+    single_solver = _get_jax_ik_sequence_solver(
+        area_type=area_type,
+        ik_max_iters=ik_max_iters,
+        ik_tolerance=ik_tolerance,
+        ik_damping=ik_damping,
+        ik_step_scale=ik_step_scale,
+        ik_position_weight=ik_position_weight,
+        ik_direction_weight=ik_direction_weight,
+        ik_max_joint_step_rad=ik_max_joint_step_rad,
+    )
+    return jax.jit(jax.vmap(single_solver, in_axes=(0, 0, 0)))
+
+
+@functools.lru_cache(maxsize=64)
+def _get_jax_ik_sequence_solver(
+    *,
+    area_type: str,
+    ik_max_iters: int,
+    ik_tolerance: float,
+    ik_damping: float,
+    ik_step_scale: float,
+    ik_position_weight: float,
+    ik_direction_weight: float,
+    ik_max_joint_step_rad: float,
+):
+    if area_type not in META_AREA_TYPE_TO_ID:
+        raise ValueError(f"Unsupported area_type={area_type!r}")
+
+    jax = _import_jax()
+    import jax.numpy as jnp  # type: ignore
+
+    def make_transform(R, t):
+        T = jnp.eye(4, dtype=jnp.float32)
+        T = T.at[:3, :3].set(jnp.asarray(R, dtype=jnp.float32))
+        T = T.at[:3, 3].set(jnp.asarray(t, dtype=jnp.float32))
+        return T
+
+    def invert_transform(T):
+        R = T[:3, :3]
+        t = T[:3, 3]
+        T_inv = jnp.eye(4, dtype=jnp.float32)
+        T_inv = T_inv.at[:3, :3].set(R.T)
+        T_inv = T_inv.at[:3, 3].set(-(R.T @ t))
+        return T_inv
+
+    def rot_y(theta_rad: float):
+        c = jnp.cos(jnp.asarray(theta_rad, dtype=jnp.float32))
+        s = jnp.sin(jnp.asarray(theta_rad, dtype=jnp.float32))
+        return jnp.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=jnp.float32)
+
+    def rot_z(theta):
+        c = jnp.cos(theta)
+        s = jnp.sin(theta)
+        z = jnp.zeros_like(theta)
+        o = jnp.ones_like(theta)
+        return jnp.stack(
+            [
+                jnp.stack([c, -s, z]),
+                jnp.stack([s, c, z]),
+                jnp.stack([z, z, o]),
+            ],
+            axis=0,
+        ).astype(jnp.float32)
+
+    r_flip_y = rot_y(np.pi)
+    r_left_j2 = jnp.array(
+        [[-1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, -1.0, 0.0]],
+        dtype=jnp.float32,
+    )
+    r_right_j5 = jnp.array(
+        [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+        dtype=jnp.float32,
+    )
+    r_right_j6 = jnp.array(
+        [[0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
+        dtype=jnp.float32,
+    )
+
+    parents = jnp.stack(
+        [
+            make_transform(jnp.eye(3, dtype=jnp.float32), jnp.array([1.06, 0.0, 0.2234], dtype=jnp.float32)),
+            make_transform(r_left_j2, jnp.zeros(3, dtype=jnp.float32)),
+            make_transform(jnp.eye(3, dtype=jnp.float32), jnp.array([0.0, -0.28, 0.0], dtype=jnp.float32)),
+            make_transform(jnp.diag(jnp.array([-1.0, 1.0, -1.0], dtype=jnp.float32)), jnp.array([0.225, 0.0, 0.1175], dtype=jnp.float32)),
+            make_transform(r_right_j5, jnp.array([-0.12, 0.0, 0.0], dtype=jnp.float32)),
+            make_transform(r_right_j6, jnp.array([-0.087743, 0.0, 0.0], dtype=jnp.float32)),
+        ],
+        axis=0,
+    )
+    child_frames = jnp.stack(
+        [
+            jnp.eye(4, dtype=jnp.float32),
+            jnp.eye(4, dtype=jnp.float32),
+            jnp.eye(4, dtype=jnp.float32),
+            jnp.eye(4, dtype=jnp.float32),
+            make_transform(r_flip_y, jnp.zeros(3, dtype=jnp.float32)),
+            jnp.eye(4, dtype=jnp.float32),
+        ],
+        axis=0,
+    )
+    child_inverses = jax.vmap(invert_transform)(child_frames)
+
+    feature_dim = 3 if area_type == "point" else 6
+    eye_feature = jnp.eye(feature_dim, dtype=jnp.float32)
+
+    def normalize(v):
+        norm = jnp.linalg.norm(v)
+        fallback = jnp.array([0.0, 0.0, 1.0], dtype=jnp.float32)
+        return jnp.where(norm < 1e-8, fallback, v / norm)
+
+    def right_fk(qpos_sim):
+        def scan_step(T, xs):
+            parent, child_inv, joint_value = xs
+            T_next = T @ parent @ make_transform(rot_z(joint_value), jnp.zeros(3, dtype=jnp.float32)) @ child_inv
+            return T_next, None
+
+        T_final, _ = jax.lax.scan(
+            scan_step,
+            jnp.eye(4, dtype=jnp.float32),
+            (parents, child_inverses, qpos_sim),
+        )
+        return T_final
+
+    def encode_meta_from_transform(T_base_meta):
+        if area_type == "point":
+            tail = jnp.zeros(3, dtype=jnp.float32)
+        elif area_type == "line":
+            tail = normalize(T_base_meta[:3, 0])
+        else:
+            tail = normalize(T_base_meta[:3, 2])
+        return jnp.concatenate([T_base_meta[:3, 3], tail], axis=0).astype(jnp.float32)
+
+    def weighted_feature_from_pose(pose6d):
+        parts = [pose6d[:3] * ik_position_weight]
+        if area_type != "point":
+            parts.append(normalize(pose6d[3:6]) * ik_direction_weight)
+        return jnp.concatenate(parts, axis=0).astype(jnp.float32)
+
+    def weighted_feature_from_qpos(qpos_sim, T_wrist_meta):
+        T_base_wrist = right_fk(qpos_sim)
+        pose6d = encode_meta_from_transform(T_base_wrist @ T_wrist_meta)
+        return weighted_feature_from_pose(pose6d)
+
+    def wrap_near_seed(qpos, seed):
+        return (seed + jnp.arctan2(jnp.sin(qpos - seed), jnp.cos(qpos - seed))).astype(jnp.float32)
+
+    def solve_one(seed_qpos_sim, target_meta_pose, T_wrist_meta):
+        seed_qpos_sim = seed_qpos_sim.astype(jnp.float32)
+        target_feature = weighted_feature_from_pose(target_meta_pose)
+        jacobian_fn = jax.jacfwd(lambda q: weighted_feature_from_qpos(q, T_wrist_meta))
+
+        def cond_fn(carry):
+            _, iteration, err_norm = carry
+            return (iteration < ik_max_iters) & (err_norm >= ik_tolerance)
+
+        def body_fn(carry):
+            q, iteration, _ = carry
+            feature = weighted_feature_from_qpos(q, T_wrist_meta)
+            error = target_feature - feature
+            err_norm = jnp.linalg.norm(error)
+            J = jacobian_fn(q)
+            JT = J.T
+            dq = JT @ jnp.linalg.solve(J @ JT + (ik_damping**2) * eye_feature, error)
+            if ik_max_joint_step_rad > 0:
+                max_step = jnp.max(jnp.abs(dq))
+                dq = dq * jnp.minimum(1.0, ik_max_joint_step_rad / jnp.maximum(max_step, 1e-8))
+            q_next = (q + ik_step_scale * dq).astype(jnp.float32)
+            next_error = jnp.linalg.norm(target_feature - weighted_feature_from_qpos(q_next, T_wrist_meta))
+            return q_next, iteration + 1, next_error.astype(jnp.float32)
+
+        initial_error = jnp.linalg.norm(target_feature - weighted_feature_from_qpos(seed_qpos_sim, T_wrist_meta))
+        q_final, _, final_error = jax.lax.while_loop(
+            cond_fn,
+            body_fn,
+            (seed_qpos_sim, jnp.asarray(0, dtype=jnp.int32), initial_error.astype(jnp.float32)),
+        )
+        q_final = wrap_near_seed(q_final, seed_qpos_sim)
+        final_error = jnp.linalg.norm(target_feature - weighted_feature_from_qpos(q_final, T_wrist_meta))
+        return q_final, final_error < ik_tolerance, final_error.astype(jnp.float32)
+
+    @jax.jit
+    def solve_sequence(target_meta_poses, T_wrist_meta, initial_qpos_sim):
+        def scan_step(seed, target_meta_pose):
+            qpos_sim, converged, final_error = solve_one(seed, target_meta_pose, T_wrist_meta)
+            return qpos_sim, (qpos_sim, converged, final_error)
+
+        _, outputs = jax.lax.scan(scan_step, initial_qpos_sim.astype(jnp.float32), target_meta_poses)
+        return outputs
+
+    return solve_sequence
 
 
 def _weighted_meta_feature_from_pose(

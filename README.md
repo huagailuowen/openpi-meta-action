@@ -17,6 +17,8 @@ structured per-area 6-DoF pose targets alongside the standard flow-matching robo
 | `src/openpi/models/model.py` | Extended `Observation` with `meta_area_poses/types/masks` |
 | `src/openpi/policies/xtrainer_meta_policy.py` | Data transforms for the meta pipeline |
 | `src/openpi/training/config.py` | New `LeRobotXTrainerMetaDataConfig` and six training configs |
+| `src/openpi/policies/xtrainer_meta_retarget.py` | Offline geometry retarget augmentation for meta-aware x-trainer chunks |
+| `scripts/build_xtrainer_meta_retarget_cache.py` | GPU-batched retarget-cache builder |
 
 ---
 
@@ -296,36 +298,82 @@ meta_areas.mask     [M]      # bool: True if slot is populated
 If `meta_areas` is absent, `XTrainerMetaInputs` will automatically derive the first meta slot from
 `state[14:20]`.
 
-### 3. Compute norm stats
+### 3. Build the optional meta-retarget cache
+
+The meta-aware x-trainer data configs can train from a precomputed geometry retarget cache. The
+cache generator perturbs the input meta area in raw, unnormalized coordinates, treats the perturbed
+meta area as rigidly attached to the right wrist J6, and solves right-arm IK so the perturbed meta
+area follows the original meta-action trajectory. Line and surface areas constrain only their
+direction vector, with no roll constraint; point areas constrain position only.
+
+By default, the cache builder uses GPU JAX IK, creates one random variant per selected chunk
+(`V=1`), and selects chunks with probability `0.5`:
 
 ```bash
-python scripts/compute_norm_stats.py --config-name pi05_xtrainer_meta_aux
+python scripts/build_xtrainer_meta_retarget_cache.py \
+    --config-name pi05_xtrainer_meta_aux \
+    --output-dir /path/to/retarget_cache \
+    --overwrite
+```
+
+Useful flags:
+
+| Flag | Default | Meaning |
+|---|---:|---|
+| `--retarget-prob` | `0.5` | Probability that a dataset chunk is selected for cache generation |
+| `--variants-per-selected-chunk` | `1` | Number of random retarget variants generated for each selected chunk |
+| `--ik-backend` | `jax` | IK backend; `jax` uses batched GPU execution, `numpy` uses the CPU path |
+| `--batch-size` | `128` | JAX batch size for cache generation |
+| `--position-noise-max-m` | `0.04` | Max xyz perturbation in meters |
+| `--direction-noise-max-deg` | `25.0` | Max direction perturbation for line/surface meta areas |
+| `--approach-joint-step-rad` | `0.04` | Dynamic approach length is `ceil(max(|Δq_right|) / this)` |
+
+The builder writes accepted retargeted chunks to `variants/` and records them in `manifest.jsonl`.
+If IK or validation fails, it retries random perturbations up to `--max-attempts-per-variant`; failed
+records go to `failures.jsonl` and are not sampled during training.
+
+Training-time sampling is independent from cache generation. The base `DataConfig` keeps retarget
+disabled by default, so old/non-meta training configs do not use this path. The x-trainer
+meta-aware configs default to `meta_retarget_cache_prob=0.4`; when
+`data.meta_retarget_cache_dir` is set, each access to a cached chunk independently returns a
+retarget variant with probability `0.4`, otherwise it returns the original chunk. If a chunk has
+multiple cached variants, one variant is sampled randomly each time.
+
+### 4. Compute norm stats
+
+```bash
+python scripts/compute_norm_stats.py --config-name pi05_xtrainer_meta_aux \
+    --overrides data.repo_id=/path/to/your/dataset \
+    --overrides data.meta_retarget_cache_dir=/path/to/retarget_cache
 ```
 
 This writes normalisation statistics to `assets/<repo_id>/norm_stats.json`.
 
-### 4. Run training
+### 5. Run training
 
 ```bash
 # Full fine-tuning with meta-action head (recommended, requires A100/H100)
 python scripts/train.py pi05_xtrainer_meta_aux \
     --exp-name my_run \
-    --overrides data.repo_id=/path/to/your/dataset
+    --overrides data.repo_id=/path/to/your/dataset \
+    --overrides data.meta_retarget_cache_dir=/path/to/retarget_cache
 
 # With delta actions
 python scripts/train.py pi05_xtrainer_meta_aux_delta \
     --exp-name my_run_delta \
-    --overrides data.repo_id=/path/to/your/dataset
+    --overrides data.repo_id=/path/to/your/dataset \
+    --overrides data.meta_retarget_cache_dir=/path/to/retarget_cache
 
 # Low-memory LoRA variant (RTX 4090 / 24 GB)
 python scripts/train.py pi05_xtrainer_meta_aux_low_mem_finetune \
     --exp-name my_run_lora \
-    --overrides data.repo_id=/path/to/your/dataset
+    --overrides data.repo_id=/path/to/your/dataset \
+    --overrides data.meta_retarget_cache_dir=/path/to/retarget_cache
 ```
 
 Training checkpoints are saved under `checkpoints/<exp-name>/`.
 
-### 5. Serve the policy
+### 6. Serve the policy
 
 ```bash
 python scripts/serve_policy.py \

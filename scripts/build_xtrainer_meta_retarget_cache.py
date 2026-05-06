@@ -132,6 +132,68 @@ def _generate_variant_worker(
     return last_record
 
 
+def _generate_variant_batch(
+    *,
+    jobs: list[dict[str, Any]],
+    cache_dir: str,
+    generator_config: dict[str, Any],
+    max_attempts: int,
+    pad_to_batch_size: int | None,
+) -> list[dict[str, Any]]:
+    config = _retarget.MetaRetargetGeneratorConfig(**generator_config)
+    remaining = list(jobs)
+    final_records: dict[tuple[int, int], dict[str, Any]] = {}
+
+    for attempt in range(max(1, int(max_attempts))):
+        if not remaining:
+            break
+
+        rngs = [np.random.default_rng(int(job["seed"]) + attempt * 9973) for job in remaining]
+        samples = [job["sample"] for job in remaining]
+        real_count = len(samples)
+        if pad_to_batch_size is not None and real_count < pad_to_batch_size:
+            pad_count = int(pad_to_batch_size) - real_count
+            samples = samples + [samples[-1]] * pad_count
+            rngs = rngs + [
+                np.random.default_rng(int(remaining[-1]["seed"]) + attempt * 9973 + 104729 * (pad_idx + 1))
+                for pad_idx in range(pad_count)
+            ]
+        results = _retarget.generate_retargeted_chunks_batch(samples, rngs=rngs, config=config)[:real_count]
+
+        next_remaining: list[dict[str, Any]] = []
+        for job, result in zip(remaining, results):
+            base_index = int(job["base_index"])
+            variant_id = int(job["variant_id"])
+            pair = (base_index, variant_id)
+            relpath = _variant_relpath(base_index, variant_id)
+            record = {
+                "base_index": base_index,
+                "variant_id": variant_id,
+                "path": str(relpath),
+                "seed": int(job["seed"]) + attempt * 9973,
+                "attempt": int(attempt),
+                "attempts": int(attempt + 1),
+            }
+
+            if result is None:
+                final_records[pair] = {**record, "accepted": False, "reason": "sample_not_usable"}
+                next_remaining.append(job)
+                continue
+
+            diagnostics = result.diagnostics.to_json_dict()
+            if not result.diagnostics.accepted:
+                final_records[pair] = {**record, "accepted": False, **diagnostics}
+                next_remaining.append(job)
+                continue
+
+            _retarget.save_retarget_result(pathlib.Path(cache_dir) / relpath, result)
+            final_records[pair] = {**record, "accepted": True, **diagnostics}
+
+        remaining = next_remaining
+
+    return [final_records[(int(job["base_index"]), int(job["variant_id"]))] for job in jobs]
+
+
 def _write_jsonl_record(path: pathlib.Path, record: dict[str, Any]) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
@@ -141,10 +203,11 @@ def main(
     config_name: str,
     output_dir: str,
     *,
-    retarget_prob: float = 1.0,
+    retarget_prob: float = 0.5,
     variants_per_selected_chunk: int = 1,
     seed: int = 0,
     num_workers: int = 8,
+    batch_size: int = 128,
     max_chunks: int | None = None,
     overwrite: bool = False,
     max_attempts_per_variant: int = 8,
@@ -154,6 +217,7 @@ def main(
     max_approach_steps: int | None = None,
     ik_max_iters: int = 80,
     ik_tolerance: float = 1e-3,
+    ik_backend: str = "jax",
     accept_max_position_error_m: float = 0.015,
     accept_max_direction_error_rad: float = 0.25,
     accept_max_step_joint_delta_rad: float = 0.35,
@@ -164,6 +228,12 @@ def main(
         raise ValueError(f"retarget_prob must be in [0, 1], got {retarget_prob}")
     if variants_per_selected_chunk < 1:
         raise ValueError("--variants-per-selected-chunk must be >= 1")
+    if batch_size < 1:
+        raise ValueError("--batch-size must be >= 1")
+    if ik_backend not in ("numpy", "jax"):
+        raise ValueError(f"--ik-backend must be 'numpy' or 'jax', got {ik_backend!r}")
+    if ik_backend == "jax" and num_workers > 1:
+        print("Warning: --ik-backend jax uses batched GPU execution in the main process; --num-workers is ignored.")
 
     cache_dir = pathlib.Path(output_dir).expanduser().resolve()
     if overwrite and cache_dir.exists():
@@ -197,6 +267,7 @@ def main(
         max_approach_steps=max_approach_steps,
         ik_max_iters=ik_max_iters,
         ik_tolerance=ik_tolerance,
+        ik_backend=ik_backend,
         accept_max_position_error_m=accept_max_position_error_m,
         accept_max_direction_error_rad=accept_max_direction_error_rad,
         accept_max_step_joint_delta_rad=accept_max_step_joint_delta_rad,
@@ -209,6 +280,7 @@ def main(
         "variants_per_selected_chunk": variants_per_selected_chunk,
         "seed": seed,
         "num_workers": num_workers,
+        "batch_size": batch_size,
         "max_chunks": max_chunks,
         "max_attempts_per_variant": max_attempts_per_variant,
         "dataset_len": len(dataset),
@@ -229,12 +301,10 @@ def main(
     skipped_probability = 0
 
     pending: dict[futures.Future, tuple[int, int]] = {}
+    batch_jobs: list[dict[str, Any]] = []
 
-    def drain_one() -> None:
+    def handle_record(record: dict[str, Any]) -> None:
         nonlocal accepted, rejected
-        done = next(futures.as_completed(pending))
-        pending.pop(done)
-        record = done.result()
         if bool(record.get("accepted", False)):
             accepted += 1
             _write_jsonl_record(manifest_path, record)
@@ -242,45 +312,112 @@ def main(
             rejected += 1
             _write_jsonl_record(failure_path, record)
 
-    total = len(dataset) if max_chunks is None else min(max_chunks, len(dataset))
-    with futures.ProcessPoolExecutor(max_workers=max(1, int(num_workers))) as executor:
-        for base_index in tqdm.trange(total, desc="Submitting retarget chunks"):
-            if selection_rng.random() > retarget_prob:
-                skipped_probability += variants_per_selected_chunk
-                continue
+    def drain_one() -> None:
+        done = next(futures.as_completed(pending))
+        pending.pop(done)
+        handle_record(done.result())
 
-            raw_sample = dataset[base_index]
-            canonical = _canonicalize_sample(
-                raw_sample,
-                data_config,
-                max_meta_areas=max_meta_areas,
-                action_stride=action_stride,
+    total = len(dataset) if max_chunks is None else min(max_chunks, len(dataset))
+    if ik_backend == "jax":
+        batch_future: futures.Future | None = None
+
+        def drain_batch_future() -> None:
+            nonlocal batch_future
+            if batch_future is None:
+                return
+            for record in batch_future.result():
+                handle_record(record)
+            batch_future = None
+
+        def submit_batch_async(executor: futures.Executor) -> None:
+            nonlocal batch_future
+            if not batch_jobs:
+                return
+            drain_batch_future()
+            jobs = list(batch_jobs)
+            batch_jobs.clear()
+            batch_future = executor.submit(
+                _generate_variant_batch,
+                jobs=jobs,
+                cache_dir=str(cache_dir),
+                generator_config=generator_config.to_json_dict(),
+                max_attempts=max_attempts_per_variant,
+                pad_to_batch_size=batch_size,
             )
 
-            for variant_id in range(variants_per_selected_chunk):
-                pair = (base_index, variant_id)
-                if pair in existing_pairs:
-                    skipped_existing += 1
+        with futures.ThreadPoolExecutor(max_workers=1) as batch_executor:
+            for base_index in tqdm.trange(total, desc="Submitting retarget chunks"):
+                if selection_rng.random() > retarget_prob:
+                    skipped_probability += variants_per_selected_chunk
                     continue
-                variant_seed = int(seed + base_index * 10007 + variant_id * 101)
-                pending[
-                    executor.submit(
-                        _generate_variant_worker,
-                        base_index=base_index,
-                        variant_id=variant_id,
-                        seed=variant_seed,
-                        sample=canonical,
-                        cache_dir=str(cache_dir),
-                        generator_config=generator_config.to_json_dict(),
-                        max_attempts=max_attempts_per_variant,
-                    )
-                ] = pair
-                submitted += 1
-                if len(pending) >= max(1, num_workers * 4):
-                    drain_one()
 
-        while pending:
-            drain_one()
+                raw_sample = dataset[base_index]
+                canonical = _canonicalize_sample(
+                    raw_sample,
+                    data_config,
+                    max_meta_areas=max_meta_areas,
+                    action_stride=action_stride,
+                )
+
+                for variant_id in range(variants_per_selected_chunk):
+                    pair = (base_index, variant_id)
+                    if pair in existing_pairs:
+                        skipped_existing += 1
+                        continue
+                    variant_seed = int(seed + base_index * 10007 + variant_id * 101)
+                    batch_jobs.append(
+                        {
+                            "base_index": base_index,
+                            "variant_id": variant_id,
+                            "seed": variant_seed,
+                            "sample": canonical,
+                        }
+                    )
+                    submitted += 1
+                    if len(batch_jobs) >= batch_size:
+                        submit_batch_async(batch_executor)
+
+            submit_batch_async(batch_executor)
+            drain_batch_future()
+    else:
+        with futures.ProcessPoolExecutor(max_workers=max(1, int(num_workers))) as executor:
+            for base_index in tqdm.trange(total, desc="Submitting retarget chunks"):
+                if selection_rng.random() > retarget_prob:
+                    skipped_probability += variants_per_selected_chunk
+                    continue
+
+                raw_sample = dataset[base_index]
+                canonical = _canonicalize_sample(
+                    raw_sample,
+                    data_config,
+                    max_meta_areas=max_meta_areas,
+                    action_stride=action_stride,
+                )
+
+                for variant_id in range(variants_per_selected_chunk):
+                    pair = (base_index, variant_id)
+                    if pair in existing_pairs:
+                        skipped_existing += 1
+                        continue
+                    variant_seed = int(seed + base_index * 10007 + variant_id * 101)
+                    pending[
+                        executor.submit(
+                            _generate_variant_worker,
+                            base_index=base_index,
+                            variant_id=variant_id,
+                            seed=variant_seed,
+                            sample=canonical,
+                            cache_dir=str(cache_dir),
+                            generator_config=generator_config.to_json_dict(),
+                            max_attempts=max_attempts_per_variant,
+                        )
+                    ] = pair
+                    submitted += 1
+                    if len(pending) >= max(1, num_workers * 4):
+                        drain_one()
+
+            while pending:
+                drain_one()
 
     summary = {
         "submitted": submitted,
