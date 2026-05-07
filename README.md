@@ -301,10 +301,22 @@ If `meta_areas` is absent, `XTrainerMetaInputs` will automatically derive the fi
 ### 3. Build the optional meta-retarget cache
 
 The meta-aware x-trainer data configs can train from a precomputed geometry retarget cache. The
-cache generator perturbs the input meta area in raw, unnormalized coordinates, treats the perturbed
-meta area as rigidly attached to the right wrist J6, and solves right-arm IK so the perturbed meta
-area follows the original meta-action trajectory. Line and surface areas constrain only their
+cache generator retargets the input meta area in raw, unnormalized coordinates, treats the retargeted
+meta area as rigidly attached to the right wrist J6, and solves right-arm IK so the retargeted meta
+area follows a mode-specific meta-action trajectory. Line and surface areas constrain only their
 direction vector, with no roll constraint; point areas constrain position only.
+
+Retarget variants are sampled from two modes. `future_near` places the new meta area near a randomly
+selected frame from the local future trajectory window, then follows the subsequent meta trajectory
+directly. It uses a shifted virtual trajectory that linearly decays back to the original trajectory
+over 8 steps by default, avoiding the earlier behavior where an already-ahead retarget first learned to move
+backward to frame 0. `correction` keeps the original qpos-interpolated approach stage, but samples
+larger off-trajectory perturbations only: the position offset is forbidden inside the forward
+70-degree cone estimated from the first local meta-action frames, and the retarget must differ by
+either more than 2 cm in position or more than 13 degrees in direction while staying within 4 cm and
+35 degrees.
+The mode is sampled once per cache variant according to `--future-near-mode-prob` and stays fixed
+across retry attempts.
 
 The cache builder follows the data interface selected by `--config-name`. Legacy meta configs such
 as `pi05_xtrainer_meta_aux` and `pi05_xtrainer_meta_aux_delta` repack only `state` and `actions`;
@@ -339,8 +351,16 @@ Useful flags:
 | `--variants-per-selected-chunk` | `1` | Number of random retarget variants generated for each selected chunk |
 | `--ik-backend` | `jax` | IK backend; `jax` uses batched GPU execution, `numpy` uses the CPU path |
 | `--batch-size` | `128` | JAX batch size for cache generation |
-| `--position-noise-max-m` | `0.04` | Max xyz perturbation in meters |
-| `--direction-noise-max-deg` | `25.0` | Max direction perturbation for line/surface meta areas |
+| `--future-near-mode-prob` | `0.5` | Per-variant probability of the future-near mode; `1 - p` uses correction mode |
+| `--future-near-window-frames` | `6` | Local trajectory window used by future-near mode, including frame 0 input meta |
+| `--future-near-position-noise-max-m` | `0.008` | Max position noise around the selected future frame |
+| `--future-near-direction-noise-max-deg` | `7.0` | Max direction noise around the selected future frame |
+| `--future-near-transition-steps` | `8` | Linear decay length from shifted virtual trajectory back to original trajectory |
+| `--position-noise-max-m` | `0.04` | Max correction-mode xyz perturbation in meters |
+| `--direction-noise-max-deg` | `35.0` | Max correction-mode direction perturbation for line/surface meta areas |
+| `--correction-forward-exclusion-angle-deg` | `70.0` | Reject correction offsets inside this forward cone around the fitted local motion direction |
+| `--correction-min-position-offset-m` | `0.02` | Correction mode requires this much position offset unless direction offset is large enough |
+| `--correction-min-direction-offset-deg` | `13.0` | Correction mode requires this much direction offset unless position offset is large enough |
 | `--approach-joint-step-rad` | `0.04` | Dynamic approach length is `ceil(max(|Δq_right|) / this)` |
 | `--accept-max-camera-rotvec-norm-rad` | `3.143` | Reject cached variants whose recomputed camera rotvec is outside the canonical near-π range |
 | `--accept-max-abs-action-value` | `1e4` | Reject catastrophic non-camera action values before cache write |

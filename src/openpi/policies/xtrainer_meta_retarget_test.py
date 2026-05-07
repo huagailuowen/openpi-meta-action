@@ -57,6 +57,9 @@ def test_generate_retargeted_chunk_accepts_zero_noise_line_case():
         config=retarget.MetaRetargetGeneratorConfig(
             position_noise_max_m=0.0,
             direction_noise_max_deg=0.0,
+            future_near_mode_prob=1.0,
+            future_near_position_noise_max_m=0.0,
+            future_near_direction_noise_max_deg=0.0,
             approach_joint_step_rad=0.04,
             ik_max_iters=10,
             accept_max_step_joint_delta_rad=1.0,
@@ -65,8 +68,39 @@ def test_generate_retargeted_chunk_accepts_zero_noise_line_case():
 
     assert result is not None
     assert result.diagnostics.accepted
+    assert result.diagnostics.retarget_mode == "future_near"
+    assert result.diagnostics.approach_steps == 0
     assert result.actions.shape == (5, 32)
     assert result.meta_area_pose6d.shape == (1, 6)
+
+
+def test_future_near_targets_start_after_selected_frame():
+    old_input = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
+    old_targets = np.array(
+        [
+            [0.01, 0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.02, 0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.03, 0.0, 0.0, 1.0, 0.0, 0.0],
+            [0.04, 0.0, 0.0, 1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    selected = old_targets[1]
+    new_anchor = selected.copy()
+    new_anchor[:3] += np.array([0.004, 0.0, 0.0], dtype=np.float32)
+
+    targets, source_indices = retarget._build_smooth_chase_targets(  # noqa: SLF001
+        "line",
+        old_targets,
+        old_anchor_pose=selected,
+        new_anchor_pose=new_anchor,
+        trajectory_start_index=2,
+        transition_steps=2,
+    )
+
+    np.testing.assert_array_equal(source_indices, np.array([2, 3, 3, 3], dtype=np.int32))
+    assert targets[0, 0] > old_targets[2, 0]
+    np.testing.assert_allclose(targets[1:], old_targets[source_indices[1:]], atol=1e-6)
 
 
 def test_matrix_to_rotvec_near_pi_is_bounded():

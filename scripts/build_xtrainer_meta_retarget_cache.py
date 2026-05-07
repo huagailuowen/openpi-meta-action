@@ -79,6 +79,10 @@ def _canonicalize_sample(
     return canonical
 
 
+def _with_retarget_mode(sample: dict[str, Any], mode: str) -> dict[str, Any]:
+    return {**sample, "_retarget_mode": mode}
+
+
 def _apply_delta_action_masks(
     result: _retarget.MetaRetargetResult,
     delta_action_masks: list[list[bool]],
@@ -251,7 +255,16 @@ def main(
     overwrite: bool = False,
     max_attempts_per_variant: int = 8,
     position_noise_max_m: float = 0.04,
-    direction_noise_max_deg: float = 25.0,
+    direction_noise_max_deg: float = 35.0,
+    future_near_mode_prob: float = 0.5,
+    future_near_window_frames: int = 6,
+    future_near_position_noise_max_m: float = 0.008,
+    future_near_direction_noise_max_deg: float = 7.0,
+    future_near_transition_steps: int = 8,
+    correction_forward_exclusion_angle_deg: float = 70.0,
+    correction_min_position_offset_m: float = 0.02,
+    correction_min_direction_offset_deg: float = 13.0,
+    correction_max_sample_attempts: int = 64,
     approach_joint_step_rad: float = 0.04,
     max_approach_steps: int | None = None,
     ik_max_iters: int = 80,
@@ -267,6 +280,8 @@ def main(
 
     if not 0.0 <= retarget_prob <= 1.0:
         raise ValueError(f"retarget_prob must be in [0, 1], got {retarget_prob}")
+    if not 0.0 <= future_near_mode_prob <= 1.0:
+        raise ValueError(f"future_near_mode_prob must be in [0, 1], got {future_near_mode_prob}")
     if variants_per_selected_chunk < 1:
         raise ValueError("--variants-per-selected-chunk must be >= 1")
     if batch_size < 1:
@@ -306,6 +321,15 @@ def main(
     generator_config = _retarget.MetaRetargetGeneratorConfig(
         position_noise_max_m=position_noise_max_m,
         direction_noise_max_deg=direction_noise_max_deg,
+        future_near_mode_prob=future_near_mode_prob,
+        future_near_window_frames=future_near_window_frames,
+        future_near_position_noise_max_m=future_near_position_noise_max_m,
+        future_near_direction_noise_max_deg=future_near_direction_noise_max_deg,
+        future_near_transition_steps=future_near_transition_steps,
+        correction_forward_exclusion_angle_deg=correction_forward_exclusion_angle_deg,
+        correction_min_position_offset_m=correction_min_position_offset_m,
+        correction_min_direction_offset_deg=correction_min_direction_offset_deg,
+        correction_max_sample_attempts=correction_max_sample_attempts,
         approach_joint_step_rad=approach_joint_step_rad,
         max_approach_steps=max_approach_steps,
         ik_max_iters=ik_max_iters,
@@ -334,6 +358,7 @@ def main(
         "action_stride": action_stride,
         "cache_action_space": "delta" if delta_action_masks else "absolute",
         "delta_action_masks": delta_action_masks_json,
+        "retarget_mode_sampling": "per_variant_fixed_before_retries",
         "max_meta_areas": max_meta_areas,
         "generator_config": generator_config.to_json_dict(),
     }
@@ -413,12 +438,13 @@ def main(
                         skipped_existing += 1
                         continue
                     variant_seed = int(seed + base_index * 10007 + variant_id * 101)
+                    retarget_mode = "future_near" if selection_rng.random() < future_near_mode_prob else "correction"
                     batch_jobs.append(
                         {
                             "base_index": base_index,
                             "variant_id": variant_id,
                             "seed": variant_seed,
-                            "sample": canonical,
+                            "sample": _with_retarget_mode(canonical, retarget_mode),
                         }
                     )
                     submitted += 1
@@ -448,13 +474,14 @@ def main(
                         skipped_existing += 1
                         continue
                     variant_seed = int(seed + base_index * 10007 + variant_id * 101)
+                    retarget_mode = "future_near" if selection_rng.random() < future_near_mode_prob else "correction"
                     pending[
                         executor.submit(
                             _generate_variant_worker,
                             base_index=base_index,
                             variant_id=variant_id,
                             seed=variant_seed,
-                            sample=canonical,
+                            sample=_with_retarget_mode(canonical, retarget_mode),
                             cache_dir=str(cache_dir),
                             generator_config=generator_config.to_json_dict(),
                             delta_action_masks=delta_action_masks_json,
