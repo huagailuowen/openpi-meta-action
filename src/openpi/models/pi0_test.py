@@ -63,3 +63,28 @@ def test_pi05_meta_inputs_spec_contains_meta_areas():
     assert observation_spec.meta_area_poses is not None
     assert observation_spec.meta_area_types is not None
     assert observation_spec.meta_area_masks is not None
+
+
+def test_pi05_meta_12d_inputs_spec_contains_dim_masks():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        meta_model=True,
+        meta_area_pose_dim=12,
+        meta_action_dim=12,
+        meta_actions_in_action_slice=False,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    observation_spec, _ = config.inputs_spec()
+    assert observation_spec.meta_area_poses is not None
+    assert observation_spec.meta_area_poses.shape[-1] == 12
+    assert observation_spec.meta_area_dim_masks is not None
+    assert observation_spec.meta_area_dim_masks.shape[-1] == 12
+    assert observation_spec.meta_action_target_poses is not None
+    assert observation_spec.meta_action_target_poses.shape[-1] == 12
+    model = nnx.eval_shape(config.create, jax.random.key(0))
+    mask = model.backbone_action_mask_values
+    assert mask[:14] == (1.0,) * 14
+    assert mask[14:20] == (0.0,) * 6
+    assert mask[20:26] == (1.0,) * 6
+    assert mask[26:32] == (0.0,) * 6

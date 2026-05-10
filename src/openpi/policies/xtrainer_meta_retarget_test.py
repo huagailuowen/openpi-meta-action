@@ -31,6 +31,68 @@ def test_canonicalize_structured_meta_chunk_fills_legacy_action_slice():
     np.testing.assert_array_equal(out["actions"][:, 14:20], target_pose6d[:, 0, :])
 
 
+def test_canonicalize_structured_meta12_chunk_keeps_12d_targets_out_of_action():
+    state = np.arange(32, dtype=np.float32)
+    actions = np.zeros((4, 32), dtype=np.float32)
+    actions[:, 14:20] = 99.0
+    actions[:, 20:26] = np.arange(24, dtype=np.float32).reshape(4, 6)
+    expected_actions = actions.copy()
+    expected_actions[:, 14:20] = 0.0
+    target_pose12d = np.arange(4 * 1 * 12, dtype=np.float32).reshape(4, 1, 12)
+    dim_mask12 = np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0]], dtype=bool)
+
+    out = retarget.canonicalize_repacked_xtrainer_chunk(
+        {
+            "state": state,
+            "actions": actions,
+            "meta_areas": {
+                "pose12d": np.ones((1, 12), dtype=np.float32),
+                "dim_mask12": dim_mask12,
+                "type": np.array([0], dtype=np.int32),
+                "mask": np.array([1], dtype=bool),
+            },
+            "meta_action_targets": {
+                "pose12d": target_pose12d,
+                "dim_mask12": np.tile(dim_mask12[None, :, :], (4, 1, 1)),
+                "mask": np.ones((4, 1), dtype=bool),
+            },
+        },
+        max_meta_areas=1,
+    )
+
+    np.testing.assert_array_equal(out["state"][14:20], np.zeros((6,), dtype=np.float32))
+    np.testing.assert_array_equal(out["state"][20:26], state[20:26])
+    np.testing.assert_array_equal(out["meta_areas"]["pose12d"], np.ones((1, 12), dtype=np.float32))
+    np.testing.assert_array_equal(out["meta_areas"]["dim_mask12"], dim_mask12)
+    np.testing.assert_array_equal(out["actions"], expected_actions)
+    np.testing.assert_array_equal(out["meta_action_targets"]["pose12d"], target_pose12d)
+
+
+def test_pose12_anchor_offset_rotates_shape_and_approach_together():
+    old_anchor = np.zeros(12, dtype=np.float32)
+    old_anchor[:3] = [0.0, 0.0, 0.0]
+    old_anchor[3:9] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    old_anchor[9:12] = [0.0, 1.0, 0.0]
+
+    new_anchor = np.zeros(12, dtype=np.float32)
+    new_anchor[:3] = [0.1, 0.0, 0.0]
+    new_anchor[3:9] = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    new_anchor[9:12] = [-1.0, 0.0, 0.0]
+    dim_mask12 = np.ones(12, dtype=bool)
+
+    shifted = retarget._apply_pose_offset_from_anchor(  # noqa: SLF001
+        "line",
+        old_anchor,
+        old_anchor_pose=old_anchor,
+        new_anchor_pose=new_anchor,
+        dim_mask12=dim_mask12,
+    )
+
+    np.testing.assert_allclose(shifted[:3], new_anchor[:3], atol=1e-6)
+    np.testing.assert_allclose(shifted[3:9], new_anchor[3:9], atol=1e-6)
+    np.testing.assert_allclose(shifted[9:12], new_anchor[9:12], atol=1e-6)
+
+
 def test_generate_retargeted_chunk_accepts_zero_noise_line_case():
     helpers = retarget._load_xtrainer_helpers()
     qpos = np.zeros(14, dtype=np.float32)

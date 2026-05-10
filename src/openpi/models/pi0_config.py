@@ -34,6 +34,7 @@ class Pi0Config(_model.BaseModelConfig):
     meta_model: bool = False
     max_meta_areas: int = 3
     meta_area_type_vocab_size: int = 3
+    meta_area_pose_dim: int = 6
     num_meta_special_tokens: int = 4
     # Weight applied to the backbone flow-matching loss term.
     action_loss_weight: float = 1.0
@@ -42,6 +43,9 @@ class Pi0Config(_model.BaseModelConfig):
     meta_loss_weight: float = 0.1
     meta_action_start_dim: int = 14
     meta_action_dim: int = 6
+    # Legacy 6D meta targets are mirrored into action[14:20]. Structured 12D
+    # targets must stay outside the action vector because action[20:26] is camera.
+    meta_actions_in_action_slice: bool = True
     meta_dropout_prob: float = 0.0
     # When True, stop gradients from the meta loss from flowing back into the shared
     # backbone (prefix_out / suffix_out). The meta head still receives full gradients
@@ -117,13 +121,41 @@ class Pi0Config(_model.BaseModelConfig):
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
                 meta_area_poses=(
-                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, 6], jnp.float32) if self.meta_model else None
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, self.meta_area_pose_dim], jnp.float32)
+                    if self.meta_model
+                    else None
+                ),
+                meta_area_dim_masks=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, self.meta_area_pose_dim], jnp.bool_)
+                    if self.meta_model and self.meta_area_pose_dim == 12
+                    else None
                 ),
                 meta_area_types=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.int32) if self.meta_model else None
                 ),
                 meta_area_masks=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.bool_) if self.meta_model else None
+                ),
+                meta_action_target_poses=(
+                    jax.ShapeDtypeStruct(
+                        [batch_size, self.action_horizon, self.max_meta_areas, self.meta_action_dim],
+                        jnp.float32,
+                    )
+                    if self.meta_model
+                    else None
+                ),
+                meta_action_target_dim_masks=(
+                    jax.ShapeDtypeStruct(
+                        [batch_size, self.action_horizon, self.max_meta_areas, self.meta_action_dim],
+                        jnp.bool_,
+                    )
+                    if self.meta_model and self.meta_action_dim == 12
+                    else None
+                ),
+                meta_action_target_masks=(
+                    jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.max_meta_areas], jnp.bool_)
+                    if self.meta_model
+                    else None
                 ),
             )
         action_spec = jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)

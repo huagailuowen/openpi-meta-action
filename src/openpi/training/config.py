@@ -439,7 +439,7 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
 
         if self.use_delta_joint_actions:
             # Block layout kept as -3/-9/-6 so individual segments are easy to flip:
-            # -3 = meta xyz (14:17), -9 = meta rpy + camera (17:26), -6 = trailing (26:32).
+            # dims 14:32 stay absolute/ignored; structured 12D targets are separate fields.
             delta_action_mask = _transforms.make_bool_mask(6, -1, 6, -1, -3, -9, -6)
             data_transforms = data_transforms.push(
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
@@ -468,15 +468,15 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     This is the new interface path and intentionally does not replace
     ``LeRobotXTrainerMetaDataConfig``. It reads explicit
     ``observation.meta_areas.*`` and ``action.meta_targets.*`` fields from the
-    LeRobot dataset. The current Pi0Meta loss still consumes the legacy
-    ``actions[..., 14:20]`` slot, so ``XTrainerStructuredMetaInputs`` writes that
-    slot from ``action.meta_targets.pose6d`` as a compatibility adapter.
+    LeRobot dataset. It supports the old 6D pose path and the 12D path
+    (`pose12d=[pos3, shape6, approach3]`) through `meta_area_pose_dim`.
     """
 
     use_delta_joint_actions: bool = False
     default_prompt: str | None = None
     output_action_dim: int = 32
     max_meta_areas: int = 3
+    meta_area_pose_dim: int = 6
     require_structured_meta: bool = True
     action_sequence_keys: Sequence[str] = (
         "action",
@@ -520,14 +520,57 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.meta_area_pose_dim == 12:
+            repack_transforms = _transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.top",
+                                "cam_left_wrist": "observation.images.left_wrist",
+                                "cam_right_wrist": "observation.images.right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                            "meta_areas": {
+                                "pose12d": "observation.meta_areas.pose12d",
+                                "dim_mask12": "observation.meta_areas.dim_mask12",
+                                "type": "observation.meta_areas.type",
+                                "mask": "observation.meta_areas.mask",
+                            },
+                            "meta_action_targets": {
+                                "pose12d": "action.meta_targets.pose12d",
+                                "dim_mask12": "action.meta_targets.dim_mask12",
+                                "mask": "action.meta_targets.mask",
+                            },
+                        }
+                    )
+                ]
+            )
+            action_sequence_keys = (
+                "action",
+                "action.meta_targets.pose12d",
+                "action.meta_targets.dim_mask12",
+                "action.meta_targets.mask",
+            )
+        else:
+            repack_transforms = self.repack_transforms
+            action_sequence_keys = self.action_sequence_keys
+
         data_transforms = _transforms.Group(
             inputs=[
                 xtrainer_meta_policy.XTrainerStructuredMetaInputs(
                     max_meta_areas=self.max_meta_areas,
+                    meta_area_pose_dim=self.meta_area_pose_dim,
                     require_structured_meta=self.require_structured_meta,
                 )
             ],
-            outputs=[xtrainer_meta_policy.XTrainerMetaOutputs(action_dim=self.output_action_dim)],
+            outputs=[
+                xtrainer_meta_policy.XTrainerMetaOutputs(
+                    action_dim=self.output_action_dim,
+                    zero_unused_meta_slice=self.meta_area_pose_dim == 12,
+                )
+            ],
         )
         if self.action_stride > 1:
             data_transforms = data_transforms.push(
@@ -560,10 +603,10 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
-            repack_transforms=self.repack_transforms,
+            repack_transforms=repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
-            action_sequence_keys=self.action_sequence_keys,
+            action_sequence_keys=action_sequence_keys,
             data_action_horizon_override=data_action_horizon_override,
             meta_retarget_cache_dir=self.meta_retarget_cache_dir,
             meta_retarget_cache_prob=self.meta_retarget_cache_prob,
@@ -1227,6 +1270,36 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=True),
             output_action_dim=32,
             max_meta_areas=1,
+            use_delta_joint_actions=True,
+            action_stride=1,
+            default_prompt="use the tool affordance to complete the task",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_meta_aux_structured_12d_delta",
+        model=pi0_config.Pi0Config(
+            max_token_len=300,
+            pi05=True,
+            meta_model=True,
+            meta_area_pose_dim=12,
+            meta_action_dim=12,
+            meta_actions_in_action_slice=False,
+            meta_dropout_prob=0.25,
+            action_loss_weight=1.0,
+            meta_loss_weight=1,
+            meta_stop_backbone_grad=False,
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotXTrainerStructuredMetaDataConfig(
+            repo_id="/home/cy/shared_project/funcPoint4VLAadp/datasets_lerobot_structured/dataset_cy_cut_meta12D/cut_knife100_stick10_2_4type_spadeOldRightLast10_2",
+            base_config=DataConfig(prompt_from_task=True),
+            output_action_dim=32,
+            max_meta_areas=1,
+            meta_area_pose_dim=12,
             use_delta_joint_actions=True,
             action_stride=1,
             default_prompt="use the tool affordance to complete the task",

@@ -4,7 +4,8 @@ This repository is a fork of [Physical Intelligence's openpi](https://github.com
 The original documentation is preserved in [README_official.md](README_official.md).
 
 This fork adds a **geometry meta-action** auxiliary head to the π₀.₅ model that jointly predicts
-structured per-area 6-DoF pose targets alongside the standard flow-matching robot actions.
+structured per-area meta targets alongside the standard flow-matching robot actions. It supports
+the legacy 6D pose interface and the newer 12D structured affordance interface.
 
 ---
 
@@ -14,10 +15,10 @@ structured per-area 6-DoF pose targets alongside the standard flow-matching robo
 |---|---|
 | `src/openpi/models/pi0_meta.py` | New `Pi0Meta` model with `MetaActionHead` |
 | `src/openpi/models/pi0_config.py` | New config flags to enable the meta model |
-| `src/openpi/models/model.py` | Extended `Observation` with `meta_area_poses/types/masks` |
+| `src/openpi/models/model.py` | Extended `Observation` with `meta_area_poses/types/masks` and optional 12D dim masks |
 | `src/openpi/policies/xtrainer_meta_policy.py` | Data transforms for the meta pipeline |
-| `src/openpi/training/config.py` | New `LeRobotXTrainerMetaDataConfig` and six training configs |
-| `src/openpi/policies/xtrainer_meta_retarget.py` | Offline geometry retarget augmentation for meta-aware x-trainer chunks |
+| `src/openpi/training/config.py` | New legacy and structured meta data configs, including 12D structured config |
+| `src/openpi/policies/xtrainer_meta_retarget.py` | Offline geometry retarget augmentation for 6D and 12D meta-aware x-trainer chunks |
 | `scripts/build_xtrainer_meta_retarget_cache.py` | GPU-batched retarget-cache builder |
 
 ---
@@ -75,6 +76,59 @@ meta_context_token[i] = LayerNorm(
 ```
 
 When `mask[i]=False` (area not observed), the slot falls back to the default learnable token.
+
+---
+
+## Structured 12D Meta Interface
+
+The new structured interface uses:
+
+```text
+pose12d = [position3, shape_matrix6, approach3]
+shape_matrix6 = [Mxx, Myy, Mzz, Mxy, Mxz, Myz]
+```
+
+`shape_matrix6` is the independent entries of a symmetric direction-distribution matrix. It can
+represent point/line/surface-like geometry without relying on a discrete type at model input time.
+The `type` field is still stored for bookkeeping and retarget logic. `approach3` is an oriented task
+direction; labels with no approach set `approach3=[0,0,0]` and mark dims 9:12 inactive in
+`dim_mask12`.
+
+LeRobot fields for the 12D path:
+
+```text
+observation.meta_areas.pose12d      [M, 12]
+observation.meta_areas.dim_mask12   [M, 12]
+observation.meta_areas.type         [M]
+observation.meta_areas.mask         [M]
+action.meta_targets.pose12d         [H, M, 12]
+action.meta_targets.dim_mask12      [H, M, 12]
+action.meta_targets.mask            [H, M]
+```
+
+Normalization rule:
+
+- `observation.meta_areas.pose12d` is not normalized as a separate input field.
+- `action.meta_targets.pose12d` stays as an explicit raw target field; it is not copied into `actions`.
+- `compute_norm_stats.py` still only computes stats for `state` and `actions`.
+- Runtime `meta_actions[:,0,:]` is therefore a raw 12D prediction and must not be unnormalized with action stats.
+
+12D action layout:
+
+```text
+dims  0–13   robot joint/gripper action (14D)
+dims  14–19  unused legacy meta slot    (zeroed, no supervision)
+dims  20–25  camera pose/action channel (6D)
+dims  26–31  reserved / padding
+```
+
+The 12D config is `pi05_xtrainer_meta_aux_structured_12d_delta`. It sets
+`meta_area_pose_dim=12`, `meta_action_dim=12`, and `action_dim=32`.
+
+Retarget cache supports the same structured fields. For 12D line/surface tools, if `approach3` is
+active, retargeting aligns the shape matrix and approach direction together instead of only
+interpolating a single direction vector along a great circle. The first 12D implementation uses the
+numpy IK path for semantic correctness; requesting `--ik-backend jax` on 12D data falls back to numpy.
 
 ---
 
@@ -243,6 +297,8 @@ All configs are defined in `src/openpi/training/config.py`. The meta-aware confi
 | `pi05_xtrainer_meta_delta` | π₀.₅ | 32 | Yes | No | Delta joint actions |
 | `pi05_xtrainer_meta_aux` | π₀.₅ | 32 | No | Yes | Full meta-action model |
 | `pi05_xtrainer_meta_aux_delta` | π₀.₅ | 32 | Yes | Yes | Meta + delta actions |
+| `pi05_xtrainer_meta_aux_structured_delta` | π₀.₅ | 32 | Yes | Yes | Explicit structured 6D fields |
+| `pi05_xtrainer_meta_aux_structured_12d_delta` | π₀.₅ | 32 | Yes | Yes | Explicit structured 12D fields |
 | `pi05_xtrainer_meta_aux_low_mem_finetune` | π₀.₅ LoRA | 32 | No | Yes | Low-memory LoRA, batch 8 |
 
 The `*_aux*` configs use `Pi0Meta` (`meta_model=True`) with `meta_dropout_prob=0.25` and
@@ -260,6 +316,10 @@ dims  14–19  meta geometry pose        (6D)  ← meta_action_start_dim=14, met
 dims  20–25  camera/extra DoF          (6D)  ← included in backbone mask
 dims  26–31  (reserved / padding)
 ```
+
+For `pi05_xtrainer_meta_aux_structured_12d_delta`, dims 14–19 are unused and masked out of the
+backbone loss, dims 20–25 remain the camera channel, and the 12D target is supervised only through
+`action.meta_targets.pose12d`.
 
 ---
 
@@ -343,6 +403,15 @@ python scripts/build_xtrainer_meta_retarget_cache.py \
     --overwrite
 ```
 
+For 12D structured data:
+
+```bash
+python scripts/build_xtrainer_meta_retarget_cache.py \
+    --config-name pi05_xtrainer_meta_aux_structured_12d_delta \
+    --output-dir /path/to/retarget_cache_12d \
+    --overwrite
+```
+
 Useful flags:
 
 | Flag | Default | Meaning |
@@ -389,6 +458,14 @@ python scripts/compute_norm_stats.py --config-name pi05_xtrainer_meta_aux \
     --overrides data.meta_retarget_cache_dir=/path/to/retarget_cache
 ```
 
+For 12D structured data:
+
+```bash
+python scripts/compute_norm_stats.py --config-name pi05_xtrainer_meta_aux_structured_12d_delta \
+    --overrides data.repo_id=/path/to/your/structured_12d_lerobot_dataset \
+    --overrides data.meta_retarget_cache_dir=/path/to/retarget_cache_12d
+```
+
 This writes normalisation statistics to `assets/<repo_id>/norm_stats.json`.
 
 ### 5. Run training
@@ -413,6 +490,15 @@ python scripts/train.py pi05_xtrainer_meta_aux_low_mem_finetune \
     --overrides data.meta_retarget_cache_dir=/path/to/retarget_cache
 ```
 
+12D structured training:
+
+```bash
+python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta \
+    --exp-name my_run_12d \
+    --overrides data.repo_id=/path/to/your/structured_12d_lerobot_dataset \
+    --overrides data.meta_retarget_cache_dir=/path/to/retarget_cache_12d
+```
+
 Training checkpoints are saved under `checkpoints/<exp-name>/`.
 
 ### 6. Serve the policy
@@ -424,7 +510,8 @@ python scripts/serve_policy.py \
 ```
 
 The server returns both `actions` (shape `[action_horizon, 32]`) and `meta_actions`
-(shape `[action_horizon, M, 6]`) when using a `*_aux` config.
+(shape `[action_horizon, M, meta_action_dim]`) when using a `*_aux` config. For the 12D config,
+`meta_action_dim=12`; slot-0 runtime predictions are raw 12D values and are not action-normalized.
 
 ---
 
@@ -438,5 +525,6 @@ The server returns both `actions` (shape `[action_horizon, 32]`) and `meta_actio
 | `num_meta_special_tokens` | `4` | Learned global context tokens S |
 | `meta_loss_weight` | `1.0` | Weight of meta loss relative to base loss |
 | `meta_action_start_dim` | `14` | First action dimension belonging to meta pose |
-| `meta_action_dim` | `6` | Dimensionality of each meta pose (6D) |
+| `meta_action_dim` | `6` | Dimensionality of each meta target; set to `12` for structured 12D |
+| `meta_area_pose_dim` | `6` | Dimensionality of input meta-area pose; set to `12` for `pose12d` |
 | `meta_dropout_prob` | `0.0` | Probability of masking a meta slot during training |

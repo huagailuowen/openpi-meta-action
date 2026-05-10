@@ -111,10 +111,29 @@ class RetargetCacheDataset(Dataset[T_co]):
         out["state"] = retargeted["state"].astype(np.float32)
         out["actions"] = retargeted["actions"].astype(np.float32)
         meta_areas = dict(out.get("meta_areas", {}))
-        meta_areas["pose6d"] = retargeted["meta_area_pose6d"].astype(np.float32)
+        if "meta_area_pose12d" in retargeted:
+            meta_areas["pose12d"] = retargeted["meta_area_pose12d"].astype(np.float32)
+            meta_areas.pop("pose6d", None)
+            if "meta_area_dim_mask12" in retargeted:
+                meta_areas["dim_mask12"] = retargeted["meta_area_dim_mask12"].astype(bool)
+        else:
+            meta_areas["pose6d"] = retargeted["meta_area_pose6d"].astype(np.float32)
+            meta_areas.pop("pose12d", None)
+            meta_areas.pop("dim_mask12", None)
         meta_areas["type"] = retargeted["meta_area_type"].astype(np.int32)
         meta_areas["mask"] = retargeted["meta_area_mask"].astype(bool)
         out["meta_areas"] = meta_areas
+        if "meta_action_target_pose12d" in retargeted:
+            meta_targets = dict(out.get("meta_action_targets", {}))
+            meta_targets["pose12d"] = retargeted["meta_action_target_pose12d"].astype(np.float32)
+            meta_targets.pop("pose6d", None)
+            if "meta_action_target_dim_mask12" in retargeted:
+                meta_targets["dim_mask12"] = retargeted["meta_action_target_dim_mask12"].astype(bool)
+            if "meta_action_target_mask" in retargeted:
+                meta_targets["mask"] = retargeted["meta_action_target_mask"].astype(bool)
+            else:
+                meta_targets["mask"] = np.ones(meta_targets["pose12d"].shape[:2], dtype=bool)
+            out["meta_action_targets"] = meta_targets
         return typing.cast(T_co, out)
 
     def __len__(self) -> int:

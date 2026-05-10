@@ -106,10 +106,15 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
-    # Optional structured meta-area inputs.
-    meta_area_poses: at.Float[ArrayT, "*b m 6"] | None = None
+    # Optional structured meta-area inputs. The last dimension is 6 for the old
+    # pose6d path or 12 for pose12d=[pos3, shape6, approach3].
+    meta_area_poses: at.Float[ArrayT, "*b m d"] | None = None
+    meta_area_dim_masks: at.Bool[ArrayT, "*b m d"] | None = None
     meta_area_types: at.Int[ArrayT, "*b m"] | None = None
     meta_area_masks: at.Bool[ArrayT, "*b m"] | None = None
+    meta_action_target_poses: at.Float[ArrayT, "*b ah m d"] | None = None
+    meta_action_target_dim_masks: at.Bool[ArrayT, "*b ah m d"] | None = None
+    meta_action_target_masks: at.Bool[ArrayT, "*b ah m"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -117,10 +122,16 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
-        if ("meta_areas" in data) != (
-            "meta_areas" in data and {"pose6d", "type", "mask"}.issubset(data["meta_areas"])
-        ):
-            raise ValueError("meta_areas must contain pose6d, type, and mask when provided.")
+        if "meta_areas" in data:
+            meta_areas = data["meta_areas"]
+            has_pose = "pose6d" in meta_areas or "pose12d" in meta_areas
+            if not (has_pose and {"type", "mask"}.issubset(meta_areas)):
+                raise ValueError("meta_areas must contain pose6d or pose12d, plus type and mask, when provided.")
+        if "meta_action_targets" in data:
+            meta_targets = data["meta_action_targets"]
+            has_pose = "pose6d" in meta_targets or "pose12d" in meta_targets
+            if not (has_pose and "mask" in meta_targets):
+                raise ValueError("meta_action_targets must contain pose6d or pose12d, plus mask, when provided.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
@@ -135,9 +146,21 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
-            meta_area_poses=data.get("meta_areas", {}).get("pose6d"),
+            meta_area_poses=(
+                data.get("meta_areas", {}).get("pose12d")
+                if "pose12d" in data.get("meta_areas", {})
+                else data.get("meta_areas", {}).get("pose6d")
+            ),
+            meta_area_dim_masks=data.get("meta_areas", {}).get("dim_mask12"),
             meta_area_types=data.get("meta_areas", {}).get("type"),
             meta_area_masks=data.get("meta_areas", {}).get("mask"),
+            meta_action_target_poses=(
+                data.get("meta_action_targets", {}).get("pose12d")
+                if "pose12d" in data.get("meta_action_targets", {})
+                else data.get("meta_action_targets", {}).get("pose6d")
+            ),
+            meta_action_target_dim_masks=data.get("meta_action_targets", {}).get("dim_mask12"),
+            meta_action_target_masks=data.get("meta_action_targets", {}).get("mask"),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -146,14 +169,33 @@ class Observation(Generic[ArrayT]):
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
         meta_area_poses = result.pop("meta_area_poses")
+        meta_area_dim_masks = result.pop("meta_area_dim_masks")
         meta_area_types = result.pop("meta_area_types")
         meta_area_masks = result.pop("meta_area_masks")
+        meta_action_target_poses = result.pop("meta_action_target_poses")
+        meta_action_target_dim_masks = result.pop("meta_action_target_dim_masks")
+        meta_action_target_masks = result.pop("meta_action_target_masks")
         if meta_area_poses is not None or meta_area_types is not None or meta_area_masks is not None:
+            pose_key = "pose12d" if getattr(meta_area_poses, "shape", ()) and meta_area_poses.shape[-1] == 12 else "pose6d"
             result["meta_areas"] = {
-                "pose6d": meta_area_poses,
+                pose_key: meta_area_poses,
                 "type": meta_area_types,
                 "mask": meta_area_masks,
             }
+            if meta_area_dim_masks is not None:
+                result["meta_areas"]["dim_mask12"] = meta_area_dim_masks
+        if meta_action_target_poses is not None or meta_action_target_masks is not None:
+            pose_key = (
+                "pose12d"
+                if getattr(meta_action_target_poses, "shape", ()) and meta_action_target_poses.shape[-1] == 12
+                else "pose6d"
+            )
+            result["meta_action_targets"] = {
+                pose_key: meta_action_target_poses,
+                "mask": meta_action_target_masks,
+            }
+            if meta_action_target_dim_masks is not None:
+                result["meta_action_targets"]["dim_mask12"] = meta_action_target_dim_masks
         return result
 
 
@@ -227,8 +269,12 @@ def preprocess_observation(
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
         meta_area_poses=observation.meta_area_poses,
+        meta_area_dim_masks=observation.meta_area_dim_masks,
         meta_area_types=observation.meta_area_types,
         meta_area_masks=observation.meta_area_masks,
+        meta_action_target_poses=observation.meta_action_target_poses,
+        meta_action_target_dim_masks=observation.meta_action_target_dim_masks,
+        meta_action_target_masks=observation.meta_action_target_masks,
     )
 
 
