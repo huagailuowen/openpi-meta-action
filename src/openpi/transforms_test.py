@@ -39,6 +39,31 @@ def test_delta_actions_noop():
     assert transform(item) is item
 
 
+def test_subsample_actions_subsamples_meta_action_targets():
+    actions = np.arange(6 * 2, dtype=np.float32).reshape(6, 2)
+    pose12d = np.arange(6 * 1 * 12, dtype=np.float32).reshape(6, 1, 12)
+    dim_mask12 = (np.arange(6 * 1 * 12).reshape(6, 1, 12) % 2) == 0
+    mask = np.array([[True], [False], [True], [True], [False], [True]])
+    sample_level = np.array([123], dtype=np.int32)
+    item = {
+        "actions": actions.copy(),
+        "meta_action_targets": {
+            "pose12d": pose12d.copy(),
+            "dim_mask12": dim_mask12.copy(),
+            "mask": mask.copy(),
+            "sample_level": sample_level.copy(),
+        },
+    }
+
+    transformed = _transforms.SubsampleActions(3)(item)
+
+    np.testing.assert_array_equal(transformed["actions"], actions[::3])
+    np.testing.assert_array_equal(transformed["meta_action_targets"]["pose12d"], pose12d[::3])
+    np.testing.assert_array_equal(transformed["meta_action_targets"]["dim_mask12"], dim_mask12[::3])
+    np.testing.assert_array_equal(transformed["meta_action_targets"]["mask"], mask[::3])
+    np.testing.assert_array_equal(transformed["meta_action_targets"]["sample_level"], sample_level)
+
+
 def test_absolute_actions():
     item = {"state": np.array([1, 2, 3]), "actions": np.array([[3, 4, 5], [5, 6, 7]])}
 

@@ -234,7 +234,16 @@ class SubsampleActions(DataTransformFn):
     stride: int
 
     def __call__(self, data: DataDict) -> DataDict:
+        action_horizon = data["actions"].shape[0]
         data["actions"] = data["actions"][:: self.stride]
+        meta_targets = data.get("meta_action_targets")
+        if isinstance(meta_targets, Mapping):
+            data["meta_action_targets"] = {
+                key: value[:: self.stride]
+                if hasattr(value, "shape") and len(value.shape) > 0 and value.shape[0] == action_horizon
+                else value
+                for key, value in meta_targets.items()
+            }
         return data
 
 

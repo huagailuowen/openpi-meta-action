@@ -44,6 +44,46 @@ def test_infer_delta_action_masks():
     np.testing.assert_array_equal(masks[0], np.array([True, False, True], dtype=bool))
 
 
+def test_canonicalize_sample_subsamples_meta_action_targets(monkeypatch):
+    actions = np.arange(6 * 2, dtype=np.float32).reshape(6, 2)
+    pose12d = np.arange(6 * 1 * 12, dtype=np.float32).reshape(6, 1, 12)
+    dim_mask12 = (np.arange(6 * 1 * 12).reshape(6, 1, 12) % 2) == 0
+    mask = np.array([[True], [False], [True], [True], [False], [True]])
+    sample_level = np.array([123], dtype=np.int32)
+
+    def fake_canonicalize_repacked_xtrainer_chunk(repacked, *, max_meta_areas):
+        del repacked, max_meta_areas
+        return {
+            "actions": actions.copy(),
+            "meta_action_targets": {
+                "pose12d": pose12d.copy(),
+                "dim_mask12": dim_mask12.copy(),
+                "mask": mask.copy(),
+                "sample_level": sample_level.copy(),
+            },
+        }
+
+    monkeypatch.setattr(
+        cache_builder._retarget,
+        "canonicalize_repacked_xtrainer_chunk",
+        fake_canonicalize_repacked_xtrainer_chunk,
+    )
+    data_config = SimpleNamespace(repack_transforms=SimpleNamespace(inputs=[]))
+
+    canonical = cache_builder._canonicalize_sample(
+        {},
+        data_config,
+        max_meta_areas=1,
+        action_stride=3,
+    )
+
+    np.testing.assert_array_equal(canonical["actions"], actions[::3])
+    np.testing.assert_array_equal(canonical["meta_action_targets"]["pose12d"], pose12d[::3])
+    np.testing.assert_array_equal(canonical["meta_action_targets"]["dim_mask12"], dim_mask12[::3])
+    np.testing.assert_array_equal(canonical["meta_action_targets"]["mask"], mask[::3])
+    np.testing.assert_array_equal(canonical["meta_action_targets"]["sample_level"], sample_level)
+
+
 def test_apply_delta_action_masks_matches_training_transform():
     state = np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
     actions = np.array([[10.0, 20.0, 30.0, 40.0], [11.0, 21.0, 31.0, 41.0]], dtype=np.float32)

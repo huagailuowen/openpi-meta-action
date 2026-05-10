@@ -75,7 +75,16 @@ def _canonicalize_sample(
         max_meta_areas=max_meta_areas,
     )
     if action_stride > 1:
+        action_horizon = canonical["actions"].shape[0]
         canonical["actions"] = canonical["actions"][::action_stride]
+        meta_targets = canonical.get("meta_action_targets")
+        if isinstance(meta_targets, dict):
+            canonical["meta_action_targets"] = {
+                key: value[::action_stride]
+                if hasattr(value, "shape") and len(value.shape) > 0 and value.shape[0] == action_horizon
+                else value
+                for key, value in meta_targets.items()
+            }
     return canonical
 
 
