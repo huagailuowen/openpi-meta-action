@@ -1295,7 +1295,7 @@ _CONFIGS = [
             action_horizon=50,
         ),
         data=LeRobotXTrainerStructuredMetaDataConfig(
-            repo_id="/home/cy/shared_project/funcPoint4VLAadp/datasets_lerobot_structured/dataset_cy_cut_meta12D/cut_knife100_stick10_2_4type_spadeOldRightLast10_2",
+            repo_id=".",
             base_config=DataConfig(prompt_from_task=True),
             output_action_dim=32,
             max_meta_areas=1,
