@@ -358,6 +358,7 @@ def main(
         repo_id=str(pathlib.Path.cwd().resolve()) if data_config.repo_id == "." else data_config.repo_id,
         meta_retarget_cache_dir=None,
         meta_retarget_cache_prob=0.0,
+        meta_alpha_enabled=False,
     )
 
     action_horizon = data_config.data_action_horizon_override or train_config.model.action_horizon
