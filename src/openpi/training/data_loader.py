@@ -1,3 +1,5 @@
+# ruff: noqa: SLF001
+
 from collections.abc import Iterator, Sequence
 import json
 import logging
@@ -14,6 +16,7 @@ import numpy as np
 import torch
 
 import openpi.models.model as _model
+import openpi.policies.xtrainer_meta_retarget as _meta_retarget
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
@@ -107,34 +110,7 @@ class RetargetCacheDataset(Dataset[T_co]):
             logging.warning("Retarget cache entry missing: %s", variant_path)
             return sample
 
-        out = dict(sample)
-        out["state"] = retargeted["state"].astype(np.float32)
-        out["actions"] = retargeted["actions"].astype(np.float32)
-        meta_areas = dict(out.get("meta_areas", {}))
-        if "meta_area_pose12d" in retargeted:
-            meta_areas["pose12d"] = retargeted["meta_area_pose12d"].astype(np.float32)
-            meta_areas.pop("pose6d", None)
-            if "meta_area_dim_mask12" in retargeted:
-                meta_areas["dim_mask12"] = retargeted["meta_area_dim_mask12"].astype(bool)
-        else:
-            meta_areas["pose6d"] = retargeted["meta_area_pose6d"].astype(np.float32)
-            meta_areas.pop("pose12d", None)
-            meta_areas.pop("dim_mask12", None)
-        meta_areas["type"] = retargeted["meta_area_type"].astype(np.int32)
-        meta_areas["mask"] = retargeted["meta_area_mask"].astype(bool)
-        out["meta_areas"] = meta_areas
-        if "meta_action_target_pose12d" in retargeted:
-            meta_targets = dict(out.get("meta_action_targets", {}))
-            meta_targets["pose12d"] = retargeted["meta_action_target_pose12d"].astype(np.float32)
-            meta_targets.pop("pose6d", None)
-            if "meta_action_target_dim_mask12" in retargeted:
-                meta_targets["dim_mask12"] = retargeted["meta_action_target_dim_mask12"].astype(bool)
-            if "meta_action_target_mask" in retargeted:
-                meta_targets["mask"] = retargeted["meta_action_target_mask"].astype(bool)
-            else:
-                meta_targets["mask"] = np.ones(meta_targets["pose12d"].shape[:2], dtype=bool)
-            out["meta_action_targets"] = meta_targets
-        return typing.cast(T_co, out)
+        return typing.cast(T_co, _apply_retargeted_payload(sample, retargeted))
 
     def __len__(self) -> int:
         return len(self._dataset)
@@ -201,6 +177,265 @@ class RetargetCacheDataset(Dataset[T_co]):
             )
 
 
+def _clone_sample(sample: dict[str, typing.Any]) -> dict[str, typing.Any]:
+    out: dict[str, typing.Any] = dict(sample)
+    for key in ("meta_areas", "meta_action_targets", "meta_control"):
+        if isinstance(out.get(key), dict):
+            out[key] = dict(out[key])
+    return out
+
+
+def _apply_retargeted_payload(sample: dict[str, typing.Any], retargeted: dict[str, np.ndarray]) -> dict[str, typing.Any]:
+    out = _clone_sample(sample)
+    out["state"] = retargeted["state"].astype(np.float32)
+    out["actions"] = retargeted["actions"].astype(np.float32)
+    meta_areas = dict(out.get("meta_areas", {}))
+    if "meta_area_pose12d" in retargeted:
+        meta_areas["pose12d"] = retargeted["meta_area_pose12d"].astype(np.float32)
+        meta_areas.pop("pose6d", None)
+        if "meta_area_dim_mask12" in retargeted:
+            meta_areas["dim_mask12"] = retargeted["meta_area_dim_mask12"].astype(bool)
+    else:
+        meta_areas["pose6d"] = retargeted["meta_area_pose6d"].astype(np.float32)
+        meta_areas.pop("pose12d", None)
+        meta_areas.pop("dim_mask12", None)
+    meta_areas["type"] = retargeted["meta_area_type"].astype(np.int32)
+    meta_areas["mask"] = retargeted["meta_area_mask"].astype(bool)
+    out["meta_areas"] = meta_areas
+    if "meta_action_target_pose12d" in retargeted:
+        meta_targets = dict(out.get("meta_action_targets", {}))
+        meta_targets["pose12d"] = retargeted["meta_action_target_pose12d"].astype(np.float32)
+        meta_targets.pop("pose6d", None)
+        if "meta_action_target_dim_mask12" in retargeted:
+            meta_targets["dim_mask12"] = retargeted["meta_action_target_dim_mask12"].astype(bool)
+        if "meta_action_target_mask" in retargeted:
+            meta_targets["mask"] = retargeted["meta_action_target_mask"].astype(bool)
+        else:
+            meta_targets["mask"] = np.ones(meta_targets["pose12d"].shape[:2], dtype=bool)
+        out["meta_action_targets"] = meta_targets
+    return out
+
+
+class AlphaMetaRetargetDataset(Dataset[T_co]):
+    """Alpha-controlled structured-meta augmentation before normalization.
+
+    Original samples are kept at a fixed probability. The remaining probability
+    mass is split continuously between cached retarget samples and counterfactual
+    samples as a sigmoid function of alpha.
+    """
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        data_config: _config.DataConfig,
+        expected_action_space: str,
+        delta_action_masks: Sequence[np.ndarray],
+    ):
+        self._dataset = dataset
+        self._cache_dir = pathlib.Path(data_config.meta_retarget_cache_dir).expanduser() if data_config.meta_retarget_cache_dir else None
+        self._rng = np.random.default_rng(data_config.meta_alpha_seed)
+        self._records_by_index = (
+            RetargetCacheDataset._load_manifest(self._cache_dir) if self._cache_dir is not None else {}
+        )
+        if self._cache_dir is not None:
+            RetargetCacheDataset._warn_if_action_space_mismatch(self._cache_dir, expected_action_space)
+        self._delta_action_masks = [np.asarray(mask, dtype=bool) for mask in delta_action_masks]
+        self._original_prob = float(np.clip(data_config.meta_alpha_original_prob, 0.0, 1.0))
+        self._sigmoid_k = float(data_config.meta_alpha_sigmoid_k)
+        self._retarget_scale_min = float(data_config.meta_alpha_retarget_scale_min)
+        self._retarget_scale_max = float(data_config.meta_alpha_retarget_scale_max)
+        self._cf_pos_full_m = float(data_config.meta_alpha_counterfactual_pos_full_m)
+        self._cf_shape_full_deg = float(data_config.meta_alpha_counterfactual_shape_full_deg)
+        self._cf_approach_full_deg = float(data_config.meta_alpha_counterfactual_approach_full_deg)
+        self._cf_scale_floor = float(np.clip(data_config.meta_alpha_counterfactual_scale_floor, 0.0, 1.0))
+        self._cf_near_target_prob = float(np.clip(data_config.meta_alpha_counterfactual_near_target_prob, 0.0, 1.0))
+        self._near_pos_m = float(data_config.meta_alpha_near_target_pos_max_m)
+        self._near_shape_deg = float(data_config.meta_alpha_near_target_shape_max_deg)
+        self._near_approach_deg = float(data_config.meta_alpha_near_target_approach_max_deg)
+        self._helpers: dict[str, typing.Any] | None = None
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        sample = typing.cast(dict[str, typing.Any], self._dataset[index])
+        alpha = float(self._rng.random())
+        out = self._choose_augmented_sample(sample, int(index.__index__()), alpha)
+        out = _clone_sample(out)
+        out["meta_control"] = {**dict(out.get("meta_control", {})), "alpha": np.asarray(alpha, dtype=np.float32)}
+        return typing.cast(T_co, out)
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def _choose_augmented_sample(
+        self, sample: dict[str, typing.Any], base_index: int, alpha: float
+    ) -> dict[str, typing.Any]:
+        if self._rng.random() < self._original_prob:
+            return sample
+
+        q_retarget = _sigmoid(self._sigmoid_k * (alpha - 0.5))
+        if self._rng.random() < q_retarget:
+            retargeted = self._sample_retarget_payload(base_index, alpha)
+            if retargeted is not None:
+                return _apply_retargeted_payload(sample, retargeted)
+            return sample
+        return self._make_counterfactual_sample(sample, alpha)
+
+    def _sample_retarget_payload(self, base_index: int, alpha: float) -> dict[str, np.ndarray] | None:
+        if self._cache_dir is None:
+            return None
+        records = self._records_by_index.get(base_index)
+        if not records:
+            return None
+        desired_scale = self._retarget_scale_min + (self._retarget_scale_max - self._retarget_scale_min) * alpha
+        scaled_records = [record for record in records if "retarget_scale" in record]
+        if scaled_records:
+            record = min(scaled_records, key=lambda r: abs(float(r["retarget_scale"]) - desired_scale))
+        else:
+            record = records[int(self._rng.integers(len(records)))]
+        try:
+            with np.load(self._cache_dir / record["path"]) as cached:
+                return {key: cached[key].copy() for key in cached.files}
+        except FileNotFoundError:
+            logging.warning("Retarget cache entry missing: %s", self._cache_dir / record["path"])
+            return None
+
+    def _make_counterfactual_sample(self, sample: dict[str, typing.Any], alpha: float) -> dict[str, typing.Any]:
+        meta_areas = sample.get("meta_areas")
+        if not isinstance(meta_areas, dict) or "pose12d" not in meta_areas:
+            return sample
+        masks = np.asarray(meta_areas.get("mask", []), dtype=bool)
+        if masks.size == 0 or not bool(masks[0]):
+            return sample
+
+        out = _clone_sample(sample)
+        out_meta = dict(out["meta_areas"])
+        poses = np.asarray(out_meta["pose12d"], dtype=np.float32).copy()
+        dim_masks = np.asarray(out_meta.get("dim_mask12", np.ones_like(poses, dtype=bool)), dtype=bool).copy()
+        types = np.asarray(out_meta.get("type", np.zeros((poses.shape[0],), dtype=np.int32)), dtype=np.int32)
+        area_type = _meta_retarget.META_AREA_ID_TO_TYPE.get(int(types.reshape(-1)[0]), "line")
+        dim_mask = dim_masks[0]
+
+        scale = self._counterfactual_scale(alpha)
+        poses[0] = _perturb_pose12(
+            poses[0],
+            area_type,
+            dim_mask,
+            self._rng,
+            position_max_m=self._cf_pos_full_m * scale,
+            shape_max_deg=self._cf_shape_full_deg * scale,
+            approach_max_deg=self._cf_approach_full_deg * scale,
+        )
+        out_meta["pose12d"] = poses
+        out["meta_areas"] = out_meta
+
+        if self._rng.random() < self._cf_near_target_prob:
+            out = self._with_near_original_meta_targets(out, area_type, dim_mask, poses_before=np.asarray(meta_areas["pose12d"], dtype=np.float32))
+        return out
+
+    def _counterfactual_scale(self, alpha: float) -> float:
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        return self._cf_scale_floor + (1.0 - self._cf_scale_floor) * (1.0 - alpha * alpha)
+
+    def _helpers_once(self) -> dict[str, typing.Any]:
+        if self._helpers is None:
+            self._helpers = _meta_retarget._load_xtrainer_helpers()
+        return self._helpers
+
+    def _with_near_original_meta_targets(
+        self,
+        sample: dict[str, typing.Any],
+        area_type: str,
+        dim_mask: np.ndarray,
+        *,
+        poses_before: np.ndarray,
+    ) -> dict[str, typing.Any]:
+        meta_targets = sample.get("meta_action_targets")
+        if not isinstance(meta_targets, dict) or "pose12d" not in meta_targets:
+            return sample
+
+        state = np.asarray(sample["state"], dtype=np.float32)
+        actions = np.asarray(sample["actions"], dtype=np.float32)
+        if state.shape[-1] < 14 or actions.ndim != 2 or actions.shape[-1] < 14:
+            return sample
+
+        small_input_pose = _perturb_pose12(
+            poses_before[0],
+            area_type,
+            dim_mask,
+            self._rng,
+            position_max_m=self._near_pos_m,
+            shape_max_deg=self._near_shape_deg,
+            approach_max_deg=self._near_approach_deg,
+        )
+        helpers = self._helpers_once()
+        t_state_wrist = np.asarray(helpers["fk"](state[:14], "right_wrist"), dtype=np.float32)
+        wrist_pose12 = _meta_retarget._base_pose12_to_wrist_pose(small_input_pose, t_state_wrist)
+        absolute_actions = _absolute_actions_for_fk(state, actions, self._delta_action_masks)
+        target_pose12 = np.asarray(meta_targets["pose12d"], dtype=np.float32).copy()
+        if target_pose12.ndim == 2:
+            target_pose12 = target_pose12[:, None, :]
+        for step in range(min(target_pose12.shape[0], absolute_actions.shape[0])):
+            t_base_wrist = np.asarray(helpers["fk"](absolute_actions[step, :14], "right_wrist"), dtype=np.float32)
+            target_pose12[step, 0, :] = _meta_retarget._wrist_pose12_to_base_pose(wrist_pose12, t_base_wrist)
+
+        out = _clone_sample(sample)
+        out_targets = dict(meta_targets)
+        out_targets["pose12d"] = target_pose12.astype(np.float32)
+        out["meta_action_targets"] = out_targets
+        return out
+
+
+def _sigmoid(x: float) -> float:
+    x = float(np.clip(x, -60.0, 60.0))
+    return float(1.0 / (1.0 + np.exp(-x)))
+
+
+def _perturb_pose12(
+    pose12: np.ndarray,
+    area_type: str,
+    dim_mask12: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    position_max_m: float,
+    shape_max_deg: float,
+    approach_max_deg: float,
+) -> np.ndarray:
+    pose = np.asarray(pose12, dtype=np.float32).reshape(12).copy()
+    dim_mask = np.asarray(dim_mask12, dtype=bool).reshape(12)
+    pose[:3] += _meta_retarget._sample_random_vector_in_ball(rng, position_max_m)
+    if area_type == "point":
+        pose[3:12] = 0.0
+        return pose.astype(np.float32)
+
+    if np.any(dim_mask[3:9]) and shape_max_deg > 0.0:
+        r_shape = _meta_retarget._random_small_rotation(rng, shape_max_deg)
+        shape_matrix = _meta_retarget._shape6_to_matrix(pose[3:9])
+        pose[3:9] = _meta_retarget._matrix_to_shape6(
+            _meta_retarget._project_psd_trace1(r_shape @ shape_matrix @ r_shape.T)
+        )
+    if np.any(dim_mask[9:12]) and approach_max_deg > 0.0 and float(np.linalg.norm(pose[9:12])) > 1e-8:
+        r_app = _meta_retarget._random_small_rotation(rng, approach_max_deg)
+        pose[9:12] = _meta_retarget._normalize(r_app @ pose[9:12])
+    elif not np.any(dim_mask[9:12]):
+        pose[9:12] = 0.0
+    return pose.astype(np.float32)
+
+
+def _absolute_actions_for_fk(
+    state: np.ndarray,
+    actions: np.ndarray,
+    delta_action_masks: Sequence[np.ndarray],
+) -> np.ndarray:
+    absolute = np.asarray(actions, dtype=np.float32).copy()
+    state = np.asarray(state, dtype=np.float32)
+    for mask_values in delta_action_masks:
+        mask = np.asarray(mask_values, dtype=bool)
+        dims = int(mask.shape[-1])
+        if absolute.shape[-1] < dims or state.shape[-1] < dims:
+            continue
+        absolute[..., :dims] += np.expand_dims(np.where(mask, state[:dims], 0.0), axis=0)
+    return absolute
+
+
 def _expected_retarget_cache_action_space(data_config: _config.DataConfig) -> str:
     for transform in data_config.data_transforms.inputs:
         if transform.__class__.__name__ == "DeltaActions" and transform.mask is not None:
@@ -208,7 +443,22 @@ def _expected_retarget_cache_action_space(data_config: _config.DataConfig) -> st
     return "absolute"
 
 
+def _delta_action_masks(data_config: _config.DataConfig) -> list[np.ndarray]:
+    return [
+        np.asarray(transform.mask, dtype=bool)
+        for transform in data_config.data_transforms.inputs
+        if transform.__class__.__name__ == "DeltaActions" and transform.mask is not None
+    ]
+
+
 def maybe_wrap_retarget_cache_dataset(dataset: Dataset, data_config: _config.DataConfig) -> Dataset:
+    if data_config.meta_alpha_enabled:
+        return AlphaMetaRetargetDataset(
+            dataset,
+            data_config,
+            expected_action_space=_expected_retarget_cache_action_space(data_config),
+            delta_action_masks=_delta_action_masks(data_config),
+        )
     if not data_config.meta_retarget_cache_dir or data_config.meta_retarget_cache_prob <= 0.0:
         return dataset
     return RetargetCacheDataset(

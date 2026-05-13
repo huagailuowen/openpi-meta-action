@@ -97,6 +97,8 @@ class Pi0Meta(_model.BaseModel):
         self.meta_actions_in_action_slice = config.meta_actions_in_action_slice
         self.meta_area_pose_dim = config.meta_area_pose_dim
         self.meta_dropout_prob = config.meta_dropout_prob
+        self.use_meta_control_alpha = config.use_meta_control_alpha
+        self.meta_loss_alpha_power = config.meta_loss_alpha_power
         self.meta_stop_backbone_grad = config.meta_stop_backbone_grad
 
         backbone_action_mask = [0.0] * config.action_dim
@@ -145,6 +147,9 @@ class Pi0Meta(_model.BaseModel):
             features=paligemma_config.width,
             rngs=rngs,
         )
+        self.meta_alpha_in = (
+            nnx.Linear(1, paligemma_config.width, rngs=rngs) if self.use_meta_control_alpha else None
+        )
         self.meta_default_embedding = nnx.Embed(num_embeddings=1, features=paligemma_config.width, rngs=rngs)
         self.meta_slot_embedding = nnx.Embed(num_embeddings=self.max_meta_areas, features=paligemma_config.width, rngs=rngs)
         self.meta_type_embedding = nnx.Embed(
@@ -187,6 +192,7 @@ class Pi0Meta(_model.BaseModel):
             meta_action_target_poses=observation.meta_action_target_poses,
             meta_action_target_dim_masks=observation.meta_action_target_dim_masks,
             meta_action_target_masks=observation.meta_action_target_masks,
+            meta_control_alpha=observation.meta_control_alpha,
         )
 
     def _apply_meta_dropout(
@@ -197,10 +203,23 @@ class Pi0Meta(_model.BaseModel):
         keep_mask = jax.random.bernoulli(rng, 1.0 - self.meta_dropout_prob, meta_masks.shape)
         return jnp.logical_and(meta_masks, keep_mask)
 
-    def _build_special_tokens(self, batch_size: int) -> at.Float[at.Array, "b s emb"]:
+    def _build_special_tokens(
+        self, observation: _model.Observation
+    ) -> at.Float[at.Array, "b s emb"]:
+        batch_size = observation.state.shape[0]
         special_ids = jnp.arange(self.num_meta_special_tokens, dtype=jnp.int32)
         special_tokens = self.meta_special_embedding(special_ids)[None, :, :]
-        return jnp.broadcast_to(special_tokens, (batch_size, self.num_meta_special_tokens, special_tokens.shape[-1]))
+        special_tokens = jnp.broadcast_to(
+            special_tokens, (batch_size, self.num_meta_special_tokens, special_tokens.shape[-1])
+        )
+        if self.meta_alpha_in is not None:
+            if observation.meta_control_alpha is None:
+                alpha = jnp.ones((batch_size,), dtype=observation.state.dtype)
+            else:
+                alpha = jnp.asarray(observation.meta_control_alpha, dtype=observation.state.dtype).reshape(batch_size)
+            alpha_token = self.meta_alpha_in(alpha[:, None])
+            special_tokens = special_tokens.at[:, 0, :].add(alpha_token)
+        return special_tokens
 
     def _build_meta_context_tokens(
         self, observation: _model.Observation
@@ -255,7 +274,7 @@ class Pi0Meta(_model.BaseModel):
         input_mask.append(jnp.ones(meta_context_tokens.shape[:2], dtype=jnp.bool_))
         ar_mask += [False] * meta_context_tokens.shape[1]
 
-        special_tokens = self._build_special_tokens(obs.state.shape[0])
+        special_tokens = self._build_special_tokens(obs)
         tokens.append(special_tokens)
         input_mask.append(jnp.ones((obs.state.shape[0], self.num_meta_special_tokens), dtype=jnp.bool_))
         ar_mask += [False] * self.num_meta_special_tokens
@@ -341,6 +360,7 @@ class Pi0Meta(_model.BaseModel):
             meta_action_target_poses=observation.meta_action_target_poses,
             meta_action_target_dim_masks=observation.meta_action_target_dim_masks,
             meta_action_target_masks=observation.meta_action_target_masks,
+            meta_control_alpha=observation.meta_control_alpha,
         )
 
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation_for_meta)
@@ -443,7 +463,19 @@ class Pi0Meta(_model.BaseModel):
         denom = jnp.maximum(jnp.sum(meta_loss_mask, axis=-1), 1)
         meta_loss = jnp.sum(meta_loss * meta_loss_mask, axis=-1) / denom
 
-        return self.action_loss_weight * base_loss + self.meta_loss_weight * meta_loss
+        if self.use_meta_control_alpha and self.meta_loss_alpha_power > 0.0:
+            if observation.meta_control_alpha is None:
+                alpha = jnp.ones((observation.state.shape[0],), dtype=meta_loss.dtype)
+            else:
+                alpha = jnp.asarray(observation.meta_control_alpha, dtype=meta_loss.dtype).reshape(
+                    observation.state.shape[0]
+                )
+            alpha = jnp.clip(alpha, 0.0, 1.0)
+            meta_loss_scale = jnp.power(alpha, self.meta_loss_alpha_power)[:, None]
+        else:
+            meta_loss_scale = 1.0
+
+        return self.action_loss_weight * base_loss + self.meta_loss_weight * meta_loss_scale * meta_loss
 
     def sample_actions_with_aux(
         self,

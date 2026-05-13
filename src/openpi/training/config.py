@@ -110,6 +110,23 @@ class DataConfig:
     meta_retarget_cache_prob: float = 0.0
     meta_retarget_cache_seed: int = 0
 
+    # Optional alpha-controlled structured-meta training wrapper. Existing
+    # configs keep this disabled and continue using meta_retarget_cache_prob.
+    meta_alpha_enabled: bool = False
+    meta_alpha_seed: int = 0
+    meta_alpha_original_prob: float = 0.8
+    meta_alpha_sigmoid_k: float = 10.0
+    meta_alpha_retarget_scale_min: float = 0.7
+    meta_alpha_retarget_scale_max: float = 1.0
+    meta_alpha_counterfactual_pos_full_m: float = 0.07
+    meta_alpha_counterfactual_shape_full_deg: float = 38.0
+    meta_alpha_counterfactual_approach_full_deg: float = 45.0
+    meta_alpha_counterfactual_scale_floor: float = 0.15
+    meta_alpha_counterfactual_near_target_prob: float = 0.3
+    meta_alpha_near_target_pos_max_m: float = 0.01
+    meta_alpha_near_target_shape_max_deg: float = 7.0
+    meta_alpha_near_target_approach_max_deg: float = 7.0
+
 
 class GroupFactory(Protocol):
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
@@ -388,6 +405,20 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     meta_retarget_cache_dir: str | None = None
     meta_retarget_cache_prob: float = 0.5
     meta_retarget_cache_seed: int = 0
+    meta_alpha_enabled: bool = False
+    meta_alpha_seed: int = 0
+    meta_alpha_original_prob: float = 0.8
+    meta_alpha_sigmoid_k: float = 10.0
+    meta_alpha_retarget_scale_min: float = 0.7
+    meta_alpha_retarget_scale_max: float = 1.0
+    meta_alpha_counterfactual_pos_full_m: float = 0.07
+    meta_alpha_counterfactual_shape_full_deg: float = 38.0
+    meta_alpha_counterfactual_approach_full_deg: float = 45.0
+    meta_alpha_counterfactual_scale_floor: float = 0.15
+    meta_alpha_counterfactual_near_target_prob: float = 0.3
+    meta_alpha_near_target_pos_max_m: float = 0.01
+    meta_alpha_near_target_shape_max_deg: float = 7.0
+    meta_alpha_near_target_approach_max_deg: float = 7.0
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -458,6 +489,20 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
             meta_retarget_cache_dir=self.meta_retarget_cache_dir,
             meta_retarget_cache_prob=self.meta_retarget_cache_prob,
             meta_retarget_cache_seed=self.meta_retarget_cache_seed,
+            meta_alpha_enabled=self.meta_alpha_enabled,
+            meta_alpha_seed=self.meta_alpha_seed,
+            meta_alpha_original_prob=self.meta_alpha_original_prob,
+            meta_alpha_sigmoid_k=self.meta_alpha_sigmoid_k,
+            meta_alpha_retarget_scale_min=self.meta_alpha_retarget_scale_min,
+            meta_alpha_retarget_scale_max=self.meta_alpha_retarget_scale_max,
+            meta_alpha_counterfactual_pos_full_m=self.meta_alpha_counterfactual_pos_full_m,
+            meta_alpha_counterfactual_shape_full_deg=self.meta_alpha_counterfactual_shape_full_deg,
+            meta_alpha_counterfactual_approach_full_deg=self.meta_alpha_counterfactual_approach_full_deg,
+            meta_alpha_counterfactual_scale_floor=self.meta_alpha_counterfactual_scale_floor,
+            meta_alpha_counterfactual_near_target_prob=self.meta_alpha_counterfactual_near_target_prob,
+            meta_alpha_near_target_pos_max_m=self.meta_alpha_near_target_pos_max_m,
+            meta_alpha_near_target_shape_max_deg=self.meta_alpha_near_target_shape_max_deg,
+            meta_alpha_near_target_approach_max_deg=self.meta_alpha_near_target_approach_max_deg,
         )
 
 
@@ -490,6 +535,20 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     meta_retarget_cache_dir: str | None = None
     meta_retarget_cache_prob: float = 0.5
     meta_retarget_cache_seed: int = 0
+    meta_alpha_enabled: bool = False
+    meta_alpha_seed: int = 0
+    meta_alpha_original_prob: float = 0.8
+    meta_alpha_sigmoid_k: float = 10.0
+    meta_alpha_retarget_scale_min: float = 0.7
+    meta_alpha_retarget_scale_max: float = 1.0
+    meta_alpha_counterfactual_pos_full_m: float = 0.07
+    meta_alpha_counterfactual_shape_full_deg: float = 38.0
+    meta_alpha_counterfactual_approach_full_deg: float = 45.0
+    meta_alpha_counterfactual_scale_floor: float = 0.15
+    meta_alpha_counterfactual_near_target_prob: float = 0.3
+    meta_alpha_near_target_pos_max_m: float = 0.01
+    meta_alpha_near_target_shape_max_deg: float = 7.0
+    meta_alpha_near_target_approach_max_deg: float = 7.0
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -611,6 +670,20 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
             meta_retarget_cache_dir=self.meta_retarget_cache_dir,
             meta_retarget_cache_prob=self.meta_retarget_cache_prob,
             meta_retarget_cache_seed=self.meta_retarget_cache_seed,
+            meta_alpha_enabled=self.meta_alpha_enabled,
+            meta_alpha_seed=self.meta_alpha_seed,
+            meta_alpha_original_prob=self.meta_alpha_original_prob,
+            meta_alpha_sigmoid_k=self.meta_alpha_sigmoid_k,
+            meta_alpha_retarget_scale_min=self.meta_alpha_retarget_scale_min,
+            meta_alpha_retarget_scale_max=self.meta_alpha_retarget_scale_max,
+            meta_alpha_counterfactual_pos_full_m=self.meta_alpha_counterfactual_pos_full_m,
+            meta_alpha_counterfactual_shape_full_deg=self.meta_alpha_counterfactual_shape_full_deg,
+            meta_alpha_counterfactual_approach_full_deg=self.meta_alpha_counterfactual_approach_full_deg,
+            meta_alpha_counterfactual_scale_floor=self.meta_alpha_counterfactual_scale_floor,
+            meta_alpha_counterfactual_near_target_prob=self.meta_alpha_counterfactual_near_target_prob,
+            meta_alpha_near_target_pos_max_m=self.meta_alpha_near_target_pos_max_m,
+            meta_alpha_near_target_shape_max_deg=self.meta_alpha_near_target_shape_max_deg,
+            meta_alpha_near_target_approach_max_deg=self.meta_alpha_near_target_approach_max_deg,
         )
 
 
@@ -1302,6 +1375,51 @@ _CONFIGS = [
             meta_area_pose_dim=12,
             use_delta_joint_actions=True,
             action_stride=1,
+            default_prompt="use the tool affordance to complete the task",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_meta_aux_structured_12d_delta_alpha",
+        model=pi0_config.Pi0Config(
+            max_token_len=300,
+            pi05=True,
+            meta_model=True,
+            meta_area_pose_dim=12,
+            meta_action_dim=12,
+            meta_actions_in_action_slice=False,
+            meta_dropout_prob=0.0,
+            use_meta_control_alpha=True,
+            meta_loss_alpha_power=2.0,
+            action_loss_weight=1.0,
+            meta_loss_weight=1,
+            meta_stop_backbone_grad=False,
+            action_dim=32,
+            action_horizon=50,
+        ),
+        data=LeRobotXTrainerStructuredMetaDataConfig(
+            repo_id=".",
+            base_config=DataConfig(prompt_from_task=True),
+            output_action_dim=32,
+            max_meta_areas=1,
+            meta_area_pose_dim=12,
+            use_delta_joint_actions=True,
+            action_stride=1,
+            meta_alpha_enabled=True,
+            meta_alpha_original_prob=0.8,
+            meta_alpha_sigmoid_k=10.0,
+            meta_alpha_retarget_scale_min=0.7,
+            meta_alpha_retarget_scale_max=1.0,
+            meta_alpha_counterfactual_pos_full_m=0.07,
+            meta_alpha_counterfactual_shape_full_deg=38.0,
+            meta_alpha_counterfactual_approach_full_deg=45.0,
+            meta_alpha_counterfactual_scale_floor=0.15,
+            meta_alpha_counterfactual_near_target_prob=0.3,
+            meta_alpha_near_target_pos_max_m=0.01,
+            meta_alpha_near_target_shape_max_deg=7.0,
+            meta_alpha_near_target_approach_max_deg=7.0,
             default_prompt="use the tool affordance to complete the task",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),

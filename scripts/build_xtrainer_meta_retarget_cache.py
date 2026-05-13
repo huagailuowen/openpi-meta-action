@@ -92,6 +92,21 @@ def _with_retarget_mode(sample: dict[str, Any], mode: str) -> dict[str, Any]:
     return {**sample, "_retarget_mode": mode}
 
 
+def _scaled_generator_config(config: _retarget.MetaRetargetGeneratorConfig, scale: float | None):
+    if scale is None:
+        return config
+    scale = float(scale)
+    return dataclasses.replace(
+        config,
+        position_noise_max_m=config.position_noise_max_m * scale,
+        direction_noise_max_deg=config.direction_noise_max_deg * scale,
+        future_near_position_noise_max_m=config.future_near_position_noise_max_m * scale,
+        future_near_direction_noise_max_deg=config.future_near_direction_noise_max_deg * scale,
+        correction_min_position_offset_m=config.correction_min_position_offset_m * scale,
+        correction_min_direction_offset_deg=config.correction_min_direction_offset_deg * scale,
+    )
+
+
 def _apply_delta_action_masks(
     result: _retarget.MetaRetargetResult,
     delta_action_masks: list[list[bool]],
@@ -145,14 +160,17 @@ def _generate_variant_worker(
     generator_config: dict[str, Any],
     delta_action_masks: list[list[bool]],
     max_attempts: int,
+    retarget_scale: float | None = None,
 ) -> dict[str, Any]:
-    config = _retarget.MetaRetargetGeneratorConfig(**generator_config)
+    config = _scaled_generator_config(_retarget.MetaRetargetGeneratorConfig(**generator_config), retarget_scale)
     relpath = _variant_relpath(base_index, variant_id)
     base_record = {
         "base_index": int(base_index),
         "variant_id": int(variant_id),
         "path": str(relpath),
     }
+    if retarget_scale is not None:
+        base_record["retarget_scale"] = float(retarget_scale)
 
     last_record: dict[str, Any] | None = None
     for attempt in range(max(1, int(max_attempts))):
@@ -192,6 +210,21 @@ def _generate_variant_batch(
     pad_to_batch_size: int | None,
 ) -> list[dict[str, Any]]:
     config = _retarget.MetaRetargetGeneratorConfig(**generator_config)
+    if any(job.get("retarget_scale") is not None for job in jobs):
+        return [
+            _generate_variant_worker(
+                base_index=int(job["base_index"]),
+                variant_id=int(job["variant_id"]),
+                seed=int(job["seed"]),
+                sample=job["sample"],
+                cache_dir=cache_dir,
+                generator_config=generator_config,
+                delta_action_masks=delta_action_masks,
+                max_attempts=max_attempts,
+                retarget_scale=job.get("retarget_scale"),
+            )
+            for job in jobs
+        ]
     remaining = list(jobs)
     final_records: dict[tuple[int, int], dict[str, Any]] = {}
 
@@ -284,6 +317,9 @@ def main(
     accept_max_step_joint_delta_rad: float = 0.35,
     accept_max_abs_action_value: float = 1e4,
     accept_max_camera_rotvec_norm_rad: float = 3.143,
+    sample_retarget_scale: bool = False,
+    retarget_scale_min: float = 0.7,
+    retarget_scale_max: float = 1.0,
 ) -> None:
     """Build a reusable retarget cache for one OpenPI training config."""
 
@@ -297,6 +333,10 @@ def main(
         raise ValueError("--batch-size must be >= 1")
     if ik_backend not in ("numpy", "jax"):
         raise ValueError(f"--ik-backend must be 'numpy' or 'jax', got {ik_backend!r}")
+    if retarget_scale_min <= 0.0 or retarget_scale_max <= 0.0 or retarget_scale_min > retarget_scale_max:
+        raise ValueError(
+            f"Invalid retarget scale range: min={retarget_scale_min}, max={retarget_scale_max}"
+        )
     if ik_backend == "jax" and num_workers > 1:
         print("Warning: --ik-backend jax uses batched GPU execution in the main process; --num-workers is ignored.")
 
@@ -368,6 +408,9 @@ def main(
         "cache_action_space": "delta" if delta_action_masks else "absolute",
         "delta_action_masks": delta_action_masks_json,
         "retarget_mode_sampling": "per_variant_fixed_before_retries",
+        "sample_retarget_scale": sample_retarget_scale,
+        "retarget_scale_min": retarget_scale_min,
+        "retarget_scale_max": retarget_scale_max,
         "max_meta_areas": max_meta_areas,
         "generator_config": generator_config.to_json_dict(),
     }
@@ -448,12 +491,18 @@ def main(
                         continue
                     variant_seed = int(seed + base_index * 10007 + variant_id * 101)
                     retarget_mode = "future_near" if selection_rng.random() < future_near_mode_prob else "correction"
+                    retarget_scale = (
+                        float(selection_rng.uniform(retarget_scale_min, retarget_scale_max))
+                        if sample_retarget_scale
+                        else None
+                    )
                     batch_jobs.append(
                         {
                             "base_index": base_index,
                             "variant_id": variant_id,
                             "seed": variant_seed,
                             "sample": _with_retarget_mode(canonical, retarget_mode),
+                            "retarget_scale": retarget_scale,
                         }
                     )
                     submitted += 1
@@ -484,6 +533,11 @@ def main(
                         continue
                     variant_seed = int(seed + base_index * 10007 + variant_id * 101)
                     retarget_mode = "future_near" if selection_rng.random() < future_near_mode_prob else "correction"
+                    retarget_scale = (
+                        float(selection_rng.uniform(retarget_scale_min, retarget_scale_max))
+                        if sample_retarget_scale
+                        else None
+                    )
                     pending[
                         executor.submit(
                             _generate_variant_worker,
@@ -495,6 +549,7 @@ def main(
                             generator_config=generator_config.to_json_dict(),
                             delta_action_masks=delta_action_masks_json,
                             max_attempts=max_attempts_per_variant,
+                            retarget_scale=retarget_scale,
                         )
                     ] = pair
                     submitted += 1

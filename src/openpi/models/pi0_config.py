@@ -47,6 +47,11 @@ class Pi0Config(_model.BaseModelConfig):
     # targets must stay outside the action vector because action[20:26] is camera.
     meta_actions_in_action_slice: bool = True
     meta_dropout_prob: float = 0.0
+    # Optional continuous control token for structured meta. When enabled, the
+    # model receives observation.meta_control.alpha and meta loss can be scaled
+    # per sample by alpha ** meta_loss_alpha_power.
+    use_meta_control_alpha: bool = False
+    meta_loss_alpha_power: float = 0.0
     # When True, stop gradients from the meta loss from flowing back into the shared
     # backbone (prefix_out / suffix_out). The meta head still receives full gradients
     # through its own new parameters. Recommended while loading from a pre-trained
@@ -155,6 +160,11 @@ class Pi0Config(_model.BaseModelConfig):
                 meta_action_target_masks=(
                     jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.max_meta_areas], jnp.bool_)
                     if self.meta_model
+                    else None
+                ),
+                meta_control_alpha=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.float32)
+                    if self.meta_model and self.use_meta_control_alpha
                     else None
                 ),
             )
