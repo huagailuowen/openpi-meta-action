@@ -98,12 +98,13 @@ def main(config_name: str, max_frames: int | None = None):
     config = _config.get_config(config_name)
     data_config = config.data.create(config.assets_dirs, config.model)
     # Norm stats must describe the underlying dataset, not stochastic training-time
-    # augmentation. Disable cache sampling and alpha/counterfactual wrapping here.
+    # augmentation. Disable cache sampling and alpha/beta wrapping here.
     data_config = dataclasses.replace(
         data_config,
         meta_retarget_cache_dir=None,
         meta_retarget_cache_prob=0.0,
         meta_alpha_enabled=False,
+        meta_beta_enabled=False,
     )
 
     if data_config.rlds_data_dir is not None:

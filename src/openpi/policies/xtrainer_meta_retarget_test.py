@@ -165,6 +165,80 @@ def test_future_near_targets_start_after_selected_frame():
     np.testing.assert_allclose(targets[1:], old_targets[source_indices[1:]], atol=1e-6)
 
 
+def test_pair_retarget_anchor_selection_finds_future_lookahead():
+    old_input = np.zeros(12, dtype=np.float32)
+    old_input[3:9] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    old_targets = np.stack([old_input.copy() for _ in range(6)], axis=0)
+    for i in range(old_targets.shape[0]):
+        old_targets[i, 0] = 0.01 * float(i + 1)
+
+    candidate = old_targets[2].copy()
+    candidate[0] += 0.002
+    selected = retarget._select_pair_retarget_anchor(  # noqa: SLF001
+        "line",
+        candidate,
+        old_input,
+        old_targets,
+        config=retarget.MetaRetargetGeneratorConfig(pair_retarget_lookahead_frames=5),
+        dim_mask12=np.ones(12, dtype=bool),
+    )
+
+    assert selected is not None
+    assert selected["retarget_mode"] == "future_near"
+    assert selected["trajectory_start_index"] == 3
+    np.testing.assert_array_equal(selected["source_indices"], np.array([3, 4, 5, 5, 5, 5], dtype=np.int32))
+
+
+def test_pair_retarget_anchor_selection_rejects_forward_forbidden_zone():
+    old_input = np.zeros(12, dtype=np.float32)
+    old_input[3:9] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    old_targets = np.stack([old_input.copy() for _ in range(6)], axis=0)
+    for i in range(old_targets.shape[0]):
+        old_targets[i, 0] = 0.01 * float(i + 1)
+
+    forward_candidate = old_input.copy()
+    forward_candidate[0] += 0.03
+    selected = retarget._select_pair_retarget_anchor(  # noqa: SLF001
+        "line",
+        forward_candidate,
+        old_input,
+        old_targets,
+        config=retarget.MetaRetargetGeneratorConfig(
+            future_near_position_noise_max_m=0.001,
+            pair_retarget_lookahead_frames=0,
+        ),
+        dim_mask12=np.ones(12, dtype=bool),
+    )
+
+    assert selected is None
+
+
+def test_pair_retarget_anchor_selection_accepts_lateral_correction():
+    old_input = np.zeros(12, dtype=np.float32)
+    old_input[3:9] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    old_targets = np.stack([old_input.copy() for _ in range(6)], axis=0)
+    for i in range(old_targets.shape[0]):
+        old_targets[i, 0] = 0.01 * float(i + 1)
+
+    lateral_candidate = old_input.copy()
+    lateral_candidate[1] += 0.03
+    selected = retarget._select_pair_retarget_anchor(  # noqa: SLF001
+        "line",
+        lateral_candidate,
+        old_input,
+        old_targets,
+        config=retarget.MetaRetargetGeneratorConfig(
+            future_near_position_noise_max_m=0.001,
+            pair_retarget_lookahead_frames=0,
+        ),
+        dim_mask12=np.ones(12, dtype=bool),
+    )
+
+    assert selected is not None
+    assert selected["retarget_mode"] == "correction"
+    assert selected["trajectory_start_index"] == 0
+
+
 def test_matrix_to_rotvec_near_pi_is_bounded():
     axis = np.array([1.0, 2.0, 3.0], dtype=np.float32)
     axis = axis / np.linalg.norm(axis)

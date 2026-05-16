@@ -112,12 +112,26 @@ class Observation(Generic[ArrayT]):
     meta_area_dim_masks: at.Bool[ArrayT, "*b m d"] | None = None
     meta_area_types: at.Int[ArrayT, "*b m"] | None = None
     meta_area_masks: at.Bool[ArrayT, "*b m"] | None = None
+    # Beta latent path: meta area in the chunk2 execution frame. This is used by
+    # the meta-action head only. When missing, beta models fall back to
+    # meta_area_* so runtime inference can keep supplying a single meta area.
+    execution_meta_area_poses: at.Float[ArrayT, "*b m d"] | None = None
+    execution_meta_area_dim_masks: at.Bool[ArrayT, "*b m d"] | None = None
+    execution_meta_area_types: at.Int[ArrayT, "*b m"] | None = None
+    execution_meta_area_masks: at.Bool[ArrayT, "*b m"] | None = None
     meta_action_target_poses: at.Float[ArrayT, "*b ah m d"] | None = None
     meta_action_target_dim_masks: at.Bool[ArrayT, "*b ah m d"] | None = None
     meta_action_target_masks: at.Bool[ArrayT, "*b ah m"] | None = None
     # Continuous runtime/training control for how strongly the policy should
     # trust structured meta inputs. Missing means "fully trust" for compatibility.
     meta_control_alpha: at.Float[ArrayT, "*b"] | None = None
+    # Beta latent path: optional demonstration/reference action chunk used only
+    # to infer latent tool-operation tokens. It is not a supervised target.
+    reference_actions: at.Float[ArrayT, "*b ah ad"] | None = None
+    reference_action_mask: at.Bool[ArrayT, "*b"] | None = None
+    # 0 means the supplied meta area is real/origin; 1 means it is imagined or
+    # retargeted. This is only meaningful when meta-area tokens are present.
+    meta_imagination_alpha: at.Float[ArrayT, "*b"] | None = None
 
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
@@ -130,6 +144,13 @@ class Observation(Generic[ArrayT]):
             has_pose = "pose6d" in meta_areas or "pose12d" in meta_areas
             if not (has_pose and {"type", "mask"}.issubset(meta_areas)):
                 raise ValueError("meta_areas must contain pose6d or pose12d, plus type and mask, when provided.")
+        if "execution_meta_areas" in data:
+            execution_meta_areas = data["execution_meta_areas"]
+            has_pose = "pose6d" in execution_meta_areas or "pose12d" in execution_meta_areas
+            if not (has_pose and {"type", "mask"}.issubset(execution_meta_areas)):
+                raise ValueError(
+                    "execution_meta_areas must contain pose6d or pose12d, plus type and mask, when provided."
+                )
         if "meta_action_targets" in data:
             meta_targets = data["meta_action_targets"]
             has_pose = "pose6d" in meta_targets or "pose12d" in meta_targets
@@ -157,6 +178,14 @@ class Observation(Generic[ArrayT]):
             meta_area_dim_masks=data.get("meta_areas", {}).get("dim_mask12"),
             meta_area_types=data.get("meta_areas", {}).get("type"),
             meta_area_masks=data.get("meta_areas", {}).get("mask"),
+            execution_meta_area_poses=(
+                data.get("execution_meta_areas", {}).get("pose12d")
+                if "pose12d" in data.get("execution_meta_areas", {})
+                else data.get("execution_meta_areas", {}).get("pose6d")
+            ),
+            execution_meta_area_dim_masks=data.get("execution_meta_areas", {}).get("dim_mask12"),
+            execution_meta_area_types=data.get("execution_meta_areas", {}).get("type"),
+            execution_meta_area_masks=data.get("execution_meta_areas", {}).get("mask"),
             meta_action_target_poses=(
                 data.get("meta_action_targets", {}).get("pose12d")
                 if "pose12d" in data.get("meta_action_targets", {})
@@ -165,6 +194,11 @@ class Observation(Generic[ArrayT]):
             meta_action_target_dim_masks=data.get("meta_action_targets", {}).get("dim_mask12"),
             meta_action_target_masks=data.get("meta_action_targets", {}).get("mask"),
             meta_control_alpha=data.get("meta_control", {}).get("alpha", data.get("meta_control_alpha")),
+            reference_actions=data.get("reference_actions"),
+            reference_action_mask=data.get("reference_action_mask"),
+            meta_imagination_alpha=data.get("meta_control", {}).get(
+                "imagination_alpha", data.get("meta_imagination_alpha")
+            ),
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -176,10 +210,17 @@ class Observation(Generic[ArrayT]):
         meta_area_dim_masks = result.pop("meta_area_dim_masks")
         meta_area_types = result.pop("meta_area_types")
         meta_area_masks = result.pop("meta_area_masks")
+        execution_meta_area_poses = result.pop("execution_meta_area_poses")
+        execution_meta_area_dim_masks = result.pop("execution_meta_area_dim_masks")
+        execution_meta_area_types = result.pop("execution_meta_area_types")
+        execution_meta_area_masks = result.pop("execution_meta_area_masks")
         meta_action_target_poses = result.pop("meta_action_target_poses")
         meta_action_target_dim_masks = result.pop("meta_action_target_dim_masks")
         meta_action_target_masks = result.pop("meta_action_target_masks")
         meta_control_alpha = result.pop("meta_control_alpha")
+        reference_actions = result.pop("reference_actions")
+        reference_action_mask = result.pop("reference_action_mask")
+        meta_imagination_alpha = result.pop("meta_imagination_alpha")
         if meta_area_poses is not None or meta_area_types is not None or meta_area_masks is not None:
             pose_key = "pose12d" if getattr(meta_area_poses, "shape", ()) and meta_area_poses.shape[-1] == 12 else "pose6d"
             result["meta_areas"] = {
@@ -189,6 +230,23 @@ class Observation(Generic[ArrayT]):
             }
             if meta_area_dim_masks is not None:
                 result["meta_areas"]["dim_mask12"] = meta_area_dim_masks
+        if (
+            execution_meta_area_poses is not None
+            or execution_meta_area_types is not None
+            or execution_meta_area_masks is not None
+        ):
+            pose_key = (
+                "pose12d"
+                if getattr(execution_meta_area_poses, "shape", ()) and execution_meta_area_poses.shape[-1] == 12
+                else "pose6d"
+            )
+            result["execution_meta_areas"] = {
+                pose_key: execution_meta_area_poses,
+                "type": execution_meta_area_types,
+                "mask": execution_meta_area_masks,
+            }
+            if execution_meta_area_dim_masks is not None:
+                result["execution_meta_areas"]["dim_mask12"] = execution_meta_area_dim_masks
         if meta_action_target_poses is not None or meta_action_target_masks is not None:
             pose_key = (
                 "pose12d"
@@ -203,6 +261,12 @@ class Observation(Generic[ArrayT]):
                 result["meta_action_targets"]["dim_mask12"] = meta_action_target_dim_masks
         if meta_control_alpha is not None:
             result["meta_control"] = {"alpha": meta_control_alpha}
+        if meta_imagination_alpha is not None:
+            result.setdefault("meta_control", {})["imagination_alpha"] = meta_imagination_alpha
+        if reference_actions is not None:
+            result["reference_actions"] = reference_actions
+        if reference_action_mask is not None:
+            result["reference_action_mask"] = reference_action_mask
         return result
 
 
@@ -279,10 +343,17 @@ def preprocess_observation(
         meta_area_dim_masks=observation.meta_area_dim_masks,
         meta_area_types=observation.meta_area_types,
         meta_area_masks=observation.meta_area_masks,
+        execution_meta_area_poses=observation.execution_meta_area_poses,
+        execution_meta_area_dim_masks=observation.execution_meta_area_dim_masks,
+        execution_meta_area_types=observation.execution_meta_area_types,
+        execution_meta_area_masks=observation.execution_meta_area_masks,
         meta_action_target_poses=observation.meta_action_target_poses,
         meta_action_target_dim_masks=observation.meta_action_target_dim_masks,
         meta_action_target_masks=observation.meta_action_target_masks,
         meta_control_alpha=observation.meta_control_alpha,
+        reference_actions=observation.reference_actions,
+        reference_action_mask=observation.reference_action_mask,
+        meta_imagination_alpha=observation.meta_imagination_alpha,
     )
 
 

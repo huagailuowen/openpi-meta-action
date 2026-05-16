@@ -307,7 +307,7 @@ def main(
     correction_min_position_offset_m: float = 0.02,
     correction_min_direction_offset_deg: float = 13.0,
     correction_max_sample_attempts: int = 64,
-    approach_joint_step_rad: float = 0.04,
+    approach_joint_step_rad: float = 0.02,
     max_approach_steps: int | None = None,
     ik_max_iters: int = 80,
     ik_tolerance: float = 1e-3,
@@ -359,6 +359,7 @@ def main(
         meta_retarget_cache_dir=None,
         meta_retarget_cache_prob=0.0,
         meta_alpha_enabled=False,
+        meta_beta_enabled=False,
     )
 
     action_horizon = data_config.data_action_horizon_override or train_config.model.action_horizon

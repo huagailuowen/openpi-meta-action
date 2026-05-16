@@ -52,6 +52,11 @@ class Pi0Config(_model.BaseModelConfig):
     # per sample by alpha ** meta_loss_alpha_power.
     use_meta_control_alpha: bool = False
     meta_loss_alpha_power: float = 0.0
+    # Beta latent path. This keeps the old structured meta model intact and
+    # switches creation to Pi0MetaBeta only for explicit beta configs.
+    meta_beta_model: bool = False
+    num_meta_latent_tokens: int = 4
+    reference_action_group_size: int = 5
     # When True, stop gradients from the meta loss from flowing back into the shared
     # backbone (prefix_out / suffix_out). The meta head still receives full gradients
     # through its own new parameters. Recommended while loading from a pre-trained
@@ -98,6 +103,10 @@ class Pi0Config(_model.BaseModelConfig):
         if self.meta_model:
             if not self.pi05:
                 raise ValueError("The meta model path is only implemented for PI0.5.")
+            if self.meta_beta_model:
+                from openpi.models.pi0_meta_beta import Pi0MetaBeta
+
+                return Pi0MetaBeta(self, rngs=nnx.Rngs(rng))
             from openpi.models.pi0_meta import Pi0Meta
 
             return Pi0Meta(self, rngs=nnx.Rngs(rng))
@@ -141,6 +150,26 @@ class Pi0Config(_model.BaseModelConfig):
                 meta_area_masks=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.bool_) if self.meta_model else None
                 ),
+                execution_meta_area_poses=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, self.meta_area_pose_dim], jnp.float32)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                execution_meta_area_dim_masks=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, self.meta_area_pose_dim], jnp.bool_)
+                    if self.meta_model and self.meta_beta_model and self.meta_area_pose_dim == 12
+                    else None
+                ),
+                execution_meta_area_types=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.int32)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                execution_meta_area_masks=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.bool_)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
                 meta_action_target_poses=(
                     jax.ShapeDtypeStruct(
                         [batch_size, self.action_horizon, self.max_meta_areas, self.meta_action_dim],
@@ -165,6 +194,21 @@ class Pi0Config(_model.BaseModelConfig):
                 meta_control_alpha=(
                     jax.ShapeDtypeStruct([batch_size], jnp.float32)
                     if self.meta_model and self.use_meta_control_alpha
+                    else None
+                ),
+                reference_actions=(
+                    jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                reference_action_mask=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                meta_imagination_alpha=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.float32)
+                    if self.meta_model and self.meta_beta_model
                     else None
                 ),
             )

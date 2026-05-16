@@ -88,6 +88,14 @@ class XTrainerMetaInputs(transforms.DataTransformFn):
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+        for key in ("execution_meta_areas", "meta_control", "reference_actions", "reference_action_mask"):
+            if key in data:
+                inputs[key] = data[key]
+        for key in ("tool_instance_hash", "source_type_id", "episode_index"):
+            if key in data:
+                inputs[key] = data[key]
+        inputs.setdefault("tool_instance_hash", np.asarray([0], dtype=np.int32))
+        inputs.setdefault("source_type_id", np.asarray([0], dtype=np.int32))
 
         return inputs
 
@@ -270,6 +278,14 @@ class XTrainerStructuredMetaInputs(transforms.DataTransformFn):
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+        for key in ("execution_meta_areas", "meta_control", "reference_actions", "reference_action_mask"):
+            if key in data:
+                inputs[key] = data[key]
+        for key in ("tool_instance_hash", "source_type_id", "episode_index"):
+            if key in data:
+                inputs[key] = data[key]
+        inputs.setdefault("tool_instance_hash", np.asarray([0], dtype=np.int32))
+        inputs.setdefault("source_type_id", np.asarray([0], dtype=np.int32))
 
         return inputs
 

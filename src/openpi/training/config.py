@@ -126,6 +126,19 @@ class DataConfig:
     meta_alpha_near_target_pos_max_m: float = 0.01
     meta_alpha_near_target_shape_max_deg: float = 7.0
     meta_alpha_near_target_approach_max_deg: float = 7.0
+    # Beta latent-condition sampler. It is separate from alpha/counterfactual
+    # augmentation and only controls how chunk1 condition tokens are sampled.
+    meta_beta_enabled: bool = False
+    meta_beta_seed: int = 0
+    meta_beta_self_same_chunk_prob: float = 0.12
+    meta_beta_same_episode_diff_chunk_prob: float = 0.08
+    meta_beta_same_tool_diff_episode_prob: float = 0.50
+    meta_beta_retarget_conditioned_prob: float = 0.30
+    meta_beta_meta_area_condition_prob: float = 0.45
+    meta_beta_reference_action_condition_prob: float = 0.50
+    meta_beta_obs_only_condition_prob: float = 0.05
+    meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
+    meta_beta_pair_retarget_max_attempts: int = 4
 
 
 class GroupFactory(Protocol):
@@ -419,6 +432,17 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     meta_alpha_near_target_pos_max_m: float = 0.01
     meta_alpha_near_target_shape_max_deg: float = 7.0
     meta_alpha_near_target_approach_max_deg: float = 7.0
+    meta_beta_enabled: bool = False
+    meta_beta_seed: int = 0
+    meta_beta_self_same_chunk_prob: float = 0.12
+    meta_beta_same_episode_diff_chunk_prob: float = 0.08
+    meta_beta_same_tool_diff_episode_prob: float = 0.50
+    meta_beta_retarget_conditioned_prob: float = 0.30
+    meta_beta_meta_area_condition_prob: float = 0.45
+    meta_beta_reference_action_condition_prob: float = 0.50
+    meta_beta_obs_only_condition_prob: float = 0.05
+    meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
+    meta_beta_pair_retarget_max_attempts: int = 4
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -503,6 +527,17 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
             meta_alpha_near_target_pos_max_m=self.meta_alpha_near_target_pos_max_m,
             meta_alpha_near_target_shape_max_deg=self.meta_alpha_near_target_shape_max_deg,
             meta_alpha_near_target_approach_max_deg=self.meta_alpha_near_target_approach_max_deg,
+            meta_beta_enabled=self.meta_beta_enabled,
+            meta_beta_seed=self.meta_beta_seed,
+            meta_beta_self_same_chunk_prob=self.meta_beta_self_same_chunk_prob,
+            meta_beta_same_episode_diff_chunk_prob=self.meta_beta_same_episode_diff_chunk_prob,
+            meta_beta_same_tool_diff_episode_prob=self.meta_beta_same_tool_diff_episode_prob,
+            meta_beta_retarget_conditioned_prob=self.meta_beta_retarget_conditioned_prob,
+            meta_beta_meta_area_condition_prob=self.meta_beta_meta_area_condition_prob,
+            meta_beta_reference_action_condition_prob=self.meta_beta_reference_action_condition_prob,
+            meta_beta_obs_only_condition_prob=self.meta_beta_obs_only_condition_prob,
+            meta_beta_non_retarget_obs_only_condition_prob=self.meta_beta_non_retarget_obs_only_condition_prob,
+            meta_beta_pair_retarget_max_attempts=self.meta_beta_pair_retarget_max_attempts,
         )
 
 
@@ -549,6 +584,17 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     meta_alpha_near_target_pos_max_m: float = 0.01
     meta_alpha_near_target_shape_max_deg: float = 7.0
     meta_alpha_near_target_approach_max_deg: float = 7.0
+    meta_beta_enabled: bool = False
+    meta_beta_seed: int = 0
+    meta_beta_self_same_chunk_prob: float = 0.12
+    meta_beta_same_episode_diff_chunk_prob: float = 0.08
+    meta_beta_same_tool_diff_episode_prob: float = 0.50
+    meta_beta_retarget_conditioned_prob: float = 0.30
+    meta_beta_meta_area_condition_prob: float = 0.45
+    meta_beta_reference_action_condition_prob: float = 0.50
+    meta_beta_obs_only_condition_prob: float = 0.05
+    meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
+    meta_beta_pair_retarget_max_attempts: int = 4
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -580,30 +626,37 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         if self.meta_area_pose_dim == 12:
+            repack_structure = {
+                "images": {
+                    "cam_high": "observation.images.top",
+                    "cam_left_wrist": "observation.images.left_wrist",
+                    "cam_right_wrist": "observation.images.right_wrist",
+                },
+                "state": "observation.state",
+                "actions": "action",
+                "meta_areas": {
+                    "pose12d": "observation.meta_areas.pose12d",
+                    "dim_mask12": "observation.meta_areas.dim_mask12",
+                    "type": "observation.meta_areas.type",
+                    "mask": "observation.meta_areas.mask",
+                },
+                "meta_action_targets": {
+                    "pose12d": "action.meta_targets.pose12d",
+                    "dim_mask12": "action.meta_targets.dim_mask12",
+                    "mask": "action.meta_targets.mask",
+                },
+            }
+            if self.meta_beta_enabled:
+                repack_structure.update(
+                    {
+                        "tool_instance_hash": "observation.tool_instance_hash",
+                        "source_type_id": "observation.source_type_id",
+                        "episode_index": "episode_index",
+                    }
+                )
             repack_transforms = _transforms.Group(
                 inputs=[
-                    _transforms.RepackTransform(
-                        {
-                            "images": {
-                                "cam_high": "observation.images.top",
-                                "cam_left_wrist": "observation.images.left_wrist",
-                                "cam_right_wrist": "observation.images.right_wrist",
-                            },
-                            "state": "observation.state",
-                            "actions": "action",
-                            "meta_areas": {
-                                "pose12d": "observation.meta_areas.pose12d",
-                                "dim_mask12": "observation.meta_areas.dim_mask12",
-                                "type": "observation.meta_areas.type",
-                                "mask": "observation.meta_areas.mask",
-                            },
-                            "meta_action_targets": {
-                                "pose12d": "action.meta_targets.pose12d",
-                                "dim_mask12": "action.meta_targets.dim_mask12",
-                                "mask": "action.meta_targets.mask",
-                            },
-                        }
-                    )
+                    _transforms.RepackTransform(repack_structure)
                 ]
             )
             action_sequence_keys = (
@@ -684,6 +737,17 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
             meta_alpha_near_target_pos_max_m=self.meta_alpha_near_target_pos_max_m,
             meta_alpha_near_target_shape_max_deg=self.meta_alpha_near_target_shape_max_deg,
             meta_alpha_near_target_approach_max_deg=self.meta_alpha_near_target_approach_max_deg,
+            meta_beta_enabled=self.meta_beta_enabled,
+            meta_beta_seed=self.meta_beta_seed,
+            meta_beta_self_same_chunk_prob=self.meta_beta_self_same_chunk_prob,
+            meta_beta_same_episode_diff_chunk_prob=self.meta_beta_same_episode_diff_chunk_prob,
+            meta_beta_same_tool_diff_episode_prob=self.meta_beta_same_tool_diff_episode_prob,
+            meta_beta_retarget_conditioned_prob=self.meta_beta_retarget_conditioned_prob,
+            meta_beta_meta_area_condition_prob=self.meta_beta_meta_area_condition_prob,
+            meta_beta_reference_action_condition_prob=self.meta_beta_reference_action_condition_prob,
+            meta_beta_obs_only_condition_prob=self.meta_beta_obs_only_condition_prob,
+            meta_beta_non_retarget_obs_only_condition_prob=self.meta_beta_non_retarget_obs_only_condition_prob,
+            meta_beta_pair_retarget_max_attempts=self.meta_beta_pair_retarget_max_attempts,
         )
 
 
@@ -1420,6 +1484,48 @@ _CONFIGS = [
             meta_alpha_near_target_pos_max_m=0.01,
             meta_alpha_near_target_shape_max_deg=7.0,
             meta_alpha_near_target_approach_max_deg=7.0,
+            default_prompt="use the tool affordance to complete the task",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_meta_aux_structured_12d_delta_beta",
+        model=pi0_config.Pi0Config(
+            max_token_len=320,
+            pi05=True,
+            meta_model=True,
+            meta_beta_model=True,
+            meta_area_pose_dim=12,
+            meta_action_dim=12,
+            meta_actions_in_action_slice=False,
+            meta_dropout_prob=0.0,
+            action_loss_weight=1.0,
+            meta_loss_weight=1,
+            meta_stop_backbone_grad=False,
+            action_dim=32,
+            action_horizon=50,
+            num_meta_latent_tokens=4,
+            reference_action_group_size=5,
+        ),
+        data=LeRobotXTrainerStructuredMetaDataConfig(
+            repo_id=".",
+            base_config=DataConfig(prompt_from_task=True),
+            output_action_dim=32,
+            max_meta_areas=1,
+            meta_area_pose_dim=12,
+            use_delta_joint_actions=True,
+            action_stride=1,
+            meta_beta_enabled=True,
+            meta_beta_self_same_chunk_prob=0.12,
+            meta_beta_same_episode_diff_chunk_prob=0.08,
+            meta_beta_same_tool_diff_episode_prob=0.50,
+            meta_beta_retarget_conditioned_prob=0.30,
+            meta_beta_meta_area_condition_prob=0.45,
+            meta_beta_reference_action_condition_prob=0.50,
+            meta_beta_obs_only_condition_prob=0.05,
+            meta_beta_non_retarget_obs_only_condition_prob=0.10,
             default_prompt="use the tool affordance to complete the task",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),

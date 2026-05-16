@@ -7,7 +7,7 @@ import multiprocessing
 import os
 import pathlib
 import typing
-from typing import Literal, Protocol, SupportsIndex, TypeVar
+from typing import ClassVar, Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
@@ -179,10 +179,14 @@ class RetargetCacheDataset(Dataset[T_co]):
 
 def _clone_sample(sample: dict[str, typing.Any]) -> dict[str, typing.Any]:
     out: dict[str, typing.Any] = dict(sample)
-    for key in ("meta_areas", "meta_action_targets", "meta_control"):
+    for key in ("meta_areas", "execution_meta_areas", "meta_action_targets", "meta_control"):
         if isinstance(out.get(key), dict):
             out[key] = dict(out[key])
     return out
+
+
+def _copy_meta_areas(meta_areas: dict[str, typing.Any]) -> dict[str, np.ndarray]:
+    return {key: np.asarray(value).copy() for key, value in meta_areas.items()}
 
 
 def _apply_retargeted_payload(sample: dict[str, typing.Any], retargeted: dict[str, np.ndarray]) -> dict[str, typing.Any]:
@@ -436,6 +440,305 @@ def _absolute_actions_for_fk(
     return absolute
 
 
+def _condition_probabilities(meta_prob: float, reference_prob: float, obs_prob: float) -> np.ndarray:
+    probs = np.asarray([meta_prob, reference_prob, obs_prob], dtype=np.float64)
+    probs = np.maximum(probs, 0.0)
+    total = float(np.sum(probs))
+    if total <= 1e-8:
+        return np.asarray([0.45, 0.50, 0.05], dtype=np.float64)
+    return probs / total
+
+
+def _condition_probabilities_with_obs_fraction(
+    meta_prob: float,
+    reference_prob: float,
+    obs_fraction: float,
+) -> np.ndarray:
+    obs_fraction = float(np.clip(obs_fraction, 0.0, 1.0))
+    meta_reference = np.asarray([meta_prob, reference_prob], dtype=np.float64)
+    meta_reference = np.maximum(meta_reference, 0.0)
+    total = float(np.sum(meta_reference))
+    if total <= 1e-8:
+        return np.asarray([(1.0 - obs_fraction) * 0.5, (1.0 - obs_fraction) * 0.5, obs_fraction], dtype=np.float64)
+    scaled = meta_reference / total * (1.0 - obs_fraction)
+    return np.asarray([scaled[0], scaled[1], obs_fraction], dtype=np.float64)
+
+
+def _retarget_result_to_payload(
+    result: _meta_retarget.MetaRetargetResult,
+    *,
+    delta_action_masks: Sequence[np.ndarray],
+) -> dict[str, np.ndarray]:
+    actions = np.asarray(result.actions, dtype=np.float32).copy()
+    for mask_values in delta_action_masks:
+        mask = np.asarray(mask_values, dtype=bool)
+        dims = int(mask.shape[-1])
+        if actions.shape[-1] < dims or result.state.shape[-1] < dims:
+            continue
+        actions[..., :dims] -= np.expand_dims(np.where(mask, result.state[:dims], 0.0), axis=0)
+
+    payload = {
+        "state": np.asarray(result.state, dtype=np.float32),
+        "actions": actions.astype(np.float32),
+        "meta_area_pose6d": np.asarray(result.meta_area_pose6d, dtype=np.float32),
+        "meta_area_type": np.asarray(result.meta_area_type, dtype=np.int32),
+        "meta_area_mask": np.asarray(result.meta_area_mask, dtype=bool),
+    }
+    if result.meta_area_pose12d is not None:
+        payload["meta_area_pose12d"] = np.asarray(result.meta_area_pose12d, dtype=np.float32)
+    if result.meta_area_dim_mask12 is not None:
+        payload["meta_area_dim_mask12"] = np.asarray(result.meta_area_dim_mask12, dtype=bool)
+    if result.meta_action_target_pose12d is not None:
+        payload["meta_action_target_pose12d"] = np.asarray(result.meta_action_target_pose12d, dtype=np.float32)
+    if result.meta_action_target_dim_mask12 is not None:
+        payload["meta_action_target_dim_mask12"] = np.asarray(result.meta_action_target_dim_mask12, dtype=bool)
+    if result.meta_action_target_mask is not None:
+        payload["meta_action_target_mask"] = np.asarray(result.meta_action_target_mask, dtype=bool)
+    return payload
+
+
+class BetaStructuredMetaPairDataset(Dataset[T_co]):
+    """Sample beta latent conditions from a chunk1/chunk2 pair.
+
+    This first beta version keeps retarget target generation compatible with the
+    existing chunk-centric cache. The condition path is already pair-based:
+    chunk1 can provide meta-area tokens, reference-action tokens, or no tokens.
+    """
+
+    _ORIGIN_SOURCE_TYPE = 0
+    _RETARGET_MODE_TO_ID: ClassVar[dict[str, int]] = {"none": -1, "future_near": 0, "correction": 1}
+
+    def __init__(
+        self,
+        dataset: Dataset,
+        data_config: _config.DataConfig,
+        expected_action_space: str,
+        delta_action_masks: Sequence[np.ndarray],
+    ):
+        self._dataset = dataset
+        self._rng = np.random.default_rng(data_config.meta_beta_seed)
+        self._cache_dir = pathlib.Path(data_config.meta_retarget_cache_dir).expanduser() if data_config.meta_retarget_cache_dir else None
+        self._retarget_prob = float(data_config.meta_retarget_cache_prob)
+        self._delta_action_masks = [np.asarray(mask, dtype=bool) for mask in delta_action_masks]
+        self._pair_retarget_max_attempts = max(1, int(data_config.meta_beta_pair_retarget_max_attempts))
+        self._retarget_config = _meta_retarget.MetaRetargetGeneratorConfig()
+        self._records_by_index = (
+            RetargetCacheDataset._load_manifest(self._cache_dir) if self._cache_dir is not None else {}
+        )
+        if self._cache_dir is not None:
+            RetargetCacheDataset._warn_if_action_space_mismatch(self._cache_dir, expected_action_space)
+
+        relation_probs = np.asarray(
+            [
+                data_config.meta_beta_self_same_chunk_prob,
+                data_config.meta_beta_same_episode_diff_chunk_prob,
+                data_config.meta_beta_same_tool_diff_episode_prob,
+                data_config.meta_beta_retarget_conditioned_prob,
+            ],
+            dtype=np.float64,
+        )
+        self._relation_probs = relation_probs / max(float(np.sum(relation_probs)), 1e-8)
+        self._retarget_condition_probs = _condition_probabilities(
+            data_config.meta_beta_meta_area_condition_prob,
+            data_config.meta_beta_reference_action_condition_prob,
+            data_config.meta_beta_obs_only_condition_prob,
+        )
+        self._non_retarget_condition_probs = _condition_probabilities_with_obs_fraction(
+            data_config.meta_beta_meta_area_condition_prob,
+            data_config.meta_beta_reference_action_condition_prob,
+            data_config.meta_beta_non_retarget_obs_only_condition_prob,
+        )
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        base_index = int(index.__index__())
+        origin_sample = typing.cast(dict[str, typing.Any], self._dataset[index])
+        target_sample = origin_sample
+        relation_id = int(self._rng.choice(4, p=self._relation_probs))
+        source_sample = self._sample_source(base_index, target_sample, relation_id)
+        beta_debug: dict[str, typing.Any] = {"relation_id": relation_id, "retarget_applied": False}
+        if relation_id == 3:
+            target_sample, source_sample, beta_debug = self._maybe_apply_pair_retarget_with_retries(
+                base_index,
+                target_sample,
+                source_sample,
+            )
+            if not bool(beta_debug.get("retarget_applied", False)):
+                # Only fall back after exhausting fresh random target/source
+                # attempts. This prevents failed/dismissed pairs from becoming
+                # cross-tool non-retarget samples while avoiding an infinite loop.
+                target_sample = origin_sample
+                source_sample = origin_sample
+                relation_id = 0
+                beta_debug = {
+                    **beta_debug,
+                    "relation_id": relation_id,
+                }
+
+        out = _clone_sample(target_sample)
+        self._set_execution_meta_from_current_meta(out)
+        condition_probs = self._retarget_condition_probs if relation_id == 3 else self._non_retarget_condition_probs
+        condition_id = int(self._rng.choice(3, p=condition_probs))
+        if condition_id == 0:
+            self._apply_meta_area_condition(out, source_sample)
+        elif condition_id == 1:
+            self._apply_reference_action_condition(out, source_sample)
+        else:
+            self._apply_obs_only_condition(out)
+        self._ensure_optional_beta_fields(out)
+        out["_beta_debug"] = self._stable_beta_debug(beta_debug, condition_id=condition_id)
+        return typing.cast(T_co, out)
+
+    def __len__(self) -> int:
+        return len(self._dataset)
+
+    def _sample_source(self, base_index: int, target_sample: dict[str, typing.Any], relation_id: int) -> dict[str, typing.Any]:
+        if relation_id == 0:
+            return target_sample
+        target_tool = _scalar_int(target_sample.get("tool_instance_hash"), default=-1)
+        target_episode = _scalar_int(target_sample.get("episode_index"), default=-1)
+        require_same_episode = relation_id == 1
+        require_same_tool = relation_id == 2
+        for _ in range(24):
+            candidate_index = int(self._rng.integers(len(self._dataset)))
+            candidate = typing.cast(dict[str, typing.Any], self._dataset[candidate_index])
+            candidate_tool = _scalar_int(candidate.get("tool_instance_hash"), default=-2)
+            candidate_episode = _scalar_int(candidate.get("episode_index"), default=-2)
+            if require_same_episode and (candidate_episode != target_episode or candidate_index == base_index):
+                continue
+            if require_same_tool and (candidate_tool != target_tool or candidate_episode == target_episode):
+                continue
+            return candidate
+        return target_sample
+
+    def _sample_retarget_target(self, base_index: int) -> tuple[int, dict[str, typing.Any]]:
+        if len(self._dataset) <= 1:
+            return base_index, typing.cast(dict[str, typing.Any], self._dataset[base_index])
+        for _ in range(24):
+            candidate_index = int(self._rng.integers(len(self._dataset)))
+            if candidate_index != base_index:
+                return candidate_index, typing.cast(dict[str, typing.Any], self._dataset[candidate_index])
+        return base_index, typing.cast(dict[str, typing.Any], self._dataset[base_index])
+
+    def _maybe_apply_pair_retarget_with_retries(
+        self,
+        base_index: int,
+        target_sample: dict[str, typing.Any],
+        initial_source_sample: dict[str, typing.Any],
+    ) -> tuple[dict[str, typing.Any], dict[str, typing.Any], dict[str, typing.Any]]:
+        if self._retarget_prob <= 0.0 or self._rng.random() >= self._retarget_prob:
+            return target_sample, initial_source_sample, {
+                "relation_id": 3,
+                "retarget_applied": False,
+                "retarget_status_id": 1,
+            }
+
+        for attempt in range(self._pair_retarget_max_attempts):
+            if attempt == 0:
+                candidate_base_index = base_index
+                candidate_target = target_sample
+                source_sample = initial_source_sample
+            else:
+                candidate_base_index, candidate_target = self._sample_retarget_target(base_index)
+                source_sample = self._sample_source(candidate_base_index, candidate_target, 3)
+
+            target_for_ik = _clone_sample(candidate_target)
+            target_for_ik["actions"] = _absolute_actions_for_fk(
+                np.asarray(candidate_target["state"], dtype=np.float32),
+                np.asarray(candidate_target["actions"], dtype=np.float32),
+                self._delta_action_masks,
+            )
+            result = _meta_retarget.generate_pair_retargeted_chunk(
+                target_for_ik,
+                source_sample,
+                rng=np.random.default_rng(int(self._rng.integers(2**31 - 1))),
+                config=self._retarget_config,
+            )
+            if result is None:
+                continue
+            diagnostics = result.diagnostics.to_json_dict()
+            if not result.diagnostics.accepted:
+                continue
+            payload = _retarget_result_to_payload(result, delta_action_masks=self._delta_action_masks)
+            out = _apply_retargeted_payload(candidate_target, payload)
+            return out, source_sample, {
+                "relation_id": 3,
+                "retarget_applied": True,
+                "retarget_status_id": 0,
+                "retarget_attempt": int(attempt),
+                **diagnostics,
+            }
+
+        return target_sample, initial_source_sample, {
+            "relation_id": 3,
+            "retarget_applied": False,
+            "retarget_status_id": 2,
+        }
+
+    def _apply_meta_area_condition(self, out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
+        out["meta_areas"] = _copy_meta_areas(dict(source_sample.get("meta_areas", {})))
+        out.pop("reference_actions", None)
+        out["reference_action_mask"] = np.asarray(0, dtype=bool)
+        source_type = _scalar_int(source_sample.get("source_type_id"), default=self._ORIGIN_SOURCE_TYPE)
+        out["meta_control"] = {
+            "imagination_alpha": np.asarray(0.0 if source_type == self._ORIGIN_SOURCE_TYPE else 1.0, dtype=np.float32)
+        }
+
+    def _apply_reference_action_condition(self, out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
+        out["reference_actions"] = np.asarray(source_sample["actions"], dtype=np.float32).copy()
+        out["reference_action_mask"] = np.asarray(1, dtype=bool)
+        self._drop_meta_tokens(out)
+        out["meta_control"] = {"imagination_alpha": np.asarray(0.0, dtype=np.float32)}
+
+    def _apply_obs_only_condition(self, out: dict[str, typing.Any]) -> None:
+        out.pop("reference_actions", None)
+        out["reference_action_mask"] = np.asarray(0, dtype=bool)
+        self._drop_meta_tokens(out)
+        out["meta_control"] = {"imagination_alpha": np.asarray(0.0, dtype=np.float32)}
+
+    @staticmethod
+    def _set_execution_meta_from_current_meta(out: dict[str, typing.Any]) -> None:
+        meta_areas = out.get("meta_areas")
+        if isinstance(meta_areas, dict):
+            out["execution_meta_areas"] = _copy_meta_areas(meta_areas)
+
+    @staticmethod
+    def _ensure_optional_beta_fields(out: dict[str, typing.Any]) -> None:
+        if "reference_actions" not in out:
+            out["reference_actions"] = np.zeros_like(np.asarray(out["actions"], dtype=np.float32))
+        out.setdefault("reference_action_mask", np.asarray(0, dtype=bool))
+        out.setdefault("meta_control", {"imagination_alpha": np.asarray(0.0, dtype=np.float32)})
+
+    def _stable_beta_debug(self, debug: dict[str, typing.Any], *, condition_id: int) -> dict[str, np.ndarray]:
+        mode_name = str(debug.get("retarget_mode", "none"))
+        return {
+            "relation_id": np.asarray(int(debug.get("relation_id", -1)), dtype=np.int32),
+            "condition_id": np.asarray(int(condition_id), dtype=np.int32),
+            "retarget_applied": np.asarray(bool(debug.get("retarget_applied", False)), dtype=bool),
+            "retarget_status_id": np.asarray(int(debug.get("retarget_status_id", -1)), dtype=np.int32),
+            "retarget_mode_id": np.asarray(int(self._RETARGET_MODE_TO_ID.get(mode_name, -1)), dtype=np.int32),
+            "retarget_attempt": np.asarray(int(debug.get("retarget_attempt", -1)), dtype=np.int32),
+            "trajectory_start_index": np.asarray(int(debug.get("trajectory_start_index", -1)), dtype=np.int32),
+            "approach_steps": np.asarray(int(debug.get("approach_steps", -1)), dtype=np.int32),
+        }
+
+    @staticmethod
+    def _drop_meta_tokens(out: dict[str, typing.Any]) -> None:
+        if "meta_areas" not in out:
+            return
+        meta_areas = dict(out["meta_areas"])
+        meta_areas["mask"] = np.zeros_like(np.asarray(meta_areas["mask"], dtype=bool))
+        out["meta_areas"] = meta_areas
+
+
+def _scalar_int(value: typing.Any, default: int) -> int:
+    if value is None:
+        return default
+    arr = np.asarray(value)
+    if arr.size == 0:
+        return default
+    return int(arr.reshape(-1)[0])
+
+
 def _expected_retarget_cache_action_space(data_config: _config.DataConfig) -> str:
     for transform in data_config.data_transforms.inputs:
         if transform.__class__.__name__ == "DeltaActions" and transform.mask is not None:
@@ -452,6 +755,13 @@ def _delta_action_masks(data_config: _config.DataConfig) -> list[np.ndarray]:
 
 
 def maybe_wrap_retarget_cache_dataset(dataset: Dataset, data_config: _config.DataConfig) -> Dataset:
+    if data_config.meta_beta_enabled:
+        return BetaStructuredMetaPairDataset(
+            dataset,
+            data_config,
+            expected_action_space=_expected_retarget_cache_action_space(data_config),
+            delta_action_masks=_delta_action_masks(data_config),
+        )
     if data_config.meta_alpha_enabled:
         return AlphaMetaRetargetDataset(
             dataset,

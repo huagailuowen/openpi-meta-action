@@ -9,9 +9,9 @@ from typing_extensions import override
 
 from openpi.models import model as _model
 from openpi.models import pi0_config
+import openpi.models.gemma as _gemma
 from openpi.models.pi0 import make_attn_mask
 from openpi.models.pi0 import posemb_sincos
-import openpi.models.gemma as _gemma
 import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
@@ -189,10 +189,17 @@ class Pi0Meta(_model.BaseModel):
             meta_area_dim_masks=observation.meta_area_dim_masks,
             meta_area_types=observation.meta_area_types,
             meta_area_masks=observation.meta_area_masks,
+            execution_meta_area_poses=observation.execution_meta_area_poses,
+            execution_meta_area_dim_masks=observation.execution_meta_area_dim_masks,
+            execution_meta_area_types=observation.execution_meta_area_types,
+            execution_meta_area_masks=observation.execution_meta_area_masks,
             meta_action_target_poses=observation.meta_action_target_poses,
             meta_action_target_dim_masks=observation.meta_action_target_dim_masks,
             meta_action_target_masks=observation.meta_action_target_masks,
             meta_control_alpha=observation.meta_control_alpha,
+            reference_actions=observation.reference_actions,
+            reference_action_mask=observation.reference_action_mask,
+            meta_imagination_alpha=observation.meta_imagination_alpha,
         )
 
     def _apply_meta_dropout(
@@ -361,6 +368,9 @@ class Pi0Meta(_model.BaseModel):
             meta_action_target_dim_masks=observation.meta_action_target_dim_masks,
             meta_action_target_masks=observation.meta_action_target_masks,
             meta_control_alpha=observation.meta_control_alpha,
+            reference_actions=observation.reference_actions,
+            reference_action_mask=observation.reference_action_mask,
+            meta_imagination_alpha=observation.meta_imagination_alpha,
         )
 
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation_for_meta)
@@ -497,7 +507,7 @@ class Pi0Meta(_model.BaseModel):
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         prefix_positions = jnp.cumsum(prefix_mask, axis=1) - 1
         prefix_outputs, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=prefix_positions)
-        prefix_out = prefix_outputs[0] if isinstance(prefix_outputs, (tuple, list)) else prefix_outputs
+        prefix_out = prefix_outputs[0] if isinstance(prefix_outputs, tuple | list) else prefix_outputs
         assert prefix_out is not None
 
         def step(carry):

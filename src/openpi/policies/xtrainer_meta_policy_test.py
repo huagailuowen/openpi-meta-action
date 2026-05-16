@@ -1,6 +1,8 @@
 import numpy as np
 
-from openpi.policies.xtrainer_meta_policy import XTrainerMetaInputs, XTrainerMetaOutputs, XTrainerStructuredMetaInputs
+from openpi.policies.xtrainer_meta_policy import XTrainerMetaInputs
+from openpi.policies.xtrainer_meta_policy import XTrainerMetaOutputs
+from openpi.policies.xtrainer_meta_policy import XTrainerStructuredMetaInputs
 
 
 def test_xtrainer_meta_inputs_derive_meta_and_zero_state_slice():
@@ -87,6 +89,14 @@ def test_xtrainer_structured_meta_inputs_use_explicit_12d_meta_and_dim_masks():
             "dim_mask12": np.broadcast_to(dim_mask12, (3, 2, 12)),
             "mask": np.ones((3, 2), dtype=bool),
         },
+        "execution_meta_areas": {
+            "pose12d": np.full((2, 12), 7.0, dtype=np.float32),
+            "dim_mask12": dim_mask12,
+            "type": np.array([3, 4], dtype=np.int32),
+            "mask": np.array([True, True], dtype=bool),
+        },
+        "reference_actions": np.full((50, 32), 0.25, dtype=np.float32),
+        "reference_action_mask": np.array(1, dtype=bool),
     }
 
     out = transform(sample)
@@ -101,6 +111,9 @@ def test_xtrainer_structured_meta_inputs_use_explicit_12d_meta_and_dim_masks():
     np.testing.assert_array_equal(out["meta_action_targets"]["pose12d"], target_pose12d)
     np.testing.assert_array_equal(out["meta_action_targets"]["dim_mask12"], np.broadcast_to(dim_mask12, (3, 2, 12)))
     np.testing.assert_array_equal(out["meta_action_targets"]["mask"], np.ones((3, 2), dtype=bool))
+    np.testing.assert_array_equal(out["execution_meta_areas"], sample["execution_meta_areas"])
+    np.testing.assert_array_equal(out["reference_actions"], sample["reference_actions"])
+    assert bool(out["reference_action_mask"])
 
 
 def test_xtrainer_meta_outputs_can_zero_unused_12d_slice():

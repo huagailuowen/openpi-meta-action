@@ -127,12 +127,16 @@ class Normalize(DataTransformFn):
         if self.norm_stats is None:
             return data
 
-        return apply_tree(
+        data = apply_tree(
             data,
             self.norm_stats,
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
+        if "reference_actions" in data and isinstance(self.norm_stats, Mapping) and "actions" in self.norm_stats:
+            fn = self._normalize_quantile if self.use_quantiles else self._normalize
+            data["reference_actions"] = fn(data["reference_actions"], self.norm_stats["actions"])
+        return data
 
     def _normalize(self, x, stats: NormStats):
         mean, std = stats.mean[..., : x.shape[-1]], stats.std[..., : x.shape[-1]]

@@ -104,6 +104,8 @@ observation.meta_areas.mask         [M]
 action.meta_targets.pose12d         [H, M, 12]
 action.meta_targets.dim_mask12      [H, M, 12]
 action.meta_targets.mask            [H, M]
+observation.tool_instance_hash      [1] optional but required by beta same-tool sampling
+observation.source_type_id          [1] optional lineage id: 0=origin, 1=retarget, 2=imagine
 ```
 
 Normalization rule:
@@ -124,6 +126,45 @@ dims  26–31  reserved / padding
 
 The 12D config is `pi05_xtrainer_meta_aux_structured_12d_delta`. It sets
 `meta_area_pose_dim=12`, `meta_action_dim=12`, and `action_dim=32`.
+
+The beta latent config is `pi05_xtrainer_meta_aux_structured_12d_delta_beta`.
+It keeps the same raw 12D fields but interprets them through a chunk-pair latent interface:
+
+```text
+chunk1 condition path:
+  observation tokens + condition meta tokens or reference-action tokens -> latent tokens
+
+chunk2 execution path:
+  observation tokens + latent tokens + special tokens -> action suffix
+
+meta-action head:
+  action tokens + execution_meta_areas tokens + latent/special memory -> meta_actions
+```
+
+`execution_meta_areas` is not a stored LeRobot field. It is created by the beta dataloader from the
+chunk2 original or pair-retargeted meta area before the chunk1 condition is applied. Therefore:
+
+- `meta_areas` means the chunk1 condition when meta-area conditioning is selected.
+- `reference_actions` means the chunk1 demonstration action condition when reference conditioning is selected.
+- `execution_meta_areas` means the chunk2 execution-frame meta token used by the meta-action head.
+- Runtime inference may pass only `meta_areas`; the beta model falls back to using it as `execution_meta_areas`.
+- Beta runtime reference-action conditioning should pass `reference_actions` plus explicit
+  `execution_meta_areas`, because the condition `meta_areas` slot is intentionally masked out.
+
+The beta prefix token order is:
+
+```text
+obs -> condition_meta -> reference_action -> latent -> special -> execution_meta
+```
+
+Attention is intentionally restricted:
+
+- condition meta attends only to observation and itself;
+- reference action attends only to observation and itself;
+- latent attends to observation, condition meta, reference action, and latent;
+- special attends only to observation, latent, and special;
+- action suffix attends only to observation, latent, and special;
+- execution meta is used for the meta-action head and is not visible to the action suffix.
 
 Retarget cache supports the same structured fields. For 12D line/surface tools, if `approach3` is
 active, retargeting aligns the shape matrix and approach direction together instead of only
@@ -299,6 +340,7 @@ All configs are defined in `src/openpi/training/config.py`. The meta-aware confi
 | `pi05_xtrainer_meta_aux_delta` | π₀.₅ | 32 | Yes | Yes | Meta + delta actions |
 | `pi05_xtrainer_meta_aux_structured_delta` | π₀.₅ | 32 | Yes | Yes | Explicit structured 6D fields |
 | `pi05_xtrainer_meta_aux_structured_12d_delta` | π₀.₅ | 32 | Yes | Yes | Explicit structured 12D fields |
+| `pi05_xtrainer_meta_aux_structured_12d_delta_beta` | π₀.₅ | 32 | Yes | Yes | Beta latent chunk-pair 12D training |
 | `pi05_xtrainer_meta_aux_low_mem_finetune` | π₀.₅ LoRA | 32 | No | Yes | Low-memory LoRA, batch 8 |
 
 The `*_aux*` configs use `Pi0Meta` (`meta_model=True`) with `meta_dropout_prob=0.25` and
@@ -320,6 +362,27 @@ dims  26–31  (reserved / padding)
 For `pi05_xtrainer_meta_aux_structured_12d_delta`, dims 14–19 are unused and masked out of the
 backbone loss, dims 20–25 remain the camera channel, and the 12D target is supervised only through
 `action.meta_targets.pose12d`.
+
+For `pi05_xtrainer_meta_aux_structured_12d_delta_beta`, the dataloader samples a chunk1/chunk2
+relationship before normalization:
+
+```text
+self same chunk:             0.12
+same episode different chunk:0.08
+same tool different episode: 0.50
+retarget conditioned:        0.30
+```
+
+Condition type is sampled separately. Non-retarget samples reserve 10% for obs-only conditioning;
+retarget-conditioned samples use the configured meta/reference/obs probabilities. The beta wrapper
+requires `observation.tool_instance_hash` for same-tool sampling. If the dataset lacks it, the
+structured input transform falls back to hash 0, which keeps training runnable but disables meaningful
+same-tool grouping.
+
+Pair retarget retries are bounded by `data.meta_beta_pair_retarget_max_attempts` (default `4`). The
+first attempt uses the requested chunk2/source pair. If it fails or is dismissed, the wrapper samples a
+fresh random chunk2 and source pair and retries. Only after all attempts fail does it fall back to
+origin self-decode, so common IK failures do not silently turn into cross-tool non-retarget samples.
 
 ---
 
@@ -430,7 +493,7 @@ Useful flags:
 | `--correction-forward-exclusion-angle-deg` | `70.0` | Reject correction offsets inside this forward cone around the fitted local motion direction |
 | `--correction-min-position-offset-m` | `0.02` | Correction mode requires this much position offset unless direction offset is large enough |
 | `--correction-min-direction-offset-deg` | `13.0` | Correction mode requires this much direction offset unless position offset is large enough |
-| `--approach-joint-step-rad` | `0.04` | Dynamic approach length is `ceil(max(|Δq_right|) / this)` |
+| `--approach-joint-step-rad` | `0.02` | Dynamic approach length is `ceil(max(|Δq_right|) / this)` |
 | `--accept-max-camera-rotvec-norm-rad` | `3.143` | Reject cached variants whose recomputed camera rotvec is outside the canonical near-π range |
 | `--accept-max-abs-action-value` | `1e4` | Reject catastrophic non-camera action values before cache write |
 
@@ -499,6 +562,18 @@ python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta \
     --overrides data.meta_retarget_cache_dir=/path/to/retarget_cache_12d
 ```
 
+Beta latent 12D structured training:
+
+```bash
+python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta \
+    --exp-name my_beta_run_12d \
+    --overrides data.repo_id=/path/to/your/classified_structured_12d_lerobot_dataset
+```
+
+For beta training, prefer datasets that include `observation.tool_instance_hash` and
+`observation.source_type_id`, for example a classified copy under
+`datasets_lerobot_structured/dataset_black_ring_12D_classified/`.
+
 Training checkpoints are saved under `checkpoints/<exp-name>/`.
 
 ### 6. Serve the policy
@@ -528,3 +603,6 @@ The server returns both `actions` (shape `[action_horizon, 32]`) and `meta_actio
 | `meta_action_dim` | `6` | Dimensionality of each meta target; set to `12` for structured 12D |
 | `meta_area_pose_dim` | `6` | Dimensionality of input meta-area pose; set to `12` for `pose12d` |
 | `meta_dropout_prob` | `0.0` | Probability of masking a meta slot during training |
+| `meta_beta_model` | `False` | Switch PI0.5 meta creation to the beta latent chunk-pair model |
+| `num_meta_latent_tokens` | `4` | Number of latent tool-operation tokens in the beta model |
+| `reference_action_group_size` | `5` | Number of action steps compressed into one reference-action token |
