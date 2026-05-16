@@ -138,11 +138,14 @@ def test_beta_pair_dataset_reference_condition_uses_source_actions():
 
 def test_beta_pair_dataset_meta_and_obs_conditions():
     class TinyDataset:
+        def __init__(self, source_type: int):
+            self.source_type = source_type
+
         def __len__(self):
             return 1
 
         def __getitem__(self, idx):
-            return _tiny_beta_sample(int(idx), tool=7, episode=0, source_type=1)
+            return _tiny_beta_sample(int(idx), tool=7, episode=0, source_type=self.source_type)
 
     base = {
         "meta_beta_seed": 0,
@@ -160,7 +163,7 @@ def test_beta_pair_dataset_meta_and_obs_conditions():
         meta_beta_non_retarget_obs_only_condition_prob=0.0,
     )
     meta_sample = _data_loader.BetaStructuredMetaPairDataset(
-        TinyDataset(),
+        TinyDataset(source_type=1),
         meta_config,
         expected_action_space="absolute",
         delta_action_masks=[],
@@ -168,7 +171,7 @@ def test_beta_pair_dataset_meta_and_obs_conditions():
     assert bool(meta_sample["meta_areas"]["mask"][0])
     np.testing.assert_array_equal(
         meta_sample["execution_meta_areas"]["pose12d"],
-        TinyDataset()[0]["meta_areas"]["pose12d"],
+        TinyDataset(source_type=1)[0]["meta_areas"]["pose12d"],
     )
     assert not bool(meta_sample["reference_action_mask"])
     assert float(meta_sample["meta_control"]["imagination_alpha"]) == 1.0
@@ -181,7 +184,7 @@ def test_beta_pair_dataset_meta_and_obs_conditions():
         meta_beta_non_retarget_obs_only_condition_prob=1.0,
     )
     obs_sample = _data_loader.BetaStructuredMetaPairDataset(
-        TinyDataset(),
+        TinyDataset(source_type=0),
         obs_config,
         expected_action_space="absolute",
         delta_action_masks=[],
@@ -190,6 +193,39 @@ def test_beta_pair_dataset_meta_and_obs_conditions():
     assert bool(obs_sample["execution_meta_areas"]["mask"][0])
     assert not bool(obs_sample["reference_action_mask"])
     assert float(obs_sample["meta_control"]["imagination_alpha"]) == 0.0
+
+
+def test_beta_pair_dataset_imagined_source_never_uses_obs_only_condition():
+    class TinyDataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, idx):
+            return _tiny_beta_sample(int(idx), tool=7, episode=0, source_type=1)
+
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        meta_beta_seed=0,
+        meta_beta_self_same_chunk_prob=1.0,
+        meta_beta_same_episode_diff_chunk_prob=0.0,
+        meta_beta_same_tool_diff_episode_prob=0.0,
+        meta_beta_retarget_conditioned_prob=0.0,
+        meta_beta_meta_area_condition_prob=1.0,
+        meta_beta_reference_action_condition_prob=0.0,
+        meta_beta_obs_only_condition_prob=1.0,
+        meta_beta_non_retarget_obs_only_condition_prob=1.0,
+    )
+    sample = _data_loader.BetaStructuredMetaPairDataset(
+        TinyDataset(),
+        data_config,
+        expected_action_space="absolute",
+        delta_action_masks=[],
+    )[0]
+
+    assert int(sample["_beta_debug"]["condition_id"]) == 0
+    assert bool(sample["meta_areas"]["mask"][0])
+    assert not bool(sample["reference_action_mask"])
+    assert float(sample["meta_control"]["imagination_alpha"]) == 1.0
 
 
 def test_beta_non_retarget_condition_distribution_uses_ten_percent_obs_only():

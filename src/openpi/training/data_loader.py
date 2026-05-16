@@ -548,6 +548,14 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             data_config.meta_beta_reference_action_condition_prob,
             data_config.meta_beta_non_retarget_obs_only_condition_prob,
         )
+        # If chunk1/source is itself an imagined or retargeted chunk, the latent
+        # must be conditioned on the source. Obs-only would discard the imagined
+        # source entirely and turn the sample into an unrelated self-decode case.
+        self._imagined_source_condition_probs = _condition_probabilities_with_obs_fraction(
+            data_config.meta_beta_meta_area_condition_prob,
+            data_config.meta_beta_reference_action_condition_prob,
+            0.0,
+        )
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         base_index = int(index.__index__())
@@ -576,7 +584,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
 
         out = _clone_sample(target_sample)
         self._set_execution_meta_from_current_meta(out)
-        condition_probs = self._retarget_condition_probs if relation_id == 3 else self._non_retarget_condition_probs
+        condition_probs = self._condition_probabilities_for_source(relation_id, source_sample)
         condition_id = int(self._rng.choice(3, p=condition_probs))
         if condition_id == 0:
             self._apply_meta_area_condition(out, source_sample)
@@ -590,6 +598,16 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+    def _condition_probabilities_for_source(
+        self,
+        relation_id: int,
+        source_sample: dict[str, typing.Any],
+    ) -> np.ndarray:
+        source_type = _scalar_int(source_sample.get("source_type_id"), default=self._ORIGIN_SOURCE_TYPE)
+        if source_type != self._ORIGIN_SOURCE_TYPE:
+            return self._imagined_source_condition_probs
+        return self._retarget_condition_probs if relation_id == 3 else self._non_retarget_condition_probs
 
     def _sample_source(self, base_index: int, target_sample: dict[str, typing.Any], relation_id: int) -> dict[str, typing.Any]:
         if relation_id == 0:
