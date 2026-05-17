@@ -1,6 +1,8 @@
 # ruff: noqa: SLF001
 
+from collections import deque
 from collections.abc import Iterator, Sequence
+from concurrent import futures
 import json
 import logging
 import multiprocessing
@@ -497,6 +499,49 @@ def _retarget_result_to_payload(
     return payload
 
 
+def _load_beta_pair_cache_manifest(cache_dir: pathlib.Path) -> list[dict[str, typing.Any]]:
+    manifest_path = cache_dir / "manifest.jsonl"
+    if not manifest_path.exists():
+        return []
+    records: list[dict[str, typing.Any]] = []
+    with manifest_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            record = json.loads(stripped)
+            if not bool(record.get("accepted", True)):
+                continue
+            if "target_index" not in record or "source_index" not in record or "path" not in record:
+                continue
+            records.append(record)
+    return records
+
+
+def _beta_pair_cache_payload(cache_dir: pathlib.Path, record: dict[str, typing.Any]) -> dict[str, np.ndarray] | None:
+    variant_path = cache_dir / str(record["path"])
+    try:
+        with np.load(variant_path) as cached:
+            return {key: cached[key].copy() for key in cached.files}
+    except FileNotFoundError:
+        logging.warning("Beta pair cache entry missing: %s", variant_path)
+    except OSError as exc:
+        logging.warning("Failed to load beta pair cache entry %s: %s", variant_path, exc)
+    return None
+
+
+def _retarget_debug_from_record(record: dict[str, typing.Any], *, status_id: int = 0) -> dict[str, typing.Any]:
+    return {
+        "relation_id": 3,
+        "retarget_applied": True,
+        "retarget_status_id": int(status_id),
+        "retarget_attempt": int(record.get("attempt", -1)),
+        "retarget_mode": str(record.get("retarget_mode", "none")),
+        "trajectory_start_index": int(record.get("trajectory_start_index", -1)),
+        "approach_steps": int(record.get("approach_steps", -1)),
+    }
+
+
 class BetaStructuredMetaPairDataset(Dataset[T_co]):
     """Sample beta latent conditions from a chunk1/chunk2 pair.
 
@@ -527,6 +572,26 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         )
         if self._cache_dir is not None:
             RetargetCacheDataset._warn_if_action_space_mismatch(self._cache_dir, expected_action_space)
+        self._pair_cache_dir = (
+            pathlib.Path(data_config.meta_beta_pair_cache_dir).expanduser()
+            if data_config.meta_beta_pair_cache_dir
+            else None
+        )
+        self._pair_cache_records = (
+            _load_beta_pair_cache_manifest(self._pair_cache_dir) if self._pair_cache_dir is not None else []
+        )
+        if self._pair_cache_dir is not None:
+            RetargetCacheDataset._warn_if_action_space_mismatch(self._pair_cache_dir, expected_action_space)
+        self._pair_cache_rng = np.random.default_rng(data_config.meta_beta_pair_cache_seed)
+        self._online_async_enabled = bool(data_config.meta_beta_online_async_enabled)
+        self._online_num_workers = max(1, int(data_config.meta_beta_online_num_workers))
+        self._online_queue_size = max(0, int(data_config.meta_beta_online_queue_size))
+        self._online_prefer_prob = float(np.clip(data_config.meta_beta_online_prefer_prob, 0.0, 1.0))
+        self._online_executor: futures.ThreadPoolExecutor | None = None
+        self._online_pending: deque[futures.Future] = deque()
+        self._online_ready: deque[
+            tuple[int, int, dict[str, np.ndarray], dict[str, typing.Any]]
+        ] = deque()
 
         relation_probs = np.asarray(
             [
@@ -558,6 +623,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         )
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
+        self._poll_and_prefill_online_retarget_queue()
         base_index = int(index.__index__())
         origin_sample = typing.cast(dict[str, typing.Any], self._dataset[index])
         target_sample = origin_sample
@@ -592,12 +658,25 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             self._apply_reference_action_condition(out, source_sample)
         else:
             self._apply_obs_only_condition(out)
+        self._set_meta_imagination_alpha(out, retarget_applied=bool(beta_debug.get("retarget_applied", False)))
         self._ensure_optional_beta_fields(out)
         out["_beta_debug"] = self._stable_beta_debug(beta_debug, condition_id=condition_id)
         return typing.cast(T_co, out)
 
     def __len__(self) -> int:
         return len(self._dataset)
+
+    def __getstate__(self) -> dict[str, typing.Any]:
+        state = self.__dict__.copy()
+        state["_online_executor"] = None
+        state["_online_pending"] = deque()
+        state["_online_ready"] = deque()
+        return state
+
+    def __del__(self) -> None:
+        executor = getattr(self, "_online_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _condition_probabilities_for_source(
         self,
@@ -610,8 +689,14 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         return self._retarget_condition_probs if relation_id == 3 else self._non_retarget_condition_probs
 
     def _sample_source(self, base_index: int, target_sample: dict[str, typing.Any], relation_id: int) -> dict[str, typing.Any]:
+        _, sample = self._sample_source_with_index(base_index, target_sample, relation_id)
+        return sample
+
+    def _sample_source_with_index(
+        self, base_index: int, target_sample: dict[str, typing.Any], relation_id: int
+    ) -> tuple[int, dict[str, typing.Any]]:
         if relation_id == 0:
-            return target_sample
+            return base_index, target_sample
         target_tool = _scalar_int(target_sample.get("tool_instance_hash"), default=-1)
         target_episode = _scalar_int(target_sample.get("episode_index"), default=-1)
         require_same_episode = relation_id == 1
@@ -625,8 +710,8 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 continue
             if require_same_tool and (candidate_tool != target_tool or candidate_episode == target_episode):
                 continue
-            return candidate
-        return target_sample
+            return candidate_index, candidate
+        return base_index, target_sample
 
     def _sample_retarget_target(self, base_index: int) -> tuple[int, dict[str, typing.Any]]:
         if len(self._dataset) <= 1:
@@ -648,6 +733,16 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 "relation_id": 3,
                 "retarget_applied": False,
                 "retarget_status_id": 1,
+            }
+
+        if self._online_async_enabled or self._pair_cache_records:
+            async_result = self._sample_async_or_cached_pair_retarget()
+            if async_result is not None:
+                return async_result
+            return target_sample, initial_source_sample, {
+                "relation_id": 3,
+                "retarget_applied": False,
+                "retarget_status_id": 3,
             }
 
         for attempt in range(self._pair_retarget_max_attempts):
@@ -692,26 +787,168 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             "retarget_status_id": 2,
         }
 
+    def _sample_async_or_cached_pair_retarget(
+        self,
+    ) -> tuple[dict[str, typing.Any], dict[str, typing.Any], dict[str, typing.Any]] | None:
+        self._poll_and_prefill_online_retarget_queue()
+        if self._online_async_enabled and self._rng.random() < self._online_prefer_prob:
+            online = self._pop_ready_online_retarget()
+            if online is not None:
+                return online
+        cached = self._sample_pair_cache_retarget()
+        if cached is not None:
+            return cached
+        return self._pop_ready_online_retarget()
+
+    def _poll_and_prefill_online_retarget_queue(self) -> None:
+        if not self._online_async_enabled or self._online_queue_size <= 0:
+            return
+        if self._online_executor is None:
+            self._online_executor = futures.ThreadPoolExecutor(max_workers=self._online_num_workers)
+
+        for _ in range(len(self._online_pending)):
+            future = self._online_pending.popleft()
+            if not future.done():
+                self._online_pending.append(future)
+                continue
+            try:
+                result = future.result()
+            except Exception as exc:
+                logging.warning("Online beta pair retarget producer failed: %s", exc)
+                continue
+            if result is not None:
+                self._online_ready.append(result)
+
+        while len(self._online_pending) + len(self._online_ready) < self._online_queue_size:
+            self._online_pending.append(self._submit_online_pair_retarget())
+
+    def _submit_online_pair_retarget(self) -> futures.Future:
+        assert self._online_executor is not None
+        dataset_len = len(self._dataset)
+        target_index = int(self._rng.integers(dataset_len))
+        if dataset_len <= 1:
+            source_index = target_index
+        else:
+            source_index = int(self._rng.integers(dataset_len - 1))
+            if source_index >= target_index:
+                source_index += 1
+        seed = int(self._rng.integers(2**31 - 1))
+        return self._online_executor.submit(
+            self._generate_online_pair_retarget,
+            target_index,
+            source_index,
+            seed,
+        )
+
+    def _pop_ready_online_retarget(
+        self,
+    ) -> tuple[dict[str, typing.Any], dict[str, typing.Any], dict[str, typing.Any]] | None:
+        self._poll_and_prefill_online_retarget_queue()
+        if not self._online_ready:
+            return None
+        target_index, source_index, payload, debug = self._online_ready.popleft()
+        target_sample = typing.cast(dict[str, typing.Any], self._dataset[target_index])
+        source_sample = typing.cast(dict[str, typing.Any], self._dataset[source_index])
+        debug = {**debug, "retarget_status_id": 0}
+        return _apply_retargeted_payload(target_sample, payload), source_sample, debug
+
+    def _generate_online_pair_retarget(
+        self,
+        target_index: int,
+        source_index: int,
+        seed: int,
+    ) -> tuple[int, int, dict[str, np.ndarray], dict[str, typing.Any]] | None:
+        target_sample = typing.cast(dict[str, typing.Any], self._dataset[target_index])
+        source_sample = typing.cast(dict[str, typing.Any], self._dataset[source_index])
+        return self._generate_pair_retarget_from_samples(
+            target_index=target_index,
+            target_sample=target_sample,
+            source_index=source_index,
+            source_sample=source_sample,
+            seed=seed,
+        )
+
+    def _generate_pair_retarget_from_samples(
+        self,
+        *,
+        target_index: int,
+        target_sample: dict[str, typing.Any],
+        source_index: int,
+        source_sample: dict[str, typing.Any],
+        seed: int,
+    ) -> tuple[int, int, dict[str, np.ndarray], dict[str, typing.Any]] | None:
+        target_for_ik = _clone_sample(target_sample)
+        target_for_ik["actions"] = _absolute_actions_for_fk(
+            np.asarray(target_sample["state"], dtype=np.float32),
+            np.asarray(target_sample["actions"], dtype=np.float32),
+            self._delta_action_masks,
+        )
+        result = _meta_retarget.generate_pair_retargeted_chunk(
+            target_for_ik,
+            source_sample,
+            rng=np.random.default_rng(seed),
+            config=self._retarget_config,
+        )
+        if result is None or not result.diagnostics.accepted:
+            return None
+        payload = _retarget_result_to_payload(result, delta_action_masks=self._delta_action_masks)
+        diagnostics = result.diagnostics.to_json_dict()
+        debug = {
+            "relation_id": 3,
+            "retarget_applied": True,
+            "retarget_status_id": 0,
+            "retarget_attempt": -1,
+            "target_index": int(target_index),
+            "source_index": int(source_index),
+            **diagnostics,
+        }
+        return int(target_index), int(source_index), payload, debug
+
+    def _sample_pair_cache_retarget(
+        self,
+    ) -> tuple[dict[str, typing.Any], dict[str, typing.Any], dict[str, typing.Any]] | None:
+        if self._pair_cache_dir is None or not self._pair_cache_records:
+            return None
+        for _ in range(8):
+            record = self._pair_cache_records[int(self._pair_cache_rng.integers(len(self._pair_cache_records)))]
+            payload = _beta_pair_cache_payload(self._pair_cache_dir, record)
+            if payload is None:
+                continue
+            target_index = int(record["target_index"])
+            source_index = int(record["source_index"])
+            if not (0 <= target_index < len(self._dataset)) or not (0 <= source_index < len(self._dataset)):
+                logging.warning(
+                    "Beta pair cache record has out-of-range indices: target=%s source=%s len=%s",
+                    target_index,
+                    source_index,
+                    len(self._dataset),
+                )
+                continue
+            target_sample = typing.cast(dict[str, typing.Any], self._dataset[target_index])
+            source_sample = typing.cast(dict[str, typing.Any], self._dataset[source_index])
+            return _apply_retargeted_payload(target_sample, payload), source_sample, _retarget_debug_from_record(record)
+        return None
+
     def _apply_meta_area_condition(self, out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
         out["meta_areas"] = _copy_meta_areas(dict(source_sample.get("meta_areas", {})))
         out.pop("reference_actions", None)
         out["reference_action_mask"] = np.asarray(0, dtype=bool)
-        source_type = _scalar_int(source_sample.get("source_type_id"), default=self._ORIGIN_SOURCE_TYPE)
-        out["meta_control"] = {
-            "imagination_alpha": np.asarray(0.0 if source_type == self._ORIGIN_SOURCE_TYPE else 1.0, dtype=np.float32)
-        }
 
     def _apply_reference_action_condition(self, out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
         out["reference_actions"] = np.asarray(source_sample["actions"], dtype=np.float32).copy()
         out["reference_action_mask"] = np.asarray(1, dtype=bool)
         self._drop_meta_tokens(out)
-        out["meta_control"] = {"imagination_alpha": np.asarray(0.0, dtype=np.float32)}
 
     def _apply_obs_only_condition(self, out: dict[str, typing.Any]) -> None:
         out.pop("reference_actions", None)
         out["reference_action_mask"] = np.asarray(0, dtype=bool)
         self._drop_meta_tokens(out)
-        out["meta_control"] = {"imagination_alpha": np.asarray(0.0, dtype=np.float32)}
+
+    @staticmethod
+    def _set_meta_imagination_alpha(out: dict[str, typing.Any], *, retarget_applied: bool) -> None:
+        out["meta_control"] = {
+            "imagination_alpha": np.asarray(1.0 if retarget_applied else 0.0, dtype=np.float32)
+        }
 
     @staticmethod
     def _set_execution_meta_from_current_meta(out: dict[str, typing.Any]) -> None:
@@ -1007,6 +1244,7 @@ def create_data_loader(
         shuffle=shuffle,
         num_batches=num_batches,
         num_workers=config.num_workers,
+        prefetch_factor=config.data_loader_prefetch_factor,
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
@@ -1024,6 +1262,7 @@ def create_torch_data_loader(
     shuffle: bool = False,
     num_batches: int | None = None,
     num_workers: int = 0,
+    prefetch_factor: int | None = None,
     seed: int = 0,
     framework: str = "jax",
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
@@ -1075,6 +1314,7 @@ def create_torch_data_loader(
         sampler=sampler,
         num_batches=num_batches,
         num_workers=num_workers,
+        prefetch_factor=prefetch_factor,
         seed=seed,
         framework=framework,
     )
@@ -1136,6 +1376,7 @@ class TorchDataLoader:
         sampler: torch.utils.data.Sampler | None = None,
         num_batches: int | None = None,
         num_workers: int = 0,
+        prefetch_factor: int | None = None,
         seed: int = 0,
         framework: str = "jax",
     ):
@@ -1183,6 +1424,7 @@ class TorchDataLoader:
             sampler=sampler,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
             persistent_workers=num_workers > 0,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,

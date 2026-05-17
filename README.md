@@ -341,6 +341,7 @@ All configs are defined in `src/openpi/training/config.py`. The meta-aware confi
 | `pi05_xtrainer_meta_aux_structured_delta` | π₀.₅ | 32 | Yes | Yes | Explicit structured 6D fields |
 | `pi05_xtrainer_meta_aux_structured_12d_delta` | π₀.₅ | 32 | Yes | Yes | Explicit structured 12D fields |
 | `pi05_xtrainer_meta_aux_structured_12d_delta_beta` | π₀.₅ | 32 | Yes | Yes | Beta latent chunk-pair 12D training |
+| `pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3` | π₀.₅ | 32 | Yes | Yes | Dataset-specific beta config for classified black-ring 12D data |
 | `pi05_xtrainer_meta_aux_low_mem_finetune` | π₀.₅ LoRA | 32 | No | Yes | Low-memory LoRA, batch 8 |
 
 The `*_aux*` configs use `Pi0Meta` (`meta_model=True`) with `meta_dropout_prob=0.25` and
@@ -374,15 +375,49 @@ retarget conditioned:        0.30
 ```
 
 Condition type is sampled separately. Non-retarget samples reserve 10% for obs-only conditioning;
-retarget-conditioned samples use the configured meta/reference/obs probabilities. The beta wrapper
-requires `observation.tool_instance_hash` for same-tool sampling. If the dataset lacks it, the
-structured input transform falls back to hash 0, which keeps training runnable but disables meaningful
-same-tool grouping.
+retarget-conditioned samples use the configured meta/reference/obs probabilities. If chunk1/source
+has `observation.source_type_id != 0`, obs-only conditioning is disabled and the meta/reference
+probabilities are re-normalized, because dropping the condition would discard the imagined source.
+The beta wrapper requires `observation.tool_instance_hash` for same-tool sampling. If the dataset
+lacks it, the structured input transform falls back to hash 0, which keeps training runnable but
+disables meaningful same-tool grouping.
 
-Pair retarget retries are bounded by `data.meta_beta_pair_retarget_max_attempts` (default `4`). The
-first attempt uses the requested chunk2/source pair. If it fails or is dismissed, the wrapper samples a
-fresh random chunk2 and source pair and retries. Only after all attempts fail does it fall back to
-origin self-decode, so common IK failures do not silently turn into cross-tool non-retarget samples.
+`meta_control.imagination_alpha` is tied to the generated supervision, not directly to chunk1/source
+lineage: it is `1.0` when pair retarget succeeds and the output trajectory is imagined/retargeted,
+and `0.0` for origin/fallback trajectories. This alpha is injected into the first beta special token,
+so the model can distinguish "operate through imagined retargeted supervision" from "operate on the
+real observed trajectory" without coupling the flag to the condition token type.
+
+Pair retarget has two modes. If `data.meta_beta_online_async_enabled` or
+`data.meta_beta_pair_cache_dir` is set, retarget-conditioned training never blocks inside
+`__getitem__`: it first consumes a ready online pair-retarget result from a bounded producer queue,
+then falls back to a random beta pair cache record, and only then falls back to origin self-decode.
+If both online async and pair cache are disabled, the wrapper keeps the legacy synchronous retry path,
+bounded by `data.meta_beta_pair_retarget_max_attempts` (default `4`).
+
+The online producer runs in the data-loader worker process and fills a bounded queue in parallel with
+the main training step and PyTorch DataLoader prefetch. `data.meta_beta_online_num_workers` controls
+producer threads per DataLoader worker, and `data.meta_beta_online_queue_size` bounds memory. The
+cache fallback is built by `scripts/build_xtrainer_beta_pair_retarget_cache.py`; it stores
+`target_index`, `source_index`, diagnostics, and retarget payloads. This keeps the retarget-conditioned
+ratio stable even when online IK cannot keep up with GPU training.
+
+The dataset-specific beta config
+`pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3`
+sets both `model.max_meta_areas=1` and `data.max_meta_areas=1`. This is required because the beta
+prefix contains two meta-area segments, `condition_meta` and `execution_meta`; if the model keeps the
+default `max_meta_areas=3` while the data emits one slot, the model creates four extra prefix tokens
+and the token mask shapes no longer match.
+
+That config also sets `data.meta_retarget_cache_prob=1.0`. In the beta dataloader, relation sampling
+already controls how often retarget-conditioned pairs are attempted through
+`data.meta_beta_retarget_conditioned_prob=0.30`; leaving the old `0.2` value would add a second random
+gate and reduce the effective attempt rate to `0.30 * 0.20 = 0.06`. Retarget/IK failures are still
+handled by bounded retries and fallback logic.
+
+For throughput, `TrainConfig.data_loader_prefetch_factor` defaults to `4` when `num_workers > 0`.
+Increasing `num_workers`, building a beta pair cache, and enabling the online producer are the main
+ways to keep GPU utilization high.
 
 ---
 
@@ -568,6 +603,36 @@ Beta latent 12D structured training:
 python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta \
     --exp-name my_beta_run_12d \
     --overrides data.repo_id=/path/to/your/classified_structured_12d_lerobot_dataset
+```
+
+Optional beta pair cache generation:
+
+```bash
+python scripts/build_xtrainer_beta_pair_retarget_cache.py \
+    --config-name pi05_xtrainer_meta_aux_structured_12d_delta_beta \
+    --output-dir /path/to/beta_pair_cache \
+    --variants-per-target 2 \
+    --num-workers 8 \
+    --max-attempts-per-pair 4
+```
+
+Beta training with online producer and cache fallback:
+
+```bash
+python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta \
+    --exp-name my_beta_run_12d \
+    --overrides data.repo_id=/path/to/your/classified_structured_12d_lerobot_dataset \
+    --overrides data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache \
+    --overrides data.meta_beta_online_async_enabled=true \
+    --overrides data.meta_beta_online_num_workers=1 \
+    --overrides num_workers=8
+```
+
+Classified black-ring stride3 beta training:
+
+```bash
+python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3 \
+    --exp-name black_ring_beta_classified_stride3
 ```
 
 For beta training, prefer datasets that include `observation.tool_instance_hash` and

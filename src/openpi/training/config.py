@@ -89,7 +89,7 @@ class DataConfig:
     action_sequence_keys: Sequence[str] = ("actions",)
 
     # If set, overrides model.action_horizon when building the dataset delta_timestamps slice.
-    # Use this with action_stride > 1 so the data loader loads stride × model_horizon raw
+    # Use this with action_stride > 1 so the data loader loads stride x model_horizon raw
     # frames, which SubsampleActions then reduces back to model_horizon steps.
     data_action_horizon_override: int | None = None
 
@@ -139,6 +139,15 @@ class DataConfig:
     meta_beta_obs_only_condition_prob: float = 0.05
     meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
     meta_beta_pair_retarget_max_attempts: int = 4
+    # Optional beta pair-retarget cache and non-blocking online producer. When
+    # enabled, beta retarget-conditioned samples first consume ready online
+    # results without waiting, then fall back to this cache, then origin.
+    meta_beta_pair_cache_dir: str | None = None
+    meta_beta_pair_cache_seed: int = 0
+    meta_beta_online_async_enabled: bool = False
+    meta_beta_online_num_workers: int = 1
+    meta_beta_online_queue_size: int = 16
+    meta_beta_online_prefer_prob: float = 1.0
 
 
 class GroupFactory(Protocol):
@@ -406,7 +415,7 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     # Subsample the action horizon: keep only every N-th frame.
     # action_stride=1 (default) is no-op. action_stride=2 means the model predicts
     # at t+0, t+2, t+4, ... covering twice the time window with the same number of
-    # output steps. The data loader automatically loads stride × model.action_horizon
+    # output steps. The data loader automatically loads stride x model.action_horizon
     # raw frames so that SubsampleActions reduces it back to model.action_horizon steps.
     action_stride: int = 1
     # Per-camera dropout probabilities. Each camera is independently zeroed (and its
@@ -443,6 +452,12 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     meta_beta_obs_only_condition_prob: float = 0.05
     meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
     meta_beta_pair_retarget_max_attempts: int = 4
+    meta_beta_pair_cache_dir: str | None = None
+    meta_beta_pair_cache_seed: int = 0
+    meta_beta_online_async_enabled: bool = False
+    meta_beta_online_num_workers: int = 1
+    meta_beta_online_queue_size: int = 16
+    meta_beta_online_prefer_prob: float = 1.0
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -538,6 +553,12 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
             meta_beta_obs_only_condition_prob=self.meta_beta_obs_only_condition_prob,
             meta_beta_non_retarget_obs_only_condition_prob=self.meta_beta_non_retarget_obs_only_condition_prob,
             meta_beta_pair_retarget_max_attempts=self.meta_beta_pair_retarget_max_attempts,
+            meta_beta_pair_cache_dir=self.meta_beta_pair_cache_dir,
+            meta_beta_pair_cache_seed=self.meta_beta_pair_cache_seed,
+            meta_beta_online_async_enabled=self.meta_beta_online_async_enabled,
+            meta_beta_online_num_workers=self.meta_beta_online_num_workers,
+            meta_beta_online_queue_size=self.meta_beta_online_queue_size,
+            meta_beta_online_prefer_prob=self.meta_beta_online_prefer_prob,
         )
 
 
@@ -595,6 +616,12 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     meta_beta_obs_only_condition_prob: float = 0.05
     meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
     meta_beta_pair_retarget_max_attempts: int = 4
+    meta_beta_pair_cache_dir: str | None = None
+    meta_beta_pair_cache_seed: int = 0
+    meta_beta_online_async_enabled: bool = False
+    meta_beta_online_num_workers: int = 1
+    meta_beta_online_queue_size: int = 16
+    meta_beta_online_prefer_prob: float = 1.0
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -748,6 +775,12 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
             meta_beta_obs_only_condition_prob=self.meta_beta_obs_only_condition_prob,
             meta_beta_non_retarget_obs_only_condition_prob=self.meta_beta_non_retarget_obs_only_condition_prob,
             meta_beta_pair_retarget_max_attempts=self.meta_beta_pair_retarget_max_attempts,
+            meta_beta_pair_cache_dir=self.meta_beta_pair_cache_dir,
+            meta_beta_pair_cache_seed=self.meta_beta_pair_cache_seed,
+            meta_beta_online_async_enabled=self.meta_beta_online_async_enabled,
+            meta_beta_online_num_workers=self.meta_beta_online_num_workers,
+            meta_beta_online_queue_size=self.meta_beta_online_queue_size,
+            meta_beta_online_prefer_prob=self.meta_beta_online_prefer_prob,
         )
 
 
@@ -980,6 +1013,8 @@ class TrainConfig:
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
+    # Number of prefetched batches per data-loader worker. Only used when num_workers > 0.
+    data_loader_prefetch_factor: int | None = 4
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -1497,6 +1532,7 @@ _CONFIGS = [
             pi05=True,
             meta_model=True,
             meta_beta_model=True,
+            max_meta_areas=1,
             meta_area_pose_dim=12,
             meta_action_dim=12,
             meta_actions_in_action_slice=False,
@@ -1526,11 +1562,64 @@ _CONFIGS = [
             meta_beta_reference_action_condition_prob=0.50,
             meta_beta_obs_only_condition_prob=0.05,
             meta_beta_non_retarget_obs_only_condition_prob=0.10,
+            meta_beta_online_async_enabled=True,
+            meta_beta_online_num_workers=1,
+            meta_beta_online_queue_size=16,
             default_prompt="use the tool affordance to complete the task",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=50_000,
         batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3",
+        model=pi0_config.Pi0Config(
+            max_token_len=320,
+            pi05=True,
+            meta_model=True,
+            meta_beta_model=True,
+            max_meta_areas=1,
+            meta_area_pose_dim=12,
+            meta_action_dim=12,
+            meta_actions_in_action_slice=False,
+            meta_dropout_prob=0.0,
+            action_loss_weight=1.0,
+            meta_loss_weight=1,
+            meta_stop_backbone_grad=False,
+            freeze_vlm_backbone=False,
+            action_dim=32,
+            action_horizon=50,
+            num_meta_latent_tokens=4,
+            reference_action_group_size=5,
+        ),
+        data=LeRobotXTrainerStructuredMetaDataConfig(
+            repo_id="/inspire/hdd/project/robot-reasoning/xuyue-p-xuyue/cy/datasets/tool_adaptation/black_ring_hookNewUpper30_60_stick10_9type_12D_classified",
+            base_config=DataConfig(prompt_from_task=True),
+            output_action_dim=32,
+            max_meta_areas=1,
+            meta_area_pose_dim=12,
+            use_delta_joint_actions=True,
+            action_stride=3,
+            meta_retarget_cache_prob=1.0,
+            meta_beta_enabled=True,
+            meta_beta_self_same_chunk_prob=0.12,
+            meta_beta_same_episode_diff_chunk_prob=0.08,
+            meta_beta_same_tool_diff_episode_prob=0.50,
+            meta_beta_retarget_conditioned_prob=0.30,
+            meta_beta_meta_area_condition_prob=0.45,
+            meta_beta_reference_action_condition_prob=0.50,
+            meta_beta_obs_only_condition_prob=0.05,
+            meta_beta_non_retarget_obs_only_condition_prob=0.10,
+            meta_beta_online_async_enabled=True,
+            meta_beta_online_num_workers=1,
+            meta_beta_online_queue_size=16,
+            default_prompt="use the tool affordance to complete the task",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=35_000,
+        batch_size=32,
+        keep_period=None,
+        wandb_enabled=False,
     ),
     TrainConfig(
         name="pi05_xtrainer_raw14",
