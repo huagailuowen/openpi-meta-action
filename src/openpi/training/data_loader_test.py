@@ -330,6 +330,7 @@ def test_beta_pair_dataset_retarget_condition_uses_source_and_retarget_target(mo
 
     assert bool(sample["_beta_debug"]["retarget_applied"])
     assert int(sample["_beta_debug"]["retarget_mode_id"]) == 0
+    assert int(sample["_beta_debug"]["retarget_source_id"]) == 2
     np.testing.assert_array_equal(sample["actions"], np.full((4, 32), 9.0, dtype=np.float32))
     assert not bool(sample["reference_action_mask"])
     assert bool(sample["meta_areas"]["mask"][0])
@@ -515,18 +516,23 @@ def test_beta_pair_dataset_uses_pair_cache_when_online_queue_empty(tmp_path):
         meta_beta_meta_area_condition_prob=1.0,
         meta_beta_reference_action_condition_prob=0.0,
         meta_beta_obs_only_condition_prob=0.0,
+        meta_beta_online_async_enabled=True,
+        meta_beta_online_prefer_prob=0.0,
     )
-    sample = _data_loader.BetaStructuredMetaPairDataset(
+    wrapped = _data_loader.BetaStructuredMetaPairDataset(
         TinyDataset(),
         data_config,
         expected_action_space="absolute",
         delta_action_masks=[],
-    )[0]
+    )
+    sample = wrapped[0]
 
     assert bool(sample["_beta_debug"]["retarget_applied"])
     assert int(sample["_beta_debug"]["retarget_mode_id"]) == 0
+    assert int(sample["_beta_debug"]["retarget_source_id"]) == 1
     assert int(sample["_beta_debug"]["trajectory_start_index"]) == 2
     assert int(sample["_beta_debug"]["approach_steps"]) == 3
+    assert wrapped._stats_online_submitted == 0  # noqa: SLF001
     np.testing.assert_array_equal(sample["actions"], np.full((4, 32), 7.0, dtype=np.float32))
     np.testing.assert_array_equal(sample["execution_meta_areas"]["pose12d"], np.full((1, 12), 5.0, dtype=np.float32))
     np.testing.assert_array_equal(sample["meta_areas"]["pose12d"][:, :3], np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32))
@@ -606,6 +612,7 @@ def test_beta_pair_dataset_consumes_ready_online_retarget(monkeypatch):
 
     assert bool(sample["_beta_debug"]["retarget_applied"])
     assert int(sample["_beta_debug"]["retarget_mode_id"]) == 0
+    assert int(sample["_beta_debug"]["retarget_source_id"]) == 0
     np.testing.assert_array_equal(sample["actions"], np.full((4, 32), 11.0, dtype=np.float32))
     assert float(sample["meta_control"]["imagination_alpha"]) == 1.0
     if wrapped._online_executor is not None:  # noqa: SLF001

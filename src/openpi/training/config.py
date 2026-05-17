@@ -147,7 +147,11 @@ class DataConfig:
     meta_beta_online_async_enabled: bool = False
     meta_beta_online_num_workers: int = 1
     meta_beta_online_queue_size: int = 16
+    meta_beta_online_max_pending: int | None = None
     meta_beta_online_prefer_prob: float = 1.0
+    meta_beta_online_submit_prob: float = 1.0
+    meta_beta_debug_stats_enabled: bool = False
+    meta_beta_debug_stats_interval: int = 1000
 
 
 class GroupFactory(Protocol):
@@ -457,7 +461,11 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     meta_beta_online_async_enabled: bool = False
     meta_beta_online_num_workers: int = 1
     meta_beta_online_queue_size: int = 16
+    meta_beta_online_max_pending: int | None = None
     meta_beta_online_prefer_prob: float = 1.0
+    meta_beta_online_submit_prob: float = 1.0
+    meta_beta_debug_stats_enabled: bool = False
+    meta_beta_debug_stats_interval: int = 1000
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -558,7 +566,11 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
             meta_beta_online_async_enabled=self.meta_beta_online_async_enabled,
             meta_beta_online_num_workers=self.meta_beta_online_num_workers,
             meta_beta_online_queue_size=self.meta_beta_online_queue_size,
+            meta_beta_online_max_pending=self.meta_beta_online_max_pending,
             meta_beta_online_prefer_prob=self.meta_beta_online_prefer_prob,
+            meta_beta_online_submit_prob=self.meta_beta_online_submit_prob,
+            meta_beta_debug_stats_enabled=self.meta_beta_debug_stats_enabled,
+            meta_beta_debug_stats_interval=self.meta_beta_debug_stats_interval,
         )
 
 
@@ -621,7 +633,11 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     meta_beta_online_async_enabled: bool = False
     meta_beta_online_num_workers: int = 1
     meta_beta_online_queue_size: int = 16
+    meta_beta_online_max_pending: int | None = None
     meta_beta_online_prefer_prob: float = 1.0
+    meta_beta_online_submit_prob: float = 1.0
+    meta_beta_debug_stats_enabled: bool = False
+    meta_beta_debug_stats_interval: int = 1000
 
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
         default=_transforms.Group(
@@ -780,7 +796,11 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
             meta_beta_online_async_enabled=self.meta_beta_online_async_enabled,
             meta_beta_online_num_workers=self.meta_beta_online_num_workers,
             meta_beta_online_queue_size=self.meta_beta_online_queue_size,
+            meta_beta_online_max_pending=self.meta_beta_online_max_pending,
             meta_beta_online_prefer_prob=self.meta_beta_online_prefer_prob,
+            meta_beta_online_submit_prob=self.meta_beta_online_submit_prob,
+            meta_beta_debug_stats_enabled=self.meta_beta_debug_stats_enabled,
+            meta_beta_debug_stats_interval=self.meta_beta_debug_stats_interval,
         )
 
 
@@ -1015,6 +1035,12 @@ class TrainConfig:
     num_workers: int = 2
     # Number of prefetched batches per data-loader worker. Only used when num_workers > 0.
     data_loader_prefetch_factor: int | None = 4
+    # Optional training-loop timing diagnostics. Environment variables
+    # OPENPI_TRAIN_TIMING_INTERVAL and OPENPI_TRAIN_TIMING_BLOCK_UNTIL_READY
+    # override these values.
+    train_timing_interval: int = 0
+    train_timing_block_until_ready: bool = False
+    train_data_prefetch_buffer: int = 0
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -1610,16 +1636,22 @@ _CONFIGS = [
             meta_beta_reference_action_condition_prob=0.50,
             meta_beta_obs_only_condition_prob=0.0,
             meta_beta_non_retarget_obs_only_condition_prob=0.10,
+            meta_beta_pair_cache_dir="./assets/pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3/beta_pair_retarget_cache",
             meta_beta_online_async_enabled=True,
             meta_beta_online_num_workers=1,
-            meta_beta_online_queue_size=16,
+            meta_beta_online_queue_size=4,
+            meta_beta_online_max_pending=2,
+            meta_beta_online_submit_prob=0.30,
             default_prompt="use the tool affordance to complete the task",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=35_000,
         batch_size=32,
+        num_workers=4,
+        data_loader_prefetch_factor=4,
         keep_period=None,
         wandb_enabled=False,
+        train_data_prefetch_buffer=1,
     ),
     TrainConfig(
         name="pi05_xtrainer_raw14",

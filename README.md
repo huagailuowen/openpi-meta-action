@@ -397,11 +397,15 @@ If both online async and pair cache are disabled, the wrapper keeps the legacy s
 bounded by `data.meta_beta_pair_retarget_max_attempts` (default `4`).
 
 The online producer runs in the data-loader worker process and fills a bounded queue in parallel with
-the main training step and PyTorch DataLoader prefetch. `data.meta_beta_online_num_workers` controls
-producer threads per DataLoader worker, and `data.meta_beta_online_queue_size` bounds memory. The
-cache fallback is built by `scripts/build_xtrainer_beta_pair_retarget_cache.py`; it stores
-`target_index`, `source_index`, diagnostics, and retarget payloads. This keeps the retarget-conditioned
-ratio stable even when online IK cannot keep up with GPU training.
+the main training step and PyTorch DataLoader prefetch. It is demand-driven: producer polling happens
+when a retarget-conditioned sample is requested, not at the start of every `__getitem__`.
+`data.meta_beta_online_num_workers` controls producer threads per DataLoader worker,
+`data.meta_beta_online_queue_size` bounds ready+pending results, and
+`data.meta_beta_online_max_pending` separately caps expensive in-flight IK jobs. If a pair cache exists
+and `data.meta_beta_online_prefer_prob=0`, online producer submission is skipped so cache-only A/B runs
+do not burn CPU. The cache fallback is built by `scripts/build_xtrainer_beta_pair_retarget_cache.py`;
+it stores `target_index`, `source_index`, diagnostics, and retarget payloads. This keeps the
+retarget-conditioned ratio stable even when online IK cannot keep up with GPU training.
 
 The dataset-specific beta config
 `pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3`
@@ -419,6 +423,28 @@ handled by bounded retries and fallback logic.
 For throughput, `TrainConfig.data_loader_prefetch_factor` defaults to `4` when `num_workers > 0`.
 Increasing `num_workers`, building a beta pair cache, and enabling the online producer are the main
 ways to keep GPU utilization high.
+
+For throughput diagnosis, set:
+
+```bash
+export OPENPI_TRAIN_TIMING_INTERVAL=20
+export OPENPI_TRAIN_TIMING_BLOCK_UNTIL_READY=1  # optional; diagnostic only
+export OPENPI_TRAIN_DATA_PREFETCH_BUFFER=1      # optional; overrides TrainConfig
+```
+
+This logs `TRAIN_TIMING` with average `data_wait_s`, `step_dispatch_s`, optional device block time,
+log-reduce time, and checkpoint-trigger time. `OPENPI_TRAIN_DATA_PREFETCH_BUFFER=1` starts one
+main-process background data prefetch thread so the next batch can be fetched while the current
+JAX step is running. For beta data-loader source diagnostics, set:
+
+```bash
+--overrides data.meta_beta_debug_stats_enabled=true \
+--overrides data.meta_beta_debug_stats_interval=1000
+```
+
+This logs per-worker `BETA_DATALOADER_STATS`, including relation/condition counts, retarget source
+counts (`online`, `cache`, `sync`, `origin_fallback`, `gated`), online queue lengths, online
+accepted/rejected counts, cache hits/misses, and average getitem/cache/online timings.
 
 ---
 
@@ -626,8 +652,42 @@ python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta \
     --overrides data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache \
     --overrides data.meta_beta_online_async_enabled=true \
     --overrides data.meta_beta_online_num_workers=1 \
+    --overrides data.meta_beta_online_queue_size=4 \
+    --overrides data.meta_beta_online_max_pending=2 \
     --overrides num_workers=8
 ```
+
+Recommended A/B throughput matrix for the classified black-ring stride3 dataset:
+
+```text
+cache-only:
+  num_workers=4 or 8
+  data_loader_prefetch_factor=4 or 8
+  train_data_prefetch_buffer=1
+  data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
+  data.meta_beta_online_async_enabled=false
+
+cache-first:
+  num_workers=4 or 8
+  data_loader_prefetch_factor=4
+  train_data_prefetch_buffer=1
+  data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
+  data.meta_beta_online_async_enabled=true
+  data.meta_beta_online_prefer_prob=0.0
+
+throttled-online:
+  num_workers=4 or 8
+  data_loader_prefetch_factor=4
+  train_data_prefetch_buffer=1
+  data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
+  data.meta_beta_online_async_enabled=true
+  data.meta_beta_online_queue_size=2 or 4
+  data.meta_beta_online_max_pending=1 or 2
+  data.meta_beta_online_prefer_prob=0.25 or 0.5
+```
+
+For each run, compare average step time after warmup, GPU-utilization pattern, `TRAIN_TIMING`
+`data_wait_s`, `BETA_DATALOADER_STATS` retarget source counts, and loss/grad-norm sanity.
 
 Classified black-ring stride3 beta training:
 

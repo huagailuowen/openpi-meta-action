@@ -1,7 +1,11 @@
+from collections import deque
+from concurrent import futures
 import dataclasses
 import functools
 import logging
+import os
 import platform
+import time
 from typing import Any
 
 import etils.epath as epath
@@ -68,6 +72,44 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, log_code: bool = 
 
     if log_code:
         wandb.run.log_code(epath.Path(__file__).parent.parent)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return int(value)
+
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+class _BackgroundPrefetchIterator:
+    """Single-threaded background wrapper around an existing iterator."""
+
+    def __init__(self, iterator, *, buffer_size: int):
+        self._iterator = iterator
+        self._buffer_size = max(1, int(buffer_size))
+        self._executor = futures.ThreadPoolExecutor(max_workers=1)
+        self._pending: deque[futures.Future] = deque()
+        for _ in range(self._buffer_size):
+            self._submit()
+
+    def _submit(self) -> None:
+        self._pending.append(self._executor.submit(next, self._iterator))
+
+    def __next__(self):
+        future = self._pending.popleft()
+        result = future.result()
+        self._submit()
+        return result
+
+    def close(self) -> None:
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _load_weights_and_validate(loader: _weight_loaders.WeightLoader, params_shape: at.Params) -> at.Params:
@@ -223,8 +265,18 @@ def main(config: _config.TrainConfig):
         shuffle=True,
     )
     data_iter = iter(data_loader)
-    batch = next(data_iter)
+    data_prefetch_buffer = max(
+        0,
+        _env_int("OPENPI_TRAIN_DATA_PREFETCH_BUFFER", int(config.train_data_prefetch_buffer)),
+    )
+    prefetch_iter = _BackgroundPrefetchIterator(data_iter, buffer_size=data_prefetch_buffer) if data_prefetch_buffer > 0 else None
+
+    def next_train_batch():
+        return next(prefetch_iter) if prefetch_iter is not None else next(data_iter)
+
+    batch = next_train_batch()
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+    logging.info("Train data background prefetch buffer: %s", data_prefetch_buffer)
 
     # Log images from first batch to sanity check.
     images_to_log = [
@@ -256,21 +308,81 @@ def main(config: _config.TrainConfig):
     )
 
     infos = []
-    for step in pbar:
-        with sharding.set_mesh(mesh):
-            train_state, info = ptrain_step(train_rng, train_state, batch)
-        infos.append(info)
-        if step % config.log_interval == 0:
-            stacked_infos = common_utils.stack_forest(infos)
-            reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
-            info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
-            pbar.write(f"Step {step}: {info_str}")
-            wandb.log(reduced_info, step=step)
-            infos = []
-        batch = next(data_iter)
+    timing_interval = max(0, _env_int("OPENPI_TRAIN_TIMING_INTERVAL", int(config.train_timing_interval)))
+    timing_block_until_ready = _env_bool(
+        "OPENPI_TRAIN_TIMING_BLOCK_UNTIL_READY",
+        default=bool(config.train_timing_block_until_ready),
+    )
+    timing = {
+        "count": 0,
+        "step_dispatch_s": 0.0,
+        "device_compute_block_s": 0.0,
+        "data_wait_s": 0.0,
+        "log_reduce_s": 0.0,
+        "save_s": 0.0,
+    }
+    try:
+        for step in pbar:
+            step_dispatch_start = time.perf_counter()
+            with sharding.set_mesh(mesh):
+                train_state, info = ptrain_step(train_rng, train_state, batch)
+            timing["step_dispatch_s"] += time.perf_counter() - step_dispatch_start
+            if timing_interval > 0 and timing_block_until_ready and (step + 1) % timing_interval == 0:
+                block_start = time.perf_counter()
+                jax.block_until_ready(info)
+                timing["device_compute_block_s"] += time.perf_counter() - block_start
+            infos.append(info)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
-            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+            data_wait_start = time.perf_counter()
+            next_batch = next_train_batch() if step != config.num_train_steps - 1 else None
+            timing["data_wait_s"] += time.perf_counter() - data_wait_start
+
+            if step % config.log_interval == 0:
+                log_reduce_start = time.perf_counter()
+                stacked_infos = common_utils.stack_forest(infos)
+                reduced_info = jax.device_get(jax.tree.map(jnp.mean, stacked_infos))
+                timing["log_reduce_s"] += time.perf_counter() - log_reduce_start
+                info_str = ", ".join(f"{k}={v:.4f}" for k, v in reduced_info.items())
+                pbar.write(f"Step {step}: {info_str}")
+                wandb.log(reduced_info, step=step)
+                infos = []
+
+            if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+                save_start = time.perf_counter()
+                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+                timing["save_s"] += time.perf_counter() - save_start
+
+            if next_batch is not None:
+                batch = next_batch
+
+            timing["count"] += 1
+            if timing_interval > 0 and timing["count"] >= timing_interval:
+                denom = max(float(timing["count"]), 1.0)
+                timing_info = {
+                    "timing/step_dispatch_s": timing["step_dispatch_s"] / denom,
+                    "timing/device_compute_block_s": timing["device_compute_block_s"] / denom,
+                    "timing/data_wait_s": timing["data_wait_s"] / denom,
+                    "timing/log_reduce_s": timing["log_reduce_s"] / denom,
+                    "timing/save_s": timing["save_s"] / denom,
+                }
+                logging.info(
+                    "TRAIN_TIMING step=%s count=%s avg_step_dispatch_s=%.4f avg_device_compute_block_s=%.4f "
+                    "avg_data_wait_s=%.4f avg_log_reduce_s=%.4f avg_save_s=%.4f block_until_ready=%s",
+                    step,
+                    timing["count"],
+                    timing_info["timing/step_dispatch_s"],
+                    timing_info["timing/device_compute_block_s"],
+                    timing_info["timing/data_wait_s"],
+                    timing_info["timing/log_reduce_s"],
+                    timing_info["timing/save_s"],
+                    timing_block_until_ready,
+                )
+                wandb.log(timing_info, step=step)
+                for key in timing:
+                    timing[key] = 0 if key == "count" else 0.0
+    finally:
+        if prefetch_iter is not None:
+            prefetch_iter.close()
 
     logging.info("Waiting for checkpoint manager to finish")
     checkpoint_manager.wait_until_finished()

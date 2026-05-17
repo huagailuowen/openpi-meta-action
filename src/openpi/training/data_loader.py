@@ -1,5 +1,6 @@
 # ruff: noqa: SLF001
 
+from collections import Counter
 from collections import deque
 from collections.abc import Iterator, Sequence
 from concurrent import futures
@@ -8,6 +9,7 @@ import logging
 import multiprocessing
 import os
 import pathlib
+import time
 import typing
 from typing import ClassVar, Literal, Protocol, SupportsIndex, TypeVar
 
@@ -552,6 +554,14 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
 
     _ORIGIN_SOURCE_TYPE = 0
     _RETARGET_MODE_TO_ID: ClassVar[dict[str, int]] = {"none": -1, "future_near": 0, "correction": 1}
+    _RETARGET_SOURCE_TO_ID: ClassVar[dict[str, int]] = {
+        "none": -1,
+        "online": 0,
+        "cache": 1,
+        "sync": 2,
+        "origin_fallback": 3,
+        "gated": 4,
+    }
 
     def __init__(
         self,
@@ -586,12 +596,36 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         self._online_async_enabled = bool(data_config.meta_beta_online_async_enabled)
         self._online_num_workers = max(1, int(data_config.meta_beta_online_num_workers))
         self._online_queue_size = max(0, int(data_config.meta_beta_online_queue_size))
+        self._online_max_pending = (
+            None
+            if data_config.meta_beta_online_max_pending is None
+            else max(0, int(data_config.meta_beta_online_max_pending))
+        )
         self._online_prefer_prob = float(np.clip(data_config.meta_beta_online_prefer_prob, 0.0, 1.0))
+        self._online_submit_prob = float(np.clip(data_config.meta_beta_online_submit_prob, 0.0, 1.0))
         self._online_executor: futures.ThreadPoolExecutor | None = None
         self._online_pending: deque[futures.Future] = deque()
         self._online_ready: deque[
             tuple[int, int, dict[str, np.ndarray], dict[str, typing.Any]]
         ] = deque()
+        self._debug_stats_enabled = bool(data_config.meta_beta_debug_stats_enabled)
+        self._debug_stats_interval = max(1, int(data_config.meta_beta_debug_stats_interval))
+        self._stats_samples_seen = 0
+        self._stats_getitem_s = 0.0
+        self._stats_online_result_s = 0.0
+        self._stats_cache_load_s = 0.0
+        self._stats_relation_counts: Counter[int] = Counter()
+        self._stats_condition_counts: Counter[int] = Counter()
+        self._stats_status_counts: Counter[int] = Counter()
+        self._stats_source_counts: Counter[str] = Counter()
+        self._stats_retarget_applied = 0
+        self._stats_online_submitted = 0
+        self._stats_online_completed = 0
+        self._stats_online_accepted = 0
+        self._stats_online_rejected = 0
+        self._stats_online_result_count = 0
+        self._stats_cache_hit = 0
+        self._stats_cache_miss = 0
 
         relation_probs = np.asarray(
             [
@@ -623,7 +657,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         )
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
-        self._poll_and_prefill_online_retarget_queue()
+        getitem_start = time.perf_counter()
         base_index = int(index.__index__())
         origin_sample = typing.cast(dict[str, typing.Any], self._dataset[index])
         target_sample = origin_sample
@@ -661,6 +695,12 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         self._set_meta_imagination_alpha(out, retarget_applied=bool(beta_debug.get("retarget_applied", False)))
         self._ensure_optional_beta_fields(out)
         out["_beta_debug"] = self._stable_beta_debug(beta_debug, condition_id=condition_id)
+        self._record_debug_stats(
+            relation_id=relation_id,
+            condition_id=condition_id,
+            beta_debug=beta_debug,
+            getitem_s=time.perf_counter() - getitem_start,
+        )
         return typing.cast(T_co, out)
 
     def __len__(self) -> int:
@@ -733,6 +773,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 "relation_id": 3,
                 "retarget_applied": False,
                 "retarget_status_id": 1,
+                "retarget_source": "gated",
             }
 
         if self._online_async_enabled or self._pair_cache_records:
@@ -743,6 +784,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 "relation_id": 3,
                 "retarget_applied": False,
                 "retarget_status_id": 3,
+                "retarget_source": "origin_fallback",
             }
 
         for attempt in range(self._pair_retarget_max_attempts):
@@ -778,6 +820,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 "retarget_applied": True,
                 "retarget_status_id": 0,
                 "retarget_attempt": int(attempt),
+                "retarget_source": "sync",
                 **diagnostics,
             }
 
@@ -785,12 +828,12 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             "relation_id": 3,
             "retarget_applied": False,
             "retarget_status_id": 2,
+            "retarget_source": "origin_fallback",
         }
 
     def _sample_async_or_cached_pair_retarget(
         self,
     ) -> tuple[dict[str, typing.Any], dict[str, typing.Any], dict[str, typing.Any]] | None:
-        self._poll_and_prefill_online_retarget_queue()
         if self._online_async_enabled and self._rng.random() < self._online_prefer_prob:
             online = self._pop_ready_online_retarget()
             if online is not None:
@@ -798,10 +841,16 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         cached = self._sample_pair_cache_retarget()
         if cached is not None:
             return cached
-        return self._pop_ready_online_retarget()
+        if self._online_async_enabled and self._online_prefer_prob > 0.0:
+            return self._pop_ready_online_retarget()
+        return None
 
     def _poll_and_prefill_online_retarget_queue(self) -> None:
         if not self._online_async_enabled or self._online_queue_size <= 0:
+            return
+        if self._pair_cache_records and self._online_prefer_prob <= 0.0:
+            return
+        if self._online_submit_prob <= 0.0:
             return
         if self._online_executor is None:
             self._online_executor = futures.ThreadPoolExecutor(max_workers=self._online_num_workers)
@@ -815,12 +864,27 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 result = future.result()
             except Exception as exc:
                 logging.warning("Online beta pair retarget producer failed: %s", exc)
+                self._stats_online_completed += 1
+                self._stats_online_rejected += 1
                 continue
+            self._stats_online_completed += 1
             if result is not None:
+                self._stats_online_result_s += float(result[3].get("online_elapsed_s", 0.0))
+                self._stats_online_result_count += 1
                 self._online_ready.append(result)
+                self._stats_online_accepted += 1
+            else:
+                self._stats_online_rejected += 1
 
-        while len(self._online_pending) + len(self._online_ready) < self._online_queue_size:
+        max_pending = self._online_queue_size if self._online_max_pending is None else self._online_max_pending
+        while (
+            len(self._online_pending) < max_pending
+            and len(self._online_pending) + len(self._online_ready) < self._online_queue_size
+        ):
+            if self._rng.random() > self._online_submit_prob:
+                break
             self._online_pending.append(self._submit_online_pair_retarget())
+            self._stats_online_submitted += 1
 
     def _submit_online_pair_retarget(self) -> futures.Future:
         assert self._online_executor is not None
@@ -850,6 +914,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         target_sample = typing.cast(dict[str, typing.Any], self._dataset[target_index])
         source_sample = typing.cast(dict[str, typing.Any], self._dataset[source_index])
         debug = {**debug, "retarget_status_id": 0}
+        debug["retarget_source"] = "online"
         return _apply_retargeted_payload(target_sample, payload), source_sample, debug
 
     def _generate_online_pair_retarget(
@@ -858,15 +923,21 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         source_index: int,
         seed: int,
     ) -> tuple[int, int, dict[str, np.ndarray], dict[str, typing.Any]] | None:
+        start = time.perf_counter()
         target_sample = typing.cast(dict[str, typing.Any], self._dataset[target_index])
         source_sample = typing.cast(dict[str, typing.Any], self._dataset[source_index])
-        return self._generate_pair_retarget_from_samples(
+        result = self._generate_pair_retarget_from_samples(
             target_index=target_index,
             target_sample=target_sample,
             source_index=source_index,
             source_sample=source_sample,
             seed=seed,
         )
+        if result is None:
+            return None
+        target_index, source_index, payload, debug = result
+        debug = {**debug, "online_elapsed_s": float(time.perf_counter() - start)}
+        return target_index, source_index, payload, debug
 
     def _generate_pair_retarget_from_samples(
         self,
@@ -898,6 +969,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             "retarget_applied": True,
             "retarget_status_id": 0,
             "retarget_attempt": -1,
+            "retarget_source": "online",
             "target_index": int(target_index),
             "source_index": int(source_index),
             **diagnostics,
@@ -908,10 +980,13 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         self,
     ) -> tuple[dict[str, typing.Any], dict[str, typing.Any], dict[str, typing.Any]] | None:
         if self._pair_cache_dir is None or not self._pair_cache_records:
+            self._stats_cache_miss += 1
             return None
         for _ in range(8):
             record = self._pair_cache_records[int(self._pair_cache_rng.integers(len(self._pair_cache_records)))]
+            cache_start = time.perf_counter()
             payload = _beta_pair_cache_payload(self._pair_cache_dir, record)
+            self._stats_cache_load_s += time.perf_counter() - cache_start
             if payload is None:
                 continue
             target_index = int(record["target_index"])
@@ -926,7 +1001,11 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 continue
             target_sample = typing.cast(dict[str, typing.Any], self._dataset[target_index])
             source_sample = typing.cast(dict[str, typing.Any], self._dataset[source_index])
-            return _apply_retargeted_payload(target_sample, payload), source_sample, _retarget_debug_from_record(record)
+            debug = _retarget_debug_from_record(record)
+            debug["retarget_source"] = "cache"
+            self._stats_cache_hit += 1
+            return _apply_retargeted_payload(target_sample, payload), source_sample, debug
+        self._stats_cache_miss += 1
         return None
 
     def _apply_meta_area_condition(self, out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
@@ -965,16 +1044,68 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
 
     def _stable_beta_debug(self, debug: dict[str, typing.Any], *, condition_id: int) -> dict[str, np.ndarray]:
         mode_name = str(debug.get("retarget_mode", "none"))
+        source_name = str(debug.get("retarget_source", "none"))
         return {
             "relation_id": np.asarray(int(debug.get("relation_id", -1)), dtype=np.int32),
             "condition_id": np.asarray(int(condition_id), dtype=np.int32),
             "retarget_applied": np.asarray(bool(debug.get("retarget_applied", False)), dtype=bool),
             "retarget_status_id": np.asarray(int(debug.get("retarget_status_id", -1)), dtype=np.int32),
             "retarget_mode_id": np.asarray(int(self._RETARGET_MODE_TO_ID.get(mode_name, -1)), dtype=np.int32),
+            "retarget_source_id": np.asarray(int(self._RETARGET_SOURCE_TO_ID.get(source_name, -1)), dtype=np.int32),
             "retarget_attempt": np.asarray(int(debug.get("retarget_attempt", -1)), dtype=np.int32),
             "trajectory_start_index": np.asarray(int(debug.get("trajectory_start_index", -1)), dtype=np.int32),
             "approach_steps": np.asarray(int(debug.get("approach_steps", -1)), dtype=np.int32),
         }
+
+    def _record_debug_stats(
+        self,
+        *,
+        relation_id: int,
+        condition_id: int,
+        beta_debug: dict[str, typing.Any],
+        getitem_s: float,
+    ) -> None:
+        if not self._debug_stats_enabled:
+            return
+        self._stats_samples_seen += 1
+        self._stats_getitem_s += float(getitem_s)
+        self._stats_relation_counts[int(relation_id)] += 1
+        self._stats_condition_counts[int(condition_id)] += 1
+        self._stats_status_counts[int(beta_debug.get("retarget_status_id", -1))] += 1
+        self._stats_source_counts[str(beta_debug.get("retarget_source", "none"))] += 1
+        self._stats_retarget_applied += int(bool(beta_debug.get("retarget_applied", False)))
+        if self._stats_samples_seen % self._debug_stats_interval != 0:
+            return
+
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = -1 if worker_info is None else int(worker_info.id)
+        avg_getitem_ms = 1000.0 * self._stats_getitem_s / max(self._stats_samples_seen, 1)
+        avg_online_ms = 1000.0 * self._stats_online_result_s / max(self._stats_online_result_count, 1)
+        avg_cache_ms = 1000.0 * self._stats_cache_load_s / max(self._stats_cache_hit + self._stats_cache_miss, 1)
+        logging.info(
+            "BETA_DATALOADER_STATS worker=%s samples=%s relation_counts=%s condition_counts=%s "
+            "retarget_applied=%s status_counts=%s source_counts=%s online_pending=%s online_ready=%s online_submitted=%s "
+            "online_completed=%s online_accepted=%s online_rejected=%s cache_hit=%s cache_miss=%s "
+            "avg_getitem_ms=%.3f avg_online_result_ms=%.3f avg_cache_load_ms=%.3f",
+            worker_id,
+            self._stats_samples_seen,
+            dict(self._stats_relation_counts),
+            dict(self._stats_condition_counts),
+            self._stats_retarget_applied,
+            dict(self._stats_status_counts),
+            dict(self._stats_source_counts),
+            len(self._online_pending),
+            len(self._online_ready),
+            self._stats_online_submitted,
+            self._stats_online_completed,
+            self._stats_online_accepted,
+            self._stats_online_rejected,
+            self._stats_cache_hit,
+            self._stats_cache_miss,
+            avg_getitem_ms,
+            avg_online_ms,
+            avg_cache_ms,
+        )
 
     @staticmethod
     def _drop_meta_tokens(out: dict[str, typing.Any]) -> None:
