@@ -374,10 +374,11 @@ same tool different episode: 0.50
 retarget conditioned:        0.30
 ```
 
-Condition type is sampled separately. Non-retarget samples reserve 10% for obs-only conditioning;
-retarget-conditioned samples use the configured meta/reference/obs probabilities. If chunk1/source
-has `observation.source_type_id != 0`, obs-only conditioning is disabled and the meta/reference
-probabilities are re-normalized, because dropping the condition would discard the imagined source.
+Condition type is sampled separately. Non-retarget samples reserve 10% for obs-only conditioning.
+Retarget-conditioned samples default to 0% obs-only conditioning, so they must provide either
+meta-area or reference-action condition tokens. If chunk1/source has `observation.source_type_id != 0`,
+obs-only conditioning is disabled and the meta/reference probabilities are re-normalized, because
+dropping the condition would discard the imagined source.
 The beta wrapper requires `observation.tool_instance_hash` for same-tool sampling. If the dataset
 lacks it, the structured input transform falls back to hash 0, which keeps training runnable but
 disables meaningful same-tool grouping.

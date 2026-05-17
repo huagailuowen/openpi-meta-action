@@ -136,7 +136,7 @@ class DataConfig:
     meta_beta_retarget_conditioned_prob: float = 0.30
     meta_beta_meta_area_condition_prob: float = 0.45
     meta_beta_reference_action_condition_prob: float = 0.50
-    meta_beta_obs_only_condition_prob: float = 0.05
+    meta_beta_obs_only_condition_prob: float = 0.0
     meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
     meta_beta_pair_retarget_max_attempts: int = 4
     # Optional beta pair-retarget cache and non-blocking online producer. When
@@ -449,7 +449,7 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     meta_beta_retarget_conditioned_prob: float = 0.30
     meta_beta_meta_area_condition_prob: float = 0.45
     meta_beta_reference_action_condition_prob: float = 0.50
-    meta_beta_obs_only_condition_prob: float = 0.05
+    meta_beta_obs_only_condition_prob: float = 0.0
     meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
     meta_beta_pair_retarget_max_attempts: int = 4
     meta_beta_pair_cache_dir: str | None = None
@@ -613,7 +613,7 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     meta_beta_retarget_conditioned_prob: float = 0.30
     meta_beta_meta_area_condition_prob: float = 0.45
     meta_beta_reference_action_condition_prob: float = 0.50
-    meta_beta_obs_only_condition_prob: float = 0.05
+    meta_beta_obs_only_condition_prob: float = 0.0
     meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
     meta_beta_pair_retarget_max_attempts: int = 4
     meta_beta_pair_cache_dir: str | None = None
@@ -1560,7 +1560,7 @@ _CONFIGS = [
             meta_beta_retarget_conditioned_prob=0.30,
             meta_beta_meta_area_condition_prob=0.45,
             meta_beta_reference_action_condition_prob=0.50,
-            meta_beta_obs_only_condition_prob=0.05,
+            meta_beta_obs_only_condition_prob=0.0,
             meta_beta_non_retarget_obs_only_condition_prob=0.10,
             meta_beta_online_async_enabled=True,
             meta_beta_online_num_workers=1,
@@ -1608,7 +1608,7 @@ _CONFIGS = [
             meta_beta_retarget_conditioned_prob=0.30,
             meta_beta_meta_area_condition_prob=0.45,
             meta_beta_reference_action_condition_prob=0.50,
-            meta_beta_obs_only_condition_prob=0.05,
+            meta_beta_obs_only_condition_prob=0.0,
             meta_beta_non_retarget_obs_only_condition_prob=0.10,
             meta_beta_online_async_enabled=True,
             meta_beta_online_num_workers=1,
