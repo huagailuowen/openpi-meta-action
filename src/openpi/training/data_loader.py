@@ -9,6 +9,7 @@ import logging
 import multiprocessing
 import os
 import pathlib
+import queue
 import time
 import typing
 from typing import ClassVar, Literal, Protocol, SupportsIndex, TypeVar
@@ -501,6 +502,105 @@ def _retarget_result_to_payload(
     return payload
 
 
+def _generate_beta_pair_retarget_from_dataset(
+    dataset: Dataset,
+    *,
+    target_index: int,
+    source_index: int,
+    seed: int,
+    delta_action_masks: Sequence[np.ndarray],
+    retarget_config: _meta_retarget.MetaRetargetGeneratorConfig,
+) -> tuple[int, int, dict[str, np.ndarray], dict[str, typing.Any]] | None:
+    target_sample = typing.cast(dict[str, typing.Any], dataset[target_index])
+    source_sample = typing.cast(dict[str, typing.Any], dataset[source_index])
+    target_for_ik = _clone_sample(target_sample)
+    target_for_ik["actions"] = _absolute_actions_for_fk(
+        np.asarray(target_sample["state"], dtype=np.float32),
+        np.asarray(target_sample["actions"], dtype=np.float32),
+        delta_action_masks,
+    )
+    result = _meta_retarget.generate_pair_retargeted_chunk(
+        target_for_ik,
+        source_sample,
+        rng=np.random.default_rng(seed),
+        config=retarget_config,
+    )
+    if result is None or not result.diagnostics.accepted:
+        return None
+    payload = _retarget_result_to_payload(result, delta_action_masks=delta_action_masks)
+    diagnostics = result.diagnostics.to_json_dict()
+    debug = {
+        "relation_id": 3,
+        "retarget_applied": True,
+        "retarget_status_id": 0,
+        "retarget_attempt": -1,
+        "retarget_source": "online",
+        "target_index": int(target_index),
+        "source_index": int(source_index),
+        **diagnostics,
+    }
+    return int(target_index), int(source_index), payload, debug
+
+
+def _beta_online_retarget_process_loop(
+    request_queue: typing.Any,
+    result_queue: typing.Any,
+    dataset: Dataset,
+    delta_action_masks: Sequence[np.ndarray],
+    worker_id: int,
+) -> None:
+    """Generate beta pair-retarget payloads in a dedicated CPU worker process."""
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+    retarget_config = _meta_retarget.MetaRetargetGeneratorConfig()
+    while True:
+        job = request_queue.get()
+        if job is None:
+            return
+        target_index, source_index, seed = typing.cast(tuple[int, int, int], job)
+        start = time.perf_counter()
+        try:
+            result = _generate_beta_pair_retarget_from_dataset(
+                dataset,
+                target_index=target_index,
+                source_index=source_index,
+                seed=seed,
+                delta_action_masks=delta_action_masks,
+                retarget_config=retarget_config,
+            )
+            elapsed_s = float(time.perf_counter() - start)
+            if result is None:
+                result_queue.put(
+                    {
+                        "accepted": False,
+                        "worker_id": int(worker_id),
+                        "online_elapsed_s": elapsed_s,
+                    }
+                )
+                continue
+            out_target_index, out_source_index, payload, debug = result
+            result_queue.put(
+                {
+                    "accepted": True,
+                    "worker_id": int(worker_id),
+                    "target_index": out_target_index,
+                    "source_index": out_source_index,
+                    "payload": payload,
+                    "debug": {**debug, "online_elapsed_s": elapsed_s},
+                }
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging path for worker crashes.
+            logging.warning("Process beta pair retarget worker %s failed: %s", worker_id, exc)
+            result_queue.put(
+                {
+                    "accepted": False,
+                    "worker_id": int(worker_id),
+                    "online_elapsed_s": float(time.perf_counter() - start),
+                    "error": str(exc),
+                }
+            )
+
+
 def _load_beta_pair_cache_manifest(cache_dir: pathlib.Path) -> list[dict[str, typing.Any]]:
     manifest_path = cache_dir / "manifest.jsonl"
     if not manifest_path.exists():
@@ -603,11 +703,20 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         )
         self._online_prefer_prob = float(np.clip(data_config.meta_beta_online_prefer_prob, 0.0, 1.0))
         self._online_submit_prob = float(np.clip(data_config.meta_beta_online_submit_prob, 0.0, 1.0))
+        self._online_worker_group = str(data_config.meta_beta_online_worker_group)
+        self._online_request_queue_size = max(1, int(data_config.meta_beta_online_request_queue_size))
+        self._online_result_queue_size = max(1, int(data_config.meta_beta_online_result_queue_size))
         self._online_executor: futures.ThreadPoolExecutor | None = None
         self._online_pending: deque[futures.Future] = deque()
         self._online_ready: deque[
             tuple[int, int, dict[str, np.ndarray], dict[str, typing.Any]]
         ] = deque()
+        self._online_request_queue: typing.Any | None = None
+        self._online_result_queue: typing.Any | None = None
+        self._online_processes: list[multiprocessing.Process] = []
+        self._online_process_owner_pid = os.getpid()
+        if self._online_async_enabled and self._online_worker_group == "process":
+            self._start_online_process_group()
         self._debug_stats_enabled = bool(data_config.meta_beta_debug_stats_enabled)
         self._debug_stats_interval = max(1, int(data_config.meta_beta_debug_stats_interval))
         self._stats_samples_seen = 0
@@ -711,12 +820,61 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         state["_online_executor"] = None
         state["_online_pending"] = deque()
         state["_online_ready"] = deque()
+        state["_online_processes"] = []
         return state
 
     def __del__(self) -> None:
         executor = getattr(self, "_online_executor", None)
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
+        if os.getpid() == getattr(self, "_online_process_owner_pid", None):
+            self._shutdown_online_process_group()
+
+    def _start_online_process_group(self) -> None:
+        if self._online_processes or self._online_num_workers <= 0:
+            return
+        if self._pair_cache_records and self._online_prefer_prob <= 0.0:
+            return
+        ctx = multiprocessing.get_context("spawn")
+        self._online_request_queue = ctx.Queue(maxsize=self._online_request_queue_size)
+        self._online_result_queue = ctx.Queue(maxsize=self._online_result_queue_size)
+        delta_action_masks = [np.asarray(mask, dtype=bool) for mask in self._delta_action_masks]
+        for worker_id in range(self._online_num_workers):
+            process = ctx.Process(
+                target=_beta_online_retarget_process_loop,
+                args=(
+                    self._online_request_queue,
+                    self._online_result_queue,
+                    self._dataset,
+                    delta_action_masks,
+                    worker_id,
+                ),
+                daemon=True,
+            )
+            process.start()
+            self._online_processes.append(process)
+        logging.info(
+            "Started beta online retarget process group: workers=%s request_queue=%s result_queue=%s",
+            len(self._online_processes),
+            self._online_request_queue_size,
+            self._online_result_queue_size,
+        )
+
+    def _shutdown_online_process_group(self) -> None:
+        processes = getattr(self, "_online_processes", [])
+        request_queue = getattr(self, "_online_request_queue", None)
+        if request_queue is not None:
+            for _ in processes:
+                try:
+                    request_queue.put_nowait(None)
+                except Exception:
+                    break
+        for process in processes:
+            if process.is_alive():
+                process.join(timeout=0.2)
+            if process.is_alive():
+                process.terminate()
+        self._online_processes = []
 
     def _condition_probabilities_for_source(
         self,
@@ -852,6 +1010,9 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             return
         if self._online_submit_prob <= 0.0:
             return
+        if self._online_worker_group == "process":
+            self._poll_and_prefill_online_process_queue()
+            return
         if self._online_executor is None:
             self._online_executor = futures.ThreadPoolExecutor(max_workers=self._online_num_workers)
 
@@ -885,6 +1046,64 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 break
             self._online_pending.append(self._submit_online_pair_retarget())
             self._stats_online_submitted += 1
+
+    def _poll_and_prefill_online_process_queue(self) -> None:
+        if self._online_request_queue is None or self._online_result_queue is None:
+            return
+        for _ in range(self._online_result_queue_size):
+            if len(self._online_ready) >= self._online_queue_size:
+                break
+            try:
+                result = self._online_result_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._stats_online_completed += 1
+            if bool(result.get("accepted", False)):
+                debug = dict(result["debug"])
+                self._stats_online_result_s += float(debug.get("online_elapsed_s", 0.0))
+                self._stats_online_result_count += 1
+                self._online_ready.append(
+                    (
+                        int(result["target_index"]),
+                        int(result["source_index"]),
+                        typing.cast(dict[str, np.ndarray], result["payload"]),
+                        debug,
+                    )
+                )
+                self._stats_online_accepted += 1
+            else:
+                self._stats_online_result_s += float(result.get("online_elapsed_s", 0.0))
+                self._stats_online_result_count += 1
+                self._stats_online_rejected += 1
+
+        max_submits = self._online_queue_size if self._online_max_pending is None else self._online_max_pending
+        max_submits = max(0, int(max_submits))
+        for _ in range(max_submits):
+            if len(self._online_ready) >= self._online_queue_size:
+                break
+            if self._rng.random() > self._online_submit_prob:
+                break
+            if not self._submit_online_process_pair_retarget():
+                break
+            self._stats_online_submitted += 1
+
+    def _submit_online_process_pair_retarget(self) -> bool:
+        if self._online_request_queue is None:
+            return False
+        dataset_len = len(self._dataset)
+        target_index = int(self._rng.integers(dataset_len))
+        if dataset_len <= 1:
+            source_index = target_index
+        else:
+            source_index = int(self._rng.integers(dataset_len - 1))
+            if source_index >= target_index:
+                source_index += 1
+        seed = int(self._rng.integers(2**31 - 1))
+        try:
+            self._online_request_queue.put_nowait((target_index, source_index, seed))
+        except queue.Full:
+            return False
+        return True
 
     def _submit_online_pair_retarget(self) -> futures.Future:
         assert self._online_executor is not None
@@ -1082,9 +1301,16 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         avg_getitem_ms = 1000.0 * self._stats_getitem_s / max(self._stats_samples_seen, 1)
         avg_online_ms = 1000.0 * self._stats_online_result_s / max(self._stats_online_result_count, 1)
         avg_cache_ms = 1000.0 * self._stats_cache_load_s / max(self._stats_cache_hit + self._stats_cache_miss, 1)
+        if self._online_worker_group == "process":
+            try:
+                online_pending = -1 if self._online_request_queue is None else int(self._online_request_queue.qsize())
+            except (NotImplementedError, OSError):
+                online_pending = -1
+        else:
+            online_pending = len(self._online_pending)
         logging.info(
             "BETA_DATALOADER_STATS worker=%s samples=%s relation_counts=%s condition_counts=%s "
-            "retarget_applied=%s status_counts=%s source_counts=%s online_pending=%s online_ready=%s online_submitted=%s "
+            "retarget_applied=%s status_counts=%s source_counts=%s online_group=%s online_pending=%s online_ready=%s online_submitted=%s "
             "online_completed=%s online_accepted=%s online_rejected=%s cache_hit=%s cache_miss=%s "
             "avg_getitem_ms=%.3f avg_online_result_ms=%.3f avg_cache_load_ms=%.3f",
             worker_id,
@@ -1094,7 +1320,8 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             self._stats_retarget_applied,
             dict(self._stats_status_counts),
             dict(self._stats_source_counts),
-            len(self._online_pending),
+            self._online_worker_group,
+            online_pending,
             len(self._online_ready),
             self._stats_online_submitted,
             self._stats_online_completed,

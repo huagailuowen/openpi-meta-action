@@ -396,16 +396,22 @@ then falls back to a random beta pair cache record, and only then falls back to 
 If both online async and pair cache are disabled, the wrapper keeps the legacy synchronous retry path,
 bounded by `data.meta_beta_pair_retarget_max_attempts` (default `4`).
 
-The online producer runs in the data-loader worker process and fills a bounded queue in parallel with
-the main training step and PyTorch DataLoader prefetch. It is demand-driven: producer polling happens
-when a retarget-conditioned sample is requested, not at the start of every `__getitem__`.
-`data.meta_beta_online_num_workers` controls producer threads per DataLoader worker,
-`data.meta_beta_online_queue_size` bounds ready+pending results, and
-`data.meta_beta_online_max_pending` separately caps expensive in-flight IK jobs. If a pair cache exists
-and `data.meta_beta_online_prefer_prob=0`, online producer submission is skipped so cache-only A/B runs
-do not burn CPU. The cache fallback is built by `scripts/build_xtrainer_beta_pair_retarget_cache.py`;
-it stores `target_index`, `source_index`, diagnostics, and retarget payloads. This keeps the
-retarget-conditioned ratio stable even when online IK cannot keep up with GPU training.
+The online producer can run in two worker groups. `data.meta_beta_online_worker_group="dataloader"`
+keeps the older per-DataLoader-worker thread producer. `data.meta_beta_online_worker_group="process"`
+starts a separate multiprocessing retarget worker group from the main process and shares request/result
+queues with the DataLoader workers. Process mode is experimental: it can isolate IK from DataLoader work,
+but it pays IPC and dataset-copy overhead and should only be used after an A/B test shows higher online
+retarget throughput. Producer polling is demand-driven: it happens when a retarget-conditioned sample is
+requested, not at the start of every `__getitem__`.
+
+`data.meta_beta_online_num_workers` controls producer threads in dataloader mode or producer processes in
+process mode. `data.meta_beta_online_queue_size` bounds local ready results, `data.meta_beta_online_max_pending`
+caps expensive submissions per demand poll, and `data.meta_beta_online_request_queue_size` /
+`data.meta_beta_online_result_queue_size` bound the shared process-mode queues. If a pair cache exists and
+`data.meta_beta_online_prefer_prob=0`, online producer submission is skipped so cache-only A/B runs do not
+burn CPU. The cache fallback is built by `scripts/build_xtrainer_beta_pair_retarget_cache.py`; it stores
+`target_index`, `source_index`, diagnostics, and retarget payloads. This keeps the retarget-conditioned
+ratio stable even when online IK cannot keep up with GPU training.
 
 The dataset-specific beta config
 `pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3`
@@ -651,39 +657,58 @@ python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta \
     --overrides data.repo_id=/path/to/your/classified_structured_12d_lerobot_dataset \
     --overrides data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache \
     --overrides data.meta_beta_online_async_enabled=true \
+    --overrides data.meta_beta_online_worker_group=dataloader \
     --overrides data.meta_beta_online_num_workers=1 \
-    --overrides data.meta_beta_online_queue_size=4 \
-    --overrides data.meta_beta_online_max_pending=2 \
-    --overrides num_workers=8
+    --overrides data.meta_beta_online_queue_size=16 \
+    --overrides data.meta_beta_online_max_pending=4 \
+    --overrides data.meta_beta_online_submit_prob=1.0 \
+    --overrides num_workers=12 \
+    --overrides train_data_prefetch_buffer=8
 ```
 
 Recommended A/B throughput matrix for the classified black-ring stride3 dataset:
 
 ```text
 cache-only:
-  num_workers=4 or 8
-  data_loader_prefetch_factor=4 or 8
-  train_data_prefetch_buffer=1
+  num_workers=12
+  data_loader_prefetch_factor=4
+  train_data_prefetch_buffer=8
   data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
   data.meta_beta_online_async_enabled=false
 
 cache-first:
-  num_workers=4 or 8
+  num_workers=12
   data_loader_prefetch_factor=4
-  train_data_prefetch_buffer=1
+  train_data_prefetch_buffer=8
   data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
   data.meta_beta_online_async_enabled=true
   data.meta_beta_online_prefer_prob=0.0
 
 throttled-online:
-  num_workers=4 or 8
+  num_workers=12
   data_loader_prefetch_factor=4
-  train_data_prefetch_buffer=1
+  train_data_prefetch_buffer=8
   data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
   data.meta_beta_online_async_enabled=true
-  data.meta_beta_online_queue_size=2 or 4
-  data.meta_beta_online_max_pending=1 or 2
-  data.meta_beta_online_prefer_prob=0.25 or 0.5
+  data.meta_beta_online_worker_group=dataloader
+  data.meta_beta_online_num_workers=1
+  data.meta_beta_online_queue_size=16
+  data.meta_beta_online_max_pending=4
+  data.meta_beta_online_submit_prob=1.0
+
+experimental separate-online-workgroup:
+  num_workers=12
+  data_loader_prefetch_factor=4
+  train_data_prefetch_buffer=8
+  data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
+  data.meta_beta_online_async_enabled=true
+  data.meta_beta_online_worker_group=process
+  data.meta_beta_online_num_workers=16
+  data.meta_beta_online_queue_size=64
+  data.meta_beta_online_max_pending=4
+  data.meta_beta_online_submit_prob=1.0
+  data.meta_beta_online_request_queue_size=256
+  data.meta_beta_online_result_queue_size=256
 ```
 
 For each run, compare average step time after warmup, GPU-utilization pattern, `TRAIN_TIMING`

@@ -150,6 +150,9 @@ class DataConfig:
     meta_beta_online_max_pending: int | None = None
     meta_beta_online_prefer_prob: float = 1.0
     meta_beta_online_submit_prob: float = 1.0
+    meta_beta_online_worker_group: Literal["dataloader", "process"] = "dataloader"
+    meta_beta_online_request_queue_size: int = 256
+    meta_beta_online_result_queue_size: int = 256
     meta_beta_debug_stats_enabled: bool = False
     meta_beta_debug_stats_interval: int = 1000
 
@@ -464,6 +467,9 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     meta_beta_online_max_pending: int | None = None
     meta_beta_online_prefer_prob: float = 1.0
     meta_beta_online_submit_prob: float = 1.0
+    meta_beta_online_worker_group: Literal["dataloader", "process"] = "dataloader"
+    meta_beta_online_request_queue_size: int = 256
+    meta_beta_online_result_queue_size: int = 256
     meta_beta_debug_stats_enabled: bool = False
     meta_beta_debug_stats_interval: int = 1000
 
@@ -569,6 +575,9 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
             meta_beta_online_max_pending=self.meta_beta_online_max_pending,
             meta_beta_online_prefer_prob=self.meta_beta_online_prefer_prob,
             meta_beta_online_submit_prob=self.meta_beta_online_submit_prob,
+            meta_beta_online_worker_group=self.meta_beta_online_worker_group,
+            meta_beta_online_request_queue_size=self.meta_beta_online_request_queue_size,
+            meta_beta_online_result_queue_size=self.meta_beta_online_result_queue_size,
             meta_beta_debug_stats_enabled=self.meta_beta_debug_stats_enabled,
             meta_beta_debug_stats_interval=self.meta_beta_debug_stats_interval,
         )
@@ -636,6 +645,9 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     meta_beta_online_max_pending: int | None = None
     meta_beta_online_prefer_prob: float = 1.0
     meta_beta_online_submit_prob: float = 1.0
+    meta_beta_online_worker_group: Literal["dataloader", "process"] = "dataloader"
+    meta_beta_online_request_queue_size: int = 256
+    meta_beta_online_result_queue_size: int = 256
     meta_beta_debug_stats_enabled: bool = False
     meta_beta_debug_stats_interval: int = 1000
 
@@ -799,6 +811,9 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
             meta_beta_online_max_pending=self.meta_beta_online_max_pending,
             meta_beta_online_prefer_prob=self.meta_beta_online_prefer_prob,
             meta_beta_online_submit_prob=self.meta_beta_online_submit_prob,
+            meta_beta_online_worker_group=self.meta_beta_online_worker_group,
+            meta_beta_online_request_queue_size=self.meta_beta_online_request_queue_size,
+            meta_beta_online_result_queue_size=self.meta_beta_online_result_queue_size,
             meta_beta_debug_stats_enabled=self.meta_beta_debug_stats_enabled,
             meta_beta_debug_stats_interval=self.meta_beta_debug_stats_interval,
         )
@@ -1638,20 +1653,23 @@ _CONFIGS = [
             meta_beta_non_retarget_obs_only_condition_prob=0.10,
             meta_beta_pair_cache_dir="./assets/pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3/beta_pair_retarget_cache",
             meta_beta_online_async_enabled=True,
+            meta_beta_online_worker_group="dataloader",
             meta_beta_online_num_workers=1,
-            meta_beta_online_queue_size=4,
-            meta_beta_online_max_pending=2,
-            meta_beta_online_submit_prob=0.30,
+            meta_beta_online_queue_size=16,
+            meta_beta_online_max_pending=4,
+            meta_beta_online_submit_prob=1.0,
+            meta_beta_online_request_queue_size=256,
+            meta_beta_online_result_queue_size=256,
             default_prompt="use the tool affordance to complete the task",
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=35_000,
         batch_size=32,
-        num_workers=4,
+        num_workers=12,
         data_loader_prefetch_factor=4,
         keep_period=None,
         wandb_enabled=False,
-        train_data_prefetch_buffer=1,
+        train_data_prefetch_buffer=8,
     ),
     TrainConfig(
         name="pi05_xtrainer_raw14",
