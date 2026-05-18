@@ -1260,8 +1260,9 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
 
     @staticmethod
     def _set_meta_imagination_alpha(out: dict[str, typing.Any], *, retarget_applied: bool) -> None:
+        del retarget_applied
         out["meta_control"] = {
-            "imagination_alpha": np.asarray(1.0 if retarget_applied else 0.0, dtype=np.float32)
+            "imagination_alpha": np.asarray(0.0, dtype=np.float32)
         }
 
     @staticmethod

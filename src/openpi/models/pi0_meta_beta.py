@@ -123,15 +123,7 @@ class Pi0MetaBeta(Pi0Meta):
         return ref_tokens, einops.repeat(ref_mask, "b -> b r", r=self.num_reference_action_tokens)
 
     def _build_beta_special_tokens(self, observation: _model.Observation) -> at.Float[at.Array, "b s emb"]:
-        special_tokens = self._build_special_tokens(observation)
-        if observation.meta_imagination_alpha is None:
-            alpha = jnp.zeros((observation.state.shape[0],), dtype=observation.state.dtype)
-        else:
-            alpha = jnp.asarray(observation.meta_imagination_alpha, dtype=observation.state.dtype).reshape(
-                observation.state.shape[0]
-            )
-        alpha = jnp.clip(alpha, 0.0, 1.0)
-        return special_tokens.at[:, 0, :].add(self.meta_imagination_in(alpha[:, None]))
+        return self._build_special_tokens(observation)
 
     def _build_execution_meta_context_tokens(
         self, observation: _model.Observation
