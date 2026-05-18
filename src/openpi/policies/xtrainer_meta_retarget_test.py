@@ -137,7 +137,6 @@ def test_generate_retargeted_chunk_accepts_zero_noise_line_case():
 
 
 def test_future_near_targets_start_after_selected_frame():
-    old_input = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
     old_targets = np.array(
         [
             [0.01, 0.0, 0.0, 1.0, 0.0, 0.0],
@@ -237,6 +236,98 @@ def test_pair_retarget_anchor_selection_accepts_lateral_correction():
     assert selected is not None
     assert selected["retarget_mode"] == "correction"
     assert selected["trajectory_start_index"] == 0
+
+
+def test_pose12_feature_respects_approach_dim_mask():
+    pose = np.zeros(12, dtype=np.float32)
+    pose[3:9] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    pose[9:12] = [0.0, 1.0, 0.0]
+    no_approach_mask = np.array([1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0], dtype=bool)
+
+    feature_no_approach = retarget._weighted_meta_feature_from_pose(  # noqa: SLF001
+        "line",
+        pose,
+        retarget.MetaRetargetGeneratorConfig(),
+        dim_mask12=no_approach_mask,
+    )
+    feature_with_approach = retarget._weighted_meta_feature_from_pose(  # noqa: SLF001
+        "line",
+        pose,
+        retarget.MetaRetargetGeneratorConfig(),
+        dim_mask12=np.ones(12, dtype=bool),
+    )
+
+    assert feature_no_approach.shape == (9,)
+    assert feature_with_approach.shape == (12,)
+
+
+def test_pair_source_affordance_rejects_source_approach_to_target_no_approach():
+    helpers = retarget._load_xtrainer_helpers()
+    state = np.zeros(32, dtype=np.float32)
+    source_pose = np.zeros((1, 12), dtype=np.float32)
+    source_pose[0, 3:9] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    source_pose[0, 9:12] = [0.0, 1.0, 0.0]
+    target_pose = source_pose.copy()
+    target_pose[0, 9:12] = 0.0
+    target_mask = np.array([[1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0]], dtype=bool)
+
+    fixed = retarget._pair_source_affordance_as_target_input_pose(  # noqa: SLF001
+        {
+            "state": state,
+            "meta_areas": {
+                "pose12d": source_pose,
+                "dim_mask12": np.ones((1, 12), dtype=bool),
+                "type": np.array([retarget.META_AREA_TYPE_TO_ID["line"]], dtype=np.int32),
+                "mask": np.array([True], dtype=bool),
+            },
+        },
+        {
+            "state": state,
+            "meta_areas": {
+                "pose12d": target_pose,
+                "dim_mask12": target_mask,
+                "type": np.array([retarget.META_AREA_TYPE_TO_ID["line"]], dtype=np.int32),
+                "mask": np.array([True], dtype=bool),
+            },
+        },
+        helpers=helpers,
+    )
+
+    assert fixed is None
+
+
+def test_pair_source_affordance_masks_target_approach_when_source_has_none():
+    helpers = retarget._load_xtrainer_helpers()
+    state = np.zeros(32, dtype=np.float32)
+    source_pose = np.zeros((1, 12), dtype=np.float32)
+    source_pose[0, 3:9] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    target_pose = source_pose.copy()
+    target_pose[0, 9:12] = [0.0, 1.0, 0.0]
+
+    fixed = retarget._pair_source_affordance_as_target_input_pose(  # noqa: SLF001
+        {
+            "state": state,
+            "meta_areas": {
+                "pose12d": source_pose,
+                "dim_mask12": np.ones((1, 12), dtype=bool),
+                "type": np.array([retarget.META_AREA_TYPE_TO_ID["line"]], dtype=np.int32),
+                "mask": np.array([True], dtype=bool),
+            },
+        },
+        {
+            "state": state,
+            "meta_areas": {
+                "pose12d": target_pose,
+                "dim_mask12": np.ones((1, 12), dtype=bool),
+                "type": np.array([retarget.META_AREA_TYPE_TO_ID["line"]], dtype=np.int32),
+                "mask": np.array([True], dtype=bool),
+            },
+        },
+        helpers=helpers,
+    )
+
+    assert fixed is not None
+    np.testing.assert_array_equal(fixed["dim_mask12"][9:12], np.array([False, False, False]))
 
 
 def test_matrix_to_rotvec_near_pi_is_bounded():

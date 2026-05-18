@@ -408,6 +408,7 @@ def _generate_correction_chunk_from_item(
         config=config,
         helpers=helpers,
         horizon=horizon,
+        dim_mask12=dim_mask12,
     )
     approach_steps = approach_plan.steps
 
@@ -477,6 +478,7 @@ def _generate_correction_chunk_from_item(
                     initial_qpos_sim=seed_sim,
                     config=config,
                     helpers=helpers,
+                    dim_mask12=dim_mask12,
                 )
                 solved_sim = _wrap_near_seed(ik_result["qpos_sim"], seed_sim)
                 converged = bool(ik_result["converged"])
@@ -1175,6 +1177,7 @@ def _prepare_retarget_chunk(
     T_state_wrist = np.asarray(helpers["fk"](state_qpos, "right_wrist"), dtype=np.float32)
     dim_mask12 = meta_area_dim_mask12[0].copy() if meta_area_dim_mask12 is not None else None
     fixed_input_pose12d = data.get("_retarget_fixed_input_pose12d")
+    fixed_dim_mask12 = None
     if fixed_input_pose12d is not None:
         if not has_pose12:
             return None
@@ -1216,6 +1219,9 @@ def _prepare_retarget_chunk(
                 meta_action_target_mask = np.squeeze(meta_action_target_mask, axis=-1)
             if meta_action_target_mask.ndim == 1:
                 meta_action_target_mask = meta_action_target_mask[:, None]
+        if fixed_dim_mask12 is not None:
+            effective = np.asarray(fixed_dim_mask12, dtype=bool).reshape(META12_DIM)
+            meta_action_target_dim_mask12[:, 0, :] = effective
     else:
         old_input_pose = meta_area_pose6d[0].copy()
         if actions.shape[-1] < action_meta_slice.stop:
@@ -1353,6 +1359,7 @@ def _solve_smooth_chase_sequence(
             initial_qpos_sim=seed_sim,
             config=config,
             helpers=helpers,
+            dim_mask12=item.get("dim_mask12"),
         )
         seed_sim = _wrap_near_seed(ik_result["qpos_sim"], seed_sim)
         qpos_sequence.append(seed_sim)
@@ -1721,6 +1728,45 @@ def _pose12_has_approach(pose12: np.ndarray, dim_mask12: np.ndarray | None = Non
     return bool(np.any(np.asarray(dim_mask12, dtype=bool).reshape(12)[9:12]))
 
 
+def _pose12_payload_dim_mask(payload: dict[str, Any] | None) -> np.ndarray | None:
+    if not isinstance(payload, dict) or "pose12d" not in payload:
+        return None
+    raw_mask = payload.get("dim_mask12")
+    if raw_mask is None:
+        return np.ones(META12_DIM, dtype=bool)
+    mask = np.asarray(raw_mask, dtype=bool)
+    if mask.shape[-1] != META12_DIM:
+        return None
+    return np.any(mask.reshape(-1, META12_DIM), axis=0).astype(bool)
+
+
+def _pose12_payload_has_approach(payload: dict[str, Any] | None) -> bool:
+    if not isinstance(payload, dict) or "pose12d" not in payload:
+        return False
+    poses = np.asarray(payload["pose12d"], dtype=np.float32)
+    if poses.shape[-1] != META12_DIM:
+        return False
+    poses = poses.reshape(-1, META12_DIM)
+    raw_mask = payload.get("dim_mask12")
+    if raw_mask is None:
+        masks = np.ones_like(poses, dtype=bool)
+    else:
+        masks = np.asarray(raw_mask, dtype=bool).reshape(-1, META12_DIM)
+        if masks.shape[0] == 1 and poses.shape[0] > 1:
+            masks = np.broadcast_to(masks, poses.shape)
+        elif masks.shape[0] != poses.shape[0]:
+            masks = np.broadcast_to(np.any(masks, axis=0, keepdims=True), poses.shape)
+    return any(_pose12_has_approach(pose, mask) for pose, mask in zip(poses, masks, strict=True))
+
+
+def _pose12_effective_dim_mask(mask: np.ndarray | None, *, has_approach: bool) -> np.ndarray:
+    effective = np.ones(META12_DIM, dtype=bool) if mask is None else np.asarray(mask, dtype=bool).reshape(META12_DIM).copy()
+    effective[:3] = True
+    if not has_approach:
+        effective[9:12] = False
+    return effective
+
+
 def _shape_axis_from_pose12(area_type: str, pose12: np.ndarray, dim_mask12: np.ndarray | None = None) -> np.ndarray:
     pose = np.asarray(pose12, dtype=np.float32).reshape(12)
     M = _project_psd_trace1(_shape6_to_matrix(pose[3:9]))
@@ -1785,6 +1831,18 @@ def _pair_source_affordance_as_target_input_pose(
         dim_mask12 = np.ones(META12_DIM, dtype=bool)
     else:
         dim_mask12 = np.asarray(raw_dim_mask, dtype=bool).reshape(-1, META12_DIM)[0].copy()
+    source_has_approach = _pose12_has_approach(source_pose12d[0], dim_mask12)
+    target_has_approach = _pose12_payload_has_approach(target_data.get("meta_action_targets")) or _pose12_payload_has_approach(
+        target_data.get("meta_areas")
+    )
+    if source_has_approach and not target_has_approach:
+        return None
+    target_dim_mask = _pose12_payload_dim_mask(target_data.get("meta_action_targets"))
+    if target_dim_mask is None:
+        target_dim_mask = _pose12_payload_dim_mask(target_data.get("meta_areas"))
+    source_effective_mask = _pose12_effective_dim_mask(dim_mask12, has_approach=source_has_approach)
+    target_effective_mask = _pose12_effective_dim_mask(target_dim_mask, has_approach=target_has_approach)
+    dim_mask12 = (source_effective_mask & target_effective_mask).astype(bool)
 
     T_source_wrist = np.asarray(helpers["fk"](source_state[:14], "right_wrist"), dtype=np.float32)
     T_target_wrist = np.asarray(helpers["fk"](target_state[:14], "right_wrist"), dtype=np.float32)
@@ -2027,6 +2085,7 @@ def _compute_dynamic_approach_plan(
     config: MetaRetargetGeneratorConfig,
     helpers: dict[str, Any],
     horizon: int,
+    dim_mask12: np.ndarray | None = None,
 ) -> _DynamicApproachPlan:
     """Choose approach length from raw right-arm qpos delta.
 
@@ -2050,6 +2109,7 @@ def _compute_dynamic_approach_plan(
         initial_qpos_sim=initial_qpos_sim,
         config=config,
         helpers=helpers,
+        dim_mask12=dim_mask12,
     )
     solved_sim = _wrap_near_seed(alignment["qpos_sim"], initial_qpos_sim)
     solved_real = _sim_to_real_right_arm_qpos(solved_sim, helpers)
@@ -2149,6 +2209,7 @@ def _solve_right_arm_meta_ik(
     initial_qpos_sim: np.ndarray,
     config: MetaRetargetGeneratorConfig,
     helpers: dict[str, Any],
+    dim_mask12: np.ndarray | None = None,
 ) -> dict[str, Any]:
     if config.ik_backend == "jax" and np.asarray(target_meta_pose).reshape(-1).shape[0] == META6_DIM:
         return _solve_right_arm_meta_ik_jax(
@@ -2168,6 +2229,7 @@ def _solve_right_arm_meta_ik(
         initial_qpos_sim=initial_qpos_sim,
         config=config,
         helpers=helpers,
+        dim_mask12=dim_mask12,
     )
 
 
@@ -2180,9 +2242,10 @@ def _solve_right_arm_meta_ik_numpy(
     initial_qpos_sim: np.ndarray,
     config: MetaRetargetGeneratorConfig,
     helpers: dict[str, Any],
+    dim_mask12: np.ndarray | None = None,
 ) -> dict[str, Any]:
     q = np.asarray(initial_qpos_sim, dtype=np.float64).reshape(6).copy()
-    target_feature = _weighted_meta_feature_from_pose(area_type, target_meta_pose, config)
+    target_feature = _weighted_meta_feature_from_pose(area_type, target_meta_pose, config, dim_mask12=dim_mask12)
     converged = False
     final_error = np.inf
     iterations = 0
@@ -2195,6 +2258,7 @@ def _solve_right_arm_meta_ik_numpy(
             area_type=area_type,
             config=config,
             helpers=helpers,
+            dim_mask12=dim_mask12,
         )
         error = target_feature - feature
         final_error = float(np.linalg.norm(error))
@@ -2209,6 +2273,7 @@ def _solve_right_arm_meta_ik_numpy(
             area_type=area_type,
             config=config,
             helpers=helpers,
+            dim_mask12=dim_mask12,
         )
         JT = J.T
         dq = JT @ np.linalg.solve(J @ JT + (config.ik_damping**2) * np.eye(J.shape[0]), error)
@@ -2492,7 +2557,6 @@ def _get_jax_ik_sequence_solver(
             q, iteration, _ = carry
             feature = weighted_feature_from_qpos(q, T_wrist_meta)
             error = target_feature - feature
-            err_norm = jnp.linalg.norm(error)
             J = jacobian_fn(q)
             JT = J.T
             dq = JT @ jnp.linalg.solve(J @ JT + (ik_damping**2) * eye_feature, error)
@@ -2578,6 +2642,7 @@ def _numerical_meta_feature_jacobian(
     area_type: str,
     config: MetaRetargetGeneratorConfig,
     helpers: dict[str, Any],
+    dim_mask12: np.ndarray | None = None,
 ) -> np.ndarray:
     q = np.asarray(qpos_sim, dtype=np.float64).reshape(6)
     base_feature = _weighted_meta_feature_from_sim_qpos(
@@ -2587,6 +2652,7 @@ def _numerical_meta_feature_jacobian(
         area_type=area_type,
         config=config,
         helpers=helpers,
+        dim_mask12=dim_mask12,
     )
     J = np.zeros((base_feature.shape[0], q.shape[0]), dtype=np.float64)
     for dim in range(q.shape[0]):
@@ -2599,6 +2665,7 @@ def _numerical_meta_feature_jacobian(
             area_type=area_type,
             config=config,
             helpers=helpers,
+            dim_mask12=dim_mask12,
         )
         J[:, dim] = (feature - base_feature) / config.ik_finite_diff_eps
     return J
