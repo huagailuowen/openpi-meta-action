@@ -73,7 +73,7 @@ class MetaRetargetGeneratorConfig:
     # steps are consumed by the smooth correction path, then tracking resumes at
     # the third semantic step.
     correction_resume_source_index: int = 2
-    approach_joint_step_rad: float = 0.02
+    approach_joint_step_rad: float = 0.03
     max_approach_steps: int | None = None
     ik_max_iters: int = 80
     ik_tolerance: float = 1e-3
@@ -84,8 +84,41 @@ class MetaRetargetGeneratorConfig:
     ik_finite_diff_eps: float = 1e-4
     ik_max_joint_step_rad: float = 0.08
     ik_backend: str = "numpy"
+    wrist_target_shape_weight: float = 1.0
+    wrist_target_approach_weight: float = 1.0
+    wrist_target_pos_weight: float = 0.1
+    wrist_target_rot_weight: float = 0.3
+    wrist_target_roll_weight: float = 0.3
+    wrist_target_shape_clip_low_deg: float = 3.0
+    wrist_target_shape_clip_high_deg: float = 30.0
+    wrist_target_approach_clip_low_deg: float = 3.0
+    wrist_target_approach_clip_high_deg: float = 30.0
+    wrist_target_pos_clip_low_m: float = 0.02
+    wrist_target_pos_clip_high_m: float = 0.30
+    wrist_target_rot_clip_low_deg: float = 5.0
+    wrist_target_rot_clip_high_deg: float = 50.0
+    wrist_target_roll_free_angle_deg: float = 45.0
+    wrist_target_roll_clip_low_deg: float = 5.0
+    wrist_target_roll_clip_high_deg: float = 35.0
+    wrist_target_angle_tail_slope_per_deg: float = 0.01
+    wrist_target_distance_tail_slope_per_m: float = 1.0
+    wrist_target_shape_tail_slope_per_deg: float = 0.01
+    wrist_target_approach_tail_slope_per_deg: float = 0.01
+    wrist_target_rot_tail_slope_per_deg: float = 0.01
+    wrist_target_roll_tail_slope_per_deg: float = 0.01
+    wrist_target_roll_samples: int = 37
+    follow_wrist_target_shape_weight: float = 0.8
+    follow_wrist_target_approach_weight: float = 0.8
+    follow_wrist_target_pos_weight: float = 1.0
+    follow_wrist_target_rot_weight: float = 1.0
+    follow_wrist_target_pos_clip_low_m: float = 0.01
+    follow_wrist_target_pos_clip_high_m: float = 0.04
+    follow_wrist_target_pos_tail_slope_per_m: float = 50.0
+    follow_wrist_target_rot_clip_low_deg: float = 4.0
+    follow_wrist_target_rot_clip_high_deg: float = 13.0
+    follow_wrist_target_rot_tail_slope_per_deg: float = 0.125
     accept_max_position_error_m: float = 0.015
-    accept_max_direction_error_rad: float = 0.25
+    accept_max_direction_error_rad: float = 0.4
     accept_max_step_joint_delta_rad: float = 0.35
     accept_max_abs_action_value: float = 1e4
     accept_max_camera_rotvec_norm_rad: float = 3.143
@@ -137,6 +170,7 @@ class _DynamicApproachPlan:
     aligned_qpos_real: np.ndarray
     converged: bool
     final_error: float
+    qpos_real_sequence: np.ndarray | None = None
 
 
 def _set_retarget_meta_action(
@@ -431,20 +465,7 @@ def _generate_correction_chunk_from_item(
     position_errors.append(align_pos_err)
     direction_errors.append(align_dir_err)
 
-    jax_follow: dict[str, Any] | None = None
-    if config.ik_backend == "jax" and approach_steps < horizon:
-        follow_seed_sim = (
-            helpers["real_to_sim_arm"](approach_plan.aligned_qpos_real[RIGHT_ARM_QPOS_SLICE], "right")
-            if approach_steps > 0
-            else seed_sim
-        )
-        jax_follow = _solve_right_arm_meta_ik_sequence_jax(
-            target_meta_poses=old_target_meta,
-            T_wrist_meta=T_wrist_meta_new,
-            area_type=area_type,
-            initial_qpos_sim=follow_seed_sim,
-            config=config,
-        )
+    follow_config = _follow_wrist_target_config(config)
 
     for step in range(horizon):
         if step < approach_steps:
@@ -458,10 +479,13 @@ def _generate_correction_chunk_from_item(
             )
             out_action = actions[0].copy()
             out_action[:14] = state_qpos
-            out_action[RIGHT_ARM_QPOS_SLICE] = (
-                (1.0 - alpha) * state_qpos[RIGHT_ARM_QPOS_SLICE]
-                + alpha * approach_plan.aligned_qpos_real[RIGHT_ARM_QPOS_SLICE]
-            ).astype(np.float32)
+            if approach_plan.qpos_real_sequence is not None and step < approach_plan.qpos_real_sequence.shape[0]:
+                out_action[RIGHT_ARM_QPOS_SLICE] = approach_plan.qpos_real_sequence[step, RIGHT_ARM_QPOS_SLICE]
+            else:
+                out_action[RIGHT_ARM_QPOS_SLICE] = (
+                    (1.0 - alpha) * state_qpos[RIGHT_ARM_QPOS_SLICE]
+                    + alpha * approach_plan.aligned_qpos_real[RIGHT_ARM_QPOS_SLICE]
+                ).astype(np.float32)
             _set_retarget_meta_action(out_action, out_target_pose12d, step, target_meta, action_meta_slice, meta_dim)
             seed_sim = helpers["real_to_sim_arm"](out_action[RIGHT_ARM_QPOS_SLICE], "right")
         else:
@@ -469,22 +493,18 @@ def _generate_correction_chunk_from_item(
             out_action = actions[source_idx].copy()
             target_meta = old_target_meta[source_idx]
 
-            if jax_follow is None:
-                ik_result = _solve_right_arm_meta_ik(
-                    template_qpos_real=out_action[:14],
-                    target_meta_pose=target_meta,
-                    T_wrist_meta=T_wrist_meta_new,
-                    area_type=area_type,
-                    initial_qpos_sim=seed_sim,
-                    config=config,
-                    helpers=helpers,
-                    dim_mask12=dim_mask12,
-                )
-                solved_sim = _wrap_near_seed(ik_result["qpos_sim"], seed_sim)
-                converged = bool(ik_result["converged"])
-            else:
-                solved_sim = np.asarray(jax_follow["qpos_sim"][source_idx], dtype=np.float32)
-                converged = bool(jax_follow["converged"][source_idx])
+            ik_result = _solve_right_arm_meta_ik(
+                template_qpos_real=previous_real_qpos,
+                target_meta_pose=target_meta,
+                T_wrist_meta=T_wrist_meta_new,
+                area_type=area_type,
+                initial_qpos_sim=seed_sim,
+                config=follow_config,
+                helpers=helpers,
+                dim_mask12=dim_mask12,
+            )
+            solved_sim = _wrap_near_seed(ik_result["qpos_sim"], seed_sim)
+            converged = bool(ik_result["converged"])
 
             solved_real = _sim_to_real_right_arm_qpos(solved_sim, helpers)
 
@@ -997,15 +1017,11 @@ def _select_pair_retarget_anchor(
             config=config,
             dim_mask12=dim_mask12,
         ):
-            target_meta_sequence, source_indices = _build_smooth_chase_targets(
-                area_type,
+            source_indices = _direct_follow_source_indices(
                 old_target_meta,
-                old_anchor_pose=anchor_pose,
-                new_anchor_pose=candidate_pose,
                 trajectory_start_index=min(anchor_index, old_target_meta.shape[0] - 1),
-                transition_steps=config.future_near_transition_steps,
-                dim_mask12=dim_mask12,
             )
+            target_meta_sequence = old_target_meta[source_indices].astype(np.float32)
             return {
                 "retarget_mode": "future_near",
                 "trajectory_start_index": int(anchor_index),
@@ -1032,6 +1048,14 @@ def _select_pair_retarget_anchor(
     return None
 
 
+def _direct_follow_source_indices(old_target_meta: np.ndarray, *, trajectory_start_index: int) -> np.ndarray:
+    horizon = int(old_target_meta.shape[0])
+    if horizon <= 0:
+        return np.zeros((0,), dtype=np.int32)
+    start = min(max(int(trajectory_start_index), 0), horizon - 1)
+    return np.minimum(np.arange(horizon, dtype=np.int32) + start, horizon - 1)
+
+
 def _rotation_between_unit_vectors(start: np.ndarray, end: np.ndarray) -> np.ndarray:
     a = _normalize(start)
     b = _normalize(end)
@@ -1047,6 +1071,315 @@ def _rotation_between_unit_vectors(start: np.ndarray, end: np.ndarray) -> np.nda
     axis = _normalize(np.cross(a, b))
     angle = float(np.arccos(dot))
     return _rotvec_to_matrix(axis * angle)
+
+
+def _angle_between_unit_vectors_deg(a: np.ndarray, b: np.ndarray, *, unsigned: bool = False) -> float:
+    va = _normalize(a)
+    vb = _normalize(b)
+    dot = float(np.clip(np.dot(va, vb), -1.0, 1.0))
+    if unsigned:
+        dot = abs(dot)
+    return float(np.rad2deg(np.arccos(dot)))
+
+
+def _rotation_angle_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
+    R_delta = np.asarray(R_a, dtype=np.float64).reshape(3, 3) @ np.asarray(R_b, dtype=np.float64).reshape(3, 3).T
+    trace = float(np.trace(R_delta))
+    cos_angle = np.clip((trace - 1.0) * 0.5, -1.0, 1.0)
+    return float(np.rad2deg(np.arccos(cos_angle)))
+
+
+def _smoothstep_unit(x: float) -> float:
+    x = float(np.clip(x, 0.0, 1.0))
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _clipped_smoothstep_with_tail(value: float, low: float, high: float, tail_slope: float) -> float:
+    value = float(value)
+    low = float(low)
+    high = float(high)
+    if high <= low:
+        return 0.0 if value <= low else 1.0 + max(0.0, value - high) * float(tail_slope)
+    if value <= low:
+        return 0.0
+    if value <= high:
+        return _smoothstep_unit((value - low) / (high - low))
+    return 1.0 + (value - high) * float(tail_slope)
+
+
+def _wrist_roll_domain_loss(R_base_wrist: np.ndarray, config: MetaRetargetGeneratorConfig) -> float:
+    wrist_x = np.asarray(R_base_wrist, dtype=np.float32).reshape(3, 3)[:, 0]
+    world_z = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    danger_angle = min(
+        _angle_between_unit_vectors_deg(wrist_x, world_z),
+        _angle_between_unit_vectors_deg(wrist_x, -world_z),
+    )
+    if danger_angle >= float(config.wrist_target_roll_free_angle_deg):
+        return 0.0
+    roll_error = float(config.wrist_target_roll_free_angle_deg) - danger_angle
+    return _clipped_smoothstep_with_tail(
+        roll_error,
+        config.wrist_target_roll_clip_low_deg,
+        config.wrist_target_roll_clip_high_deg,
+        config.wrist_target_roll_tail_slope_per_deg,
+    )
+
+
+def _follow_wrist_target_config(config: MetaRetargetGeneratorConfig) -> MetaRetargetGeneratorConfig:
+    """Use stronger wrist-pose continuity regularization during trajectory following."""
+
+    return dataclasses.replace(
+        config,
+        wrist_target_shape_weight=float(config.follow_wrist_target_shape_weight),
+        wrist_target_approach_weight=float(config.follow_wrist_target_approach_weight),
+        wrist_target_pos_weight=float(config.follow_wrist_target_pos_weight),
+        wrist_target_rot_weight=float(config.follow_wrist_target_rot_weight),
+        wrist_target_pos_clip_low_m=float(config.follow_wrist_target_pos_clip_low_m),
+        wrist_target_pos_clip_high_m=float(config.follow_wrist_target_pos_clip_high_m),
+        wrist_target_distance_tail_slope_per_m=float(config.follow_wrist_target_pos_tail_slope_per_m),
+        wrist_target_rot_clip_low_deg=float(config.follow_wrist_target_rot_clip_low_deg),
+        wrist_target_rot_clip_high_deg=float(config.follow_wrist_target_rot_clip_high_deg),
+        wrist_target_rot_tail_slope_per_deg=float(config.follow_wrist_target_rot_tail_slope_per_deg),
+    )
+
+
+def _candidate_roll_angles(config: MetaRetargetGeneratorConfig) -> np.ndarray:
+    samples = max(1, int(config.wrist_target_roll_samples))
+    if samples == 1:
+        return np.zeros((1,), dtype=np.float32)
+    return np.linspace(-np.pi, np.pi, samples, endpoint=True, dtype=np.float32)
+
+
+def _shape_angle_deg_for_pose12(
+    area_type: str,
+    actual_pose: np.ndarray,
+    target_pose: np.ndarray,
+    dim_mask12: np.ndarray | None,
+) -> float:
+    if area_type == "point":
+        return 0.0
+    axis_actual = _shape_axis_from_pose12(area_type, actual_pose, dim_mask12)
+    axis_target = _shape_axis_from_pose12(area_type, target_pose, dim_mask12)
+    return _angle_between_unit_vectors_deg(axis_actual, axis_target, unsigned=True)
+
+
+def _approach_angle_deg_for_pose12(
+    actual_pose: np.ndarray,
+    target_pose: np.ndarray,
+    dim_mask12: np.ndarray | None,
+) -> float | None:
+    if not (_pose12_has_approach(actual_pose, dim_mask12) and _pose12_has_approach(target_pose, dim_mask12)):
+        return None
+    return _angle_between_unit_vectors_deg(actual_pose[9:12], target_pose[9:12], unsigned=False)
+
+
+def _rotation_candidate_score(
+    *,
+    R_base_wrist: np.ndarray,
+    p_base_wrist: np.ndarray,
+    R_ref_wrist: np.ndarray,
+    p_ref_wrist: np.ndarray,
+    shape_angle_deg: float,
+    approach_angle_deg: float | None,
+    config: MetaRetargetGeneratorConfig,
+) -> float:
+    shape_loss = _clipped_smoothstep_with_tail(
+        shape_angle_deg,
+        config.wrist_target_shape_clip_low_deg,
+        config.wrist_target_shape_clip_high_deg,
+        config.wrist_target_shape_tail_slope_per_deg,
+    )
+    approach_loss = 0.0
+    if approach_angle_deg is not None:
+        approach_loss = _clipped_smoothstep_with_tail(
+            approach_angle_deg,
+            config.wrist_target_approach_clip_low_deg,
+            config.wrist_target_approach_clip_high_deg,
+            config.wrist_target_approach_tail_slope_per_deg,
+        )
+    pos_loss = _clipped_smoothstep_with_tail(
+        float(np.linalg.norm(np.asarray(p_base_wrist, dtype=np.float32) - np.asarray(p_ref_wrist, dtype=np.float32))),
+        config.wrist_target_pos_clip_low_m,
+        config.wrist_target_pos_clip_high_m,
+        config.wrist_target_distance_tail_slope_per_m,
+    )
+    rot_loss = _clipped_smoothstep_with_tail(
+        _rotation_angle_deg(R_base_wrist, R_ref_wrist),
+        config.wrist_target_rot_clip_low_deg,
+        config.wrist_target_rot_clip_high_deg,
+        config.wrist_target_rot_tail_slope_per_deg,
+    )
+    roll_loss = _wrist_roll_domain_loss(R_base_wrist, config)
+    return float(
+        config.wrist_target_shape_weight * shape_loss
+        + config.wrist_target_approach_weight * approach_loss
+        + config.wrist_target_pos_weight * pos_loss
+        + config.wrist_target_rot_weight * rot_loss
+        + config.wrist_target_roll_weight * roll_loss
+    )
+
+
+def _make_wrist_pose(R_base_wrist: np.ndarray, p_base_wrist: np.ndarray) -> np.ndarray:
+    T = np.eye(4, dtype=np.float32)
+    T[:3, :3] = np.asarray(R_base_wrist, dtype=np.float32).reshape(3, 3)
+    T[:3, 3] = np.asarray(p_base_wrist, dtype=np.float32).reshape(3)
+    return T
+
+
+def _interpolate_wrist_pose(T_start: np.ndarray, T_end: np.ndarray, alpha: float) -> np.ndarray:
+    start = np.asarray(T_start, dtype=np.float32).reshape(4, 4)
+    end = np.asarray(T_end, dtype=np.float32).reshape(4, 4)
+    t = float(np.clip(alpha, 0.0, 1.0))
+    R_delta = end[:3, :3] @ start[:3, :3].T
+    R = _rotvec_to_matrix(_matrix_to_rotvec(R_delta) * t) @ start[:3, :3]
+    p = (1.0 - t) * start[:3, 3] + t * end[:3, 3]
+    return _make_wrist_pose(R, p)
+
+
+def _target_wrist_pose_from_pose12(
+    *,
+    area_type: str,
+    wrist_pose12: np.ndarray,
+    target_pose12: np.ndarray,
+    reference_T_base_wrist: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    dim_mask12: np.ndarray | None,
+) -> np.ndarray:
+    wrist_pose = np.asarray(wrist_pose12, dtype=np.float32).reshape(META12_DIM)
+    target_pose = np.asarray(target_pose12, dtype=np.float32).reshape(META12_DIM)
+    T_ref = np.asarray(reference_T_base_wrist, dtype=np.float32).reshape(4, 4)
+    R_ref = T_ref[:3, :3]
+    p_ref = T_ref[:3, 3]
+
+    if area_type == "point":
+        R = R_ref.copy()
+        return _make_wrist_pose(R, target_pose[:3] - R @ wrist_pose[:3])
+
+    local_axis = _shape_axis_from_pose12(area_type, wrist_pose, dim_mask12)
+    target_axis = _shape_axis_from_pose12(area_type, target_pose, dim_mask12)
+    local_has_approach = _pose12_has_approach(wrist_pose, dim_mask12)
+    target_has_approach = _pose12_has_approach(target_pose, dim_mask12)
+    use_approach = local_has_approach and target_has_approach
+
+    base_rotations: list[np.ndarray] = []
+    for sign in (1.0, -1.0):
+        signed_target_axis = target_axis * sign
+        base_rotations.append(_rotation_between_unit_vectors(local_axis, signed_target_axis))
+        if use_approach:
+            base_rotations.append(
+                _rotation_from_direction_pairs(
+                    [local_axis, wrist_pose[9:12]],
+                    [signed_target_axis, target_pose[9:12]],
+                )
+            )
+    base_rotations.append(R_ref.copy())
+
+    best_T: np.ndarray | None = None
+    best_score = np.inf
+    roll_axis = target_axis
+    roll_angles = _candidate_roll_angles(config)
+    for base_R in base_rotations:
+        for angle in roll_angles:
+            R = _rotvec_to_matrix(roll_axis * float(angle)) @ base_R
+            p = target_pose[:3] - R @ wrist_pose[:3]
+            T = _make_wrist_pose(R, p)
+            actual_pose = _wrist_pose12_to_base_pose(wrist_pose, T)
+            shape_angle = _shape_angle_deg_for_pose12(area_type, actual_pose, target_pose, dim_mask12)
+            approach_angle = _approach_angle_deg_for_pose12(actual_pose, target_pose, dim_mask12)
+            score = _rotation_candidate_score(
+                R_base_wrist=R,
+                p_base_wrist=p,
+                R_ref_wrist=R_ref,
+                p_ref_wrist=p_ref,
+                shape_angle_deg=shape_angle,
+                approach_angle_deg=approach_angle,
+                config=config,
+            )
+            if score < best_score:
+                best_score = score
+                best_T = T
+    if best_T is None:
+        return _make_wrist_pose(R_ref, target_pose[:3] - R_ref @ wrist_pose[:3])
+    return best_T
+
+
+def _target_wrist_pose_from_pose6d(
+    *,
+    area_type: str,
+    T_wrist_meta: np.ndarray,
+    target_pose6d: np.ndarray,
+    reference_T_base_wrist: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+) -> np.ndarray:
+    T_local = np.asarray(T_wrist_meta, dtype=np.float32).reshape(4, 4)
+    target_pose = np.asarray(target_pose6d, dtype=np.float32).reshape(6)
+    T_ref = np.asarray(reference_T_base_wrist, dtype=np.float32).reshape(4, 4)
+    R_ref = T_ref[:3, :3]
+    p_ref = T_ref[:3, 3]
+    local_p = T_local[:3, 3]
+
+    if area_type == "point":
+        return _make_wrist_pose(R_ref, target_pose[:3] - R_ref @ local_p)
+
+    local_axis = _normalize(T_local[:3, 0] if area_type == "line" else T_local[:3, 2])
+    target_axis = _normalize(target_pose[3:6])
+    base_rotations = [
+        _rotation_between_unit_vectors(local_axis, target_axis),
+        _rotation_between_unit_vectors(local_axis, -target_axis),
+        R_ref.copy(),
+    ]
+    best_T: np.ndarray | None = None
+    best_score = np.inf
+    for base_R in base_rotations:
+        for angle in _candidate_roll_angles(config):
+            R = _rotvec_to_matrix(target_axis * float(angle)) @ base_R
+            p = target_pose[:3] - R @ local_p
+            actual_axis = _normalize(R @ local_axis)
+            shape_angle = _angle_between_unit_vectors_deg(actual_axis, target_axis, unsigned=True)
+            score = _rotation_candidate_score(
+                R_base_wrist=R,
+                p_base_wrist=p,
+                R_ref_wrist=R_ref,
+                p_ref_wrist=p_ref,
+                shape_angle_deg=shape_angle,
+                approach_angle_deg=None,
+                config=config,
+            )
+            if score < best_score:
+                best_score = score
+                best_T = _make_wrist_pose(R, p)
+    if best_T is None:
+        return _make_wrist_pose(R_ref, target_pose[:3] - R_ref @ local_p)
+    return best_T
+
+
+def _target_wrist_pose_from_meta_target(
+    *,
+    area_type: str,
+    target_meta_pose: np.ndarray,
+    T_wrist_meta: np.ndarray,
+    reference_T_base_wrist: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    dim_mask12: np.ndarray | None,
+) -> np.ndarray:
+    target = np.asarray(target_meta_pose, dtype=np.float32).reshape(-1)
+    wrist_meta = np.asarray(T_wrist_meta, dtype=np.float32)
+    if target.shape[0] == META12_DIM:
+        return _target_wrist_pose_from_pose12(
+            area_type=area_type,
+            wrist_pose12=wrist_meta.reshape(META12_DIM),
+            target_pose12=target,
+            reference_T_base_wrist=reference_T_base_wrist,
+            config=config,
+            dim_mask12=dim_mask12,
+        )
+    return _target_wrist_pose_from_pose6d(
+        area_type=area_type,
+        T_wrist_meta=wrist_meta.reshape(4, 4),
+        target_pose6d=target.reshape(META6_DIM),
+        reference_T_base_wrist=reference_T_base_wrist,
+        config=config,
+    )
 
 
 def _apply_pose_offset_from_anchor(
@@ -1269,15 +1602,8 @@ def _prepare_retarget_chunk(
             dim_mask12=dim_mask12,
         )
         trajectory_start_index = min(selected_frame_index, horizon - 1)
-        target_meta_sequence, source_indices = _build_smooth_chase_targets(
-            area_type,
-            old_target_meta,
-            old_anchor_pose=selected_pose,
-            new_anchor_pose=new_input_pose,
-            trajectory_start_index=trajectory_start_index,
-            transition_steps=config.future_near_transition_steps,
-            dim_mask12=dim_mask12,
-        )
+        source_indices = _direct_follow_source_indices(old_target_meta, trajectory_start_index=trajectory_start_index)
+        target_meta_sequence = old_target_meta[source_indices].astype(np.float32)
     else:
         new_input_pose = _sample_correction_pose(
             area_type,
@@ -1347,21 +1673,26 @@ def _solve_smooth_chase_sequence(
         raise ValueError(f"Unsupported ik_backend={config.ik_backend!r}; expected 'numpy' or 'jax'")
 
     seed_sim = np.asarray(initial_qpos_sim, dtype=np.float32)
+    previous_real_qpos = np.asarray(item["state_qpos"], dtype=np.float32).reshape(-1)[:14].copy()
+    follow_config = _follow_wrist_target_config(config)
     qpos_sequence = []
     converged_sequence = []
     for step, target_meta in enumerate(target_meta_sequence):
         source_idx = int(item["source_indices"][step])
         ik_result = _solve_right_arm_meta_ik_numpy(
-            template_qpos_real=item["actions"][source_idx, :14],
+            template_qpos_real=previous_real_qpos,
             target_meta_pose=target_meta,
             T_wrist_meta=item["T_wrist_meta_new"],
             area_type=item["area_type"],
             initial_qpos_sim=seed_sim,
-            config=config,
+            config=follow_config,
             helpers=helpers,
             dim_mask12=item.get("dim_mask12"),
         )
         seed_sim = _wrap_near_seed(ik_result["qpos_sim"], seed_sim)
+        solved_real = _sim_to_real_right_arm_qpos(seed_sim, helpers)
+        previous_real_qpos = np.asarray(item["actions"][source_idx, :14], dtype=np.float32).copy()
+        previous_real_qpos[RIGHT_ARM_QPOS_SLICE] = solved_real
         qpos_sequence.append(seed_sim)
         converged_sequence.append(bool(ik_result["converged"]))
 
@@ -2101,19 +2432,26 @@ def _compute_dynamic_approach_plan(
     if config.approach_joint_step_rad <= 0:
         raise ValueError(f"approach_joint_step_rad must be positive, got {config.approach_joint_step_rad}")
 
-    alignment = _solve_right_arm_meta_ik(
-        template_qpos_real=np.asarray(state_qpos, dtype=np.float32).reshape(-1)[:14],
+    state_qpos = np.asarray(state_qpos, dtype=np.float32).reshape(-1)[:14].copy()
+    start_T_base_wrist = np.asarray(helpers["fk"](state_qpos, "right_wrist"), dtype=np.float32)
+    target_T_base_wrist = _target_wrist_pose_from_meta_target(
+        area_type=area_type,
         target_meta_pose=first_target_meta,
         T_wrist_meta=T_wrist_meta,
-        area_type=area_type,
+        reference_T_base_wrist=start_T_base_wrist,
+        config=config,
+        dim_mask12=dim_mask12,
+    )
+    alignment = _solve_right_arm_wrist_pose_ik_numpy(
+        template_qpos_real=state_qpos,
+        target_T_base_wrist=target_T_base_wrist,
         initial_qpos_sim=initial_qpos_sim,
         config=config,
         helpers=helpers,
-        dim_mask12=dim_mask12,
     )
     solved_sim = _wrap_near_seed(alignment["qpos_sim"], initial_qpos_sim)
     solved_real = _sim_to_real_right_arm_qpos(solved_sim, helpers)
-    aligned_qpos_real = np.asarray(state_qpos, dtype=np.float32).reshape(-1)[:14].copy()
+    aligned_qpos_real = state_qpos.copy()
     aligned_qpos_real[RIGHT_ARM_QPOS_SLICE] = solved_real
     right_delta = np.asarray(solved_real, dtype=np.float32) - np.asarray(state_qpos[RIGHT_ARM_QPOS_SLICE], dtype=np.float32)
     max_abs_delta = float(np.max(np.abs(right_delta)))
@@ -2121,12 +2459,77 @@ def _compute_dynamic_approach_plan(
     if config.max_approach_steps is not None:
         steps = min(steps, int(config.max_approach_steps))
     steps = min(max(steps, 0), int(horizon))
+    qpos_sequence = _build_approach_qpos_sequence_from_wrist_keyframes(
+        state_qpos=state_qpos,
+        start_T_base_wrist=start_T_base_wrist,
+        target_T_base_wrist=target_T_base_wrist,
+        steps=steps,
+        initial_qpos_sim=initial_qpos_sim,
+        final_qpos_sim=solved_sim,
+        config=config,
+        helpers=helpers,
+    )
     return _DynamicApproachPlan(
         steps=steps,
-        aligned_qpos_real=aligned_qpos_real.astype(np.float32),
+        aligned_qpos_real=(
+            qpos_sequence[-1].astype(np.float32) if qpos_sequence is not None and qpos_sequence.shape[0] else aligned_qpos_real.astype(np.float32)
+        ),
         converged=bool(alignment["converged"]),
         final_error=float(alignment["final_error"]),
+        qpos_real_sequence=qpos_sequence,
     )
+
+
+def _build_approach_qpos_sequence_from_wrist_keyframes(
+    *,
+    state_qpos: np.ndarray,
+    start_T_base_wrist: np.ndarray,
+    target_T_base_wrist: np.ndarray,
+    steps: int,
+    initial_qpos_sim: np.ndarray,
+    final_qpos_sim: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+) -> np.ndarray | None:
+    if steps <= 0:
+        return np.zeros((0, 14), dtype=np.float32)
+
+    state_qpos = np.asarray(state_qpos, dtype=np.float32).reshape(-1)[:14].copy()
+    key_alphas = [1.0 / 3.0, 2.0 / 3.0, 1.0]
+    key_qpos = [state_qpos.copy()]
+    seed_sim = np.asarray(initial_qpos_sim, dtype=np.float32).reshape(6)
+    for alpha in key_alphas:
+        if alpha >= 1.0:
+            solved_sim = _wrap_near_seed(final_qpos_sim, seed_sim)
+        else:
+            target_T = _interpolate_wrist_pose(start_T_base_wrist, target_T_base_wrist, alpha)
+            ik_result = _solve_right_arm_wrist_pose_ik_numpy(
+                template_qpos_real=state_qpos,
+                target_T_base_wrist=target_T,
+                initial_qpos_sim=seed_sim,
+                config=config,
+                helpers=helpers,
+            )
+            solved_sim = _wrap_near_seed(ik_result["qpos_sim"], seed_sim)
+        solved_real = _sim_to_real_right_arm_qpos(solved_sim, helpers)
+        qpos = state_qpos.copy()
+        qpos[RIGHT_ARM_QPOS_SLICE] = solved_real
+        key_qpos.append(qpos.astype(np.float32))
+        seed_sim = solved_sim.astype(np.float32)
+
+    key_qpos_arr = np.stack(key_qpos, axis=0)
+    sequence = np.zeros((steps, 14), dtype=np.float32)
+    for step in range(steps):
+        u = float(step + 1) / float(steps)
+        segment = min(int(np.ceil(u * 3.0)), 3)
+        segment = max(segment, 1)
+        left_u = float(segment - 1) / 3.0
+        right_u = float(segment) / 3.0
+        local = 1.0 if right_u <= left_u else (u - left_u) / (right_u - left_u)
+        sequence[step] = (
+            (1.0 - local) * key_qpos_arr[segment - 1] + local * key_qpos_arr[segment]
+        ).astype(np.float32)
+    return sequence
 
 
 def _interpolate_meta_pose(
@@ -2244,39 +2647,62 @@ def _solve_right_arm_meta_ik_numpy(
     helpers: dict[str, Any],
     dim_mask12: np.ndarray | None = None,
 ) -> dict[str, Any]:
+    template_qpos = np.asarray(template_qpos_real, dtype=np.float32).reshape(-1)[:14].copy()
+    reference_T_base_wrist = np.asarray(helpers["fk"](template_qpos, "right_wrist"), dtype=np.float32)
+    target_T_base_wrist = _target_wrist_pose_from_meta_target(
+        area_type=area_type,
+        target_meta_pose=target_meta_pose,
+        T_wrist_meta=T_wrist_meta,
+        reference_T_base_wrist=reference_T_base_wrist,
+        config=config,
+        dim_mask12=dim_mask12,
+    )
+    return _solve_right_arm_wrist_pose_ik_numpy(
+        template_qpos_real=template_qpos,
+        target_T_base_wrist=target_T_base_wrist,
+        initial_qpos_sim=initial_qpos_sim,
+        config=config,
+        helpers=helpers,
+    )
+
+
+def _solve_right_arm_wrist_pose_ik_numpy(
+    *,
+    template_qpos_real: np.ndarray,
+    target_T_base_wrist: np.ndarray,
+    initial_qpos_sim: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+) -> dict[str, Any]:
     q = np.asarray(initial_qpos_sim, dtype=np.float64).reshape(6).copy()
-    target_feature = _weighted_meta_feature_from_pose(area_type, target_meta_pose, config, dim_mask12=dim_mask12)
+    template_qpos = np.asarray(template_qpos_real, dtype=np.float32).reshape(-1)[:14].copy()
+    target_T_base_wrist = np.asarray(target_T_base_wrist, dtype=np.float32).reshape(4, 4)
     converged = False
     final_error = np.inf
     iterations = 0
 
     for iterations in range(1, config.ik_max_iters + 1):
-        feature = _weighted_meta_feature_from_sim_qpos(
+        error = _wrist_pose_residual_from_sim_qpos(
             q,
-            template_qpos_real=template_qpos_real,
-            T_wrist_meta=T_wrist_meta,
-            area_type=area_type,
+            template_qpos_real=template_qpos,
+            target_T_base_wrist=target_T_base_wrist,
             config=config,
             helpers=helpers,
-            dim_mask12=dim_mask12,
         )
-        error = target_feature - feature
         final_error = float(np.linalg.norm(error))
         if final_error < config.ik_tolerance:
             converged = True
             break
 
-        J = _numerical_meta_feature_jacobian(
+        J = _numerical_wrist_pose_residual_jacobian(
             q,
-            template_qpos_real=template_qpos_real,
-            T_wrist_meta=T_wrist_meta,
-            area_type=area_type,
+            template_qpos_real=template_qpos,
+            target_T_base_wrist=target_T_base_wrist,
             config=config,
             helpers=helpers,
-            dim_mask12=dim_mask12,
         )
         JT = J.T
-        dq = JT @ np.linalg.solve(J @ JT + (config.ik_damping**2) * np.eye(J.shape[0]), error)
+        dq = -JT @ np.linalg.solve(J @ JT + (config.ik_damping**2) * np.eye(J.shape[0]), error)
         max_step = float(np.max(np.abs(dq)))
         if max_step > config.ik_max_joint_step_rad > 0:
             dq *= config.ik_max_joint_step_rad / max_step
@@ -2668,6 +3094,69 @@ def _numerical_meta_feature_jacobian(
             dim_mask12=dim_mask12,
         )
         J[:, dim] = (feature - base_feature) / config.ik_finite_diff_eps
+    return J
+
+
+def _wrist_pose_from_sim_qpos(
+    qpos_sim: np.ndarray,
+    *,
+    template_qpos_real: np.ndarray,
+    helpers: dict[str, Any],
+) -> np.ndarray:
+    full_real = np.asarray(template_qpos_real, dtype=np.float32).reshape(-1)[:14].copy()
+    full_real[RIGHT_ARM_QPOS_SLICE] = _sim_to_real_right_arm_qpos(np.asarray(qpos_sim, dtype=np.float32), helpers)
+    return np.asarray(helpers["fk"](full_real, "right_wrist"), dtype=np.float32)
+
+
+def _wrist_pose_residual_from_sim_qpos(
+    qpos_sim: np.ndarray,
+    *,
+    template_qpos_real: np.ndarray,
+    target_T_base_wrist: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+) -> np.ndarray:
+    current_T = _wrist_pose_from_sim_qpos(qpos_sim, template_qpos_real=template_qpos_real, helpers=helpers)
+    target_T = np.asarray(target_T_base_wrist, dtype=np.float32).reshape(4, 4)
+    pos_error = target_T[:3, 3] - current_T[:3, 3]
+    rot_error = _matrix_to_rotvec(target_T[:3, :3] @ current_T[:3, :3].T)
+    return np.concatenate(
+        [
+            pos_error.astype(np.float64) * float(config.ik_position_weight),
+            rot_error.astype(np.float64),
+        ],
+        axis=0,
+    )
+
+
+def _numerical_wrist_pose_residual_jacobian(
+    qpos_sim: np.ndarray,
+    *,
+    template_qpos_real: np.ndarray,
+    target_T_base_wrist: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+) -> np.ndarray:
+    q = np.asarray(qpos_sim, dtype=np.float64).reshape(6)
+    base_error = _wrist_pose_residual_from_sim_qpos(
+        q,
+        template_qpos_real=template_qpos_real,
+        target_T_base_wrist=target_T_base_wrist,
+        config=config,
+        helpers=helpers,
+    )
+    J = np.zeros((base_error.shape[0], q.shape[0]), dtype=np.float64)
+    for dim in range(q.shape[0]):
+        q_perturbed = q.copy()
+        q_perturbed[dim] += config.ik_finite_diff_eps
+        error = _wrist_pose_residual_from_sim_qpos(
+            q_perturbed,
+            template_qpos_real=template_qpos_real,
+            target_T_base_wrist=target_T_base_wrist,
+            config=config,
+            helpers=helpers,
+        )
+        J[:, dim] = (error - base_error) / config.ik_finite_diff_eps
     return J
 
 
