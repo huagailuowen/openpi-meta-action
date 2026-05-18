@@ -57,6 +57,9 @@ class Pi0Config(_model.BaseModelConfig):
     meta_beta_model: bool = False
     num_meta_latent_tokens: int = 4
     reference_action_group_size: int = 5
+    # Reference-action conditioning only uses the bimanual qpos action prefix.
+    # Camera/meta/padding channels are deliberately excluded from the latent path.
+    reference_action_dim: int = 14
     # When True, stop gradients from the meta loss from flowing back into the shared
     # backbone (prefix_out / suffix_out). The meta head still receives full gradients
     # through its own new parameters. Recommended while loading from a pre-trained
@@ -155,6 +158,16 @@ class Pi0Config(_model.BaseModelConfig):
                     if self.meta_model and self.meta_beta_model
                     else None
                 ),
+                condition_tokenized_prompt=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                condition_tokenized_prompt_mask=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
                 meta_area_poses=(
@@ -220,7 +233,7 @@ class Pi0Config(_model.BaseModelConfig):
                     else None
                 ),
                 reference_actions=(
-                    jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.action_dim], jnp.float32)
+                    jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.reference_action_dim], jnp.float32)
                     if self.meta_model and self.meta_beta_model
                     else None
                 ),

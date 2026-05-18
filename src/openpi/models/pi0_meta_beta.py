@@ -47,11 +47,17 @@ class Pi0MetaBeta(Pi0Meta):
             )
         self.num_meta_latent_tokens = int(config.num_meta_latent_tokens)
         self.reference_action_group_size = int(config.reference_action_group_size)
+        self.reference_action_dim = int(config.reference_action_dim)
+        if self.reference_action_dim <= 0 or self.reference_action_dim > config.action_dim:
+            raise ValueError(
+                "Pi0MetaBeta requires 0 < reference_action_dim <= action_dim; "
+                f"got reference_action_dim={self.reference_action_dim}, action_dim={config.action_dim}"
+            )
         self.num_reference_action_tokens = config.action_horizon // self.reference_action_group_size
 
         width = self.prefix_token_width
         self.reference_action_in = nnx.Linear(
-            self.reference_action_group_size * config.action_dim,
+            self.reference_action_group_size * self.reference_action_dim,
             width,
             rngs=rngs,
         )
@@ -75,9 +81,13 @@ class Pi0MetaBeta(Pi0Meta):
         *,
         images: dict[str, at.Float[at.Array, "b h w c"]] | None = None,
         image_masks: dict[str, at.Bool[at.Array, "b"]] | None = None,
+        tokenized_prompt: at.Int[at.Array, "b l"] | None = None,
+        tokenized_prompt_mask: at.Bool[at.Array, "b l"] | None = None,
     ) -> tuple[at.Float[at.Array, "b o emb"], at.Bool[at.Array, "b o"]]:
         images = obs.images if images is None else images
         image_masks = obs.image_masks if image_masks is None else image_masks
+        tokenized_prompt = obs.tokenized_prompt if tokenized_prompt is None else tokenized_prompt
+        tokenized_prompt_mask = obs.tokenized_prompt_mask if tokenized_prompt_mask is None else tokenized_prompt_mask
         tokens = []
         input_mask = []
         for name in images:
@@ -85,12 +95,44 @@ class Pi0MetaBeta(Pi0Meta):
             tokens.append(image_tokens)
             input_mask.append(einops.repeat(image_masks[name], "b -> b s", s=image_tokens.shape[1]))
 
-        if obs.tokenized_prompt is not None:
-            tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
+        if tokenized_prompt is not None:
+            tokenized_inputs = self.PaliGemma.llm(tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
-            input_mask.append(obs.tokenized_prompt_mask)
+            input_mask.append(tokenized_prompt_mask)
 
         return jnp.concatenate(tokens, axis=1), jnp.concatenate(input_mask, axis=1)
+
+    @staticmethod
+    def _require_condition_observation(
+        obs: _model.Observation,
+    ) -> tuple[
+        dict[str, at.Float[at.Array, "b h w c"]],
+        dict[str, at.Bool[at.Array, "b"]],
+        at.Int[at.Array, "b l"],
+        at.Bool[at.Array, "b l"],
+    ]:
+        missing = []
+        if obs.condition_images is None:
+            missing.append("condition_image")
+        if obs.condition_image_masks is None:
+            missing.append("condition_image_mask")
+        if obs.condition_state is None:
+            missing.append("condition_state")
+        if obs.condition_tokenized_prompt is None:
+            missing.append("condition_tokenized_prompt")
+        if obs.condition_tokenized_prompt_mask is None:
+            missing.append("condition_tokenized_prompt_mask")
+        if missing:
+            raise ValueError(
+                "Pi0MetaBeta requires chunk1 condition observation fields for latent encoding; "
+                f"missing: {', '.join(missing)}"
+            )
+        return (
+            obs.condition_images,
+            obs.condition_image_masks,
+            obs.condition_tokenized_prompt,
+            obs.condition_tokenized_prompt_mask,
+        )
 
     def _build_reference_action_tokens(
         self, observation: _model.Observation
@@ -98,12 +140,17 @@ class Pi0MetaBeta(Pi0Meta):
         batch_size = observation.state.shape[0]
         if observation.reference_actions is None:
             reference_actions = jnp.zeros(
-                (batch_size, self.action_horizon, self.action_dim),
+                (batch_size, self.action_horizon, self.reference_action_dim),
                 dtype=observation.state.dtype,
             )
             ref_mask = jnp.zeros((batch_size,), dtype=jnp.bool_)
         else:
-            reference_actions = self._mask_backbone_channels(observation.reference_actions)
+            reference_actions = observation.reference_actions[..., : self.reference_action_dim]
+            if reference_actions.shape[-1] != self.reference_action_dim:
+                raise ValueError(
+                    "reference_actions last dimension is smaller than reference_action_dim: "
+                    f"{reference_actions.shape[-1]} < {self.reference_action_dim}"
+                )
             ref_mask = (
                 jnp.ones((batch_size,), dtype=jnp.bool_)
                 if observation.reference_action_mask is None
@@ -113,7 +160,7 @@ class Pi0MetaBeta(Pi0Meta):
         grouped = reference_actions.reshape(
             batch_size,
             self.num_reference_action_tokens,
-            self.reference_action_group_size * self.action_dim,
+            self.reference_action_group_size * self.reference_action_dim,
         )
         ref_tokens = self.reference_action_in(grouped)
         ref_tokens = nnx.swish(ref_tokens)
@@ -137,6 +184,8 @@ class Pi0MetaBeta(Pi0Meta):
             condition_images=observation.condition_images,
             condition_image_masks=observation.condition_image_masks,
             condition_state=observation.condition_state,
+            condition_tokenized_prompt=observation.condition_tokenized_prompt,
+            condition_tokenized_prompt_mask=observation.condition_tokenized_prompt_mask,
             tokenized_prompt=observation.tokenized_prompt,
             tokenized_prompt_mask=observation.tokenized_prompt_mask,
             token_ar_mask=observation.token_ar_mask,
@@ -160,12 +209,15 @@ class Pi0MetaBeta(Pi0Meta):
         return self._build_meta_context_tokens(execution_observation)
 
     def _build_condition_prefix(self, obs: _model.Observation) -> _ConditionPrefix:
-        condition_images = obs.images if obs.condition_images is None else obs.condition_images
-        condition_masks = obs.image_masks if obs.condition_image_masks is None else obs.condition_image_masks
+        condition_images, condition_masks, condition_prompt, condition_prompt_mask = self._require_condition_observation(
+            obs
+        )
         obs_tokens, obs_mask = self._build_observation_tokens(
             obs,
             images=condition_images,
             image_masks=condition_masks,
+            tokenized_prompt=condition_prompt,
+            tokenized_prompt_mask=condition_prompt_mask,
         )
         meta_tokens, meta_mask = self._build_meta_context_tokens(obs)
         ref_tokens, ref_mask = self._build_reference_action_tokens(obs)
@@ -323,6 +375,8 @@ class Pi0MetaBeta(Pi0Meta):
             condition_images=observation.condition_images,
             condition_image_masks=observation.condition_image_masks,
             condition_state=observation.condition_state,
+            condition_tokenized_prompt=observation.condition_tokenized_prompt,
+            condition_tokenized_prompt_mask=observation.condition_tokenized_prompt_mask,
             tokenized_prompt=observation.tokenized_prompt,
             tokenized_prompt_mask=observation.tokenized_prompt_mask,
             token_ar_mask=observation.token_ar_mask,

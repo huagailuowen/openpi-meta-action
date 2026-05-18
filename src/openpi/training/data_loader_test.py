@@ -132,9 +132,69 @@ def test_beta_pair_dataset_reference_condition_uses_source_actions():
         delta_action_masks=[],
     )
     sample = wrapped[0]
-    np.testing.assert_array_equal(sample["reference_actions"], np.ones((4, 32), dtype=np.float32))
+    np.testing.assert_array_equal(sample["reference_actions"], np.ones((4, 14), dtype=np.float32))
     assert bool(sample["reference_action_mask"])
     assert not bool(np.asarray(sample["meta_areas"]["mask"]).reshape(-1)[0])
+
+
+def test_beta_reference_actions_are_delta_relative_to_condition_state():
+    class TinyDataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, idx):
+            state = np.arange(32, dtype=np.float32)
+            actions = np.tile(state[None, :], (4, 1)).astype(np.float32)
+            actions[:, 0:6] += 2.0
+            actions[:, 7:13] -= 3.0
+            actions[:, 14:] = 99.0
+            return {
+                "state": state,
+                "actions": actions,
+                "meta_areas": {
+                    "pose12d": np.zeros((1, 12), dtype=np.float32),
+                    "dim_mask12": np.ones((1, 12), dtype=bool),
+                    "type": np.zeros((1,), dtype=np.int32),
+                    "mask": np.ones((1,), dtype=bool),
+                },
+                "meta_action_targets": {
+                    "pose12d": np.zeros((4, 1, 12), dtype=np.float32),
+                    "dim_mask12": np.ones((4, 1, 12), dtype=bool),
+                    "mask": np.ones((4, 1), dtype=bool),
+                },
+                "tool_instance_hash": np.asarray([7], dtype=np.int32),
+                "source_type_id": np.asarray([0], dtype=np.int32),
+                "episode_index": np.asarray(idx, dtype=np.int64),
+            }
+
+    delta_mask = _transforms.make_bool_mask(6, -1, 6, -1, -18)
+    transformed = _data_loader.TransformedDataset(TinyDataset(), [_transforms.DeltaActions(delta_mask)])
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        meta_beta_seed=0,
+        meta_beta_self_same_chunk_prob=1.0,
+        meta_beta_same_episode_diff_chunk_prob=0.0,
+        meta_beta_same_tool_diff_episode_prob=0.0,
+        meta_beta_retarget_conditioned_prob=0.0,
+        meta_beta_meta_area_condition_prob=0.0,
+        meta_beta_reference_action_condition_prob=1.0,
+        meta_beta_obs_only_condition_prob=0.0,
+        meta_beta_non_retarget_obs_only_condition_prob=0.0,
+    )
+    sample = _data_loader.BetaStructuredMetaPairDataset(
+        transformed,
+        data_config,
+        expected_action_space="delta",
+        delta_action_masks=[np.asarray(delta_mask, dtype=bool)],
+    )[0]
+
+    expected = np.zeros((4, 14), dtype=np.float32)
+    expected[:, 0:6] = 2.0
+    expected[:, 6] = 6.0
+    expected[:, 7:13] = -3.0
+    expected[:, 13] = 13.0
+    np.testing.assert_array_equal(sample["condition_state"], np.arange(32, dtype=np.float32))
+    np.testing.assert_array_equal(sample["reference_actions"], expected)
 
 
 def test_beta_pair_dataset_reference_condition_carries_source_observation():

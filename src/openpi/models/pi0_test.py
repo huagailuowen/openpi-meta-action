@@ -1,6 +1,7 @@
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import pytest
 
 import openpi.models.model as _model
 import openpi.models.pi0_config as _pi0_config
@@ -106,11 +107,13 @@ def test_pi05_meta_beta_inputs_spec_contains_execution_meta_and_reference():
     assert observation_spec.condition_images is not None
     assert observation_spec.condition_image_masks is not None
     assert observation_spec.condition_state is not None
+    assert observation_spec.condition_tokenized_prompt is not None
+    assert observation_spec.condition_tokenized_prompt_mask is not None
     assert observation_spec.execution_meta_area_poses is not None
     assert observation_spec.execution_meta_area_poses.shape[-1] == 12
     assert observation_spec.execution_meta_area_dim_masks is not None
     assert observation_spec.reference_actions is not None
-    assert observation_spec.reference_actions.shape[1:] == (50, 32)
+    assert observation_spec.reference_actions.shape[1:] == (50, 14)
     assert observation_spec.meta_imagination_alpha is not None
 
 
@@ -138,6 +141,10 @@ def test_preprocess_observation_preserves_beta_fields():
             "right_wrist_0_rgb": jnp.ones((1,), dtype=jnp.bool_),
         },
         condition_state=jnp.ones((1, 32), dtype=jnp.float32),
+        condition_tokenized_prompt=jnp.ones((1, 8), dtype=jnp.int32),
+        condition_tokenized_prompt_mask=jnp.ones((1, 8), dtype=jnp.bool_),
+        tokenized_prompt=jnp.zeros((1, 8), dtype=jnp.int32),
+        tokenized_prompt_mask=jnp.ones((1, 8), dtype=jnp.bool_),
         meta_area_poses=jnp.zeros((1, 1, 12), dtype=jnp.float32),
         meta_area_dim_masks=jnp.ones((1, 1, 12), dtype=jnp.bool_),
         meta_area_types=jnp.zeros((1, 1), dtype=jnp.int32),
@@ -146,7 +153,7 @@ def test_preprocess_observation_preserves_beta_fields():
         execution_meta_area_dim_masks=jnp.ones((1, 1, 12), dtype=jnp.bool_),
         execution_meta_area_types=jnp.ones((1, 1), dtype=jnp.int32),
         execution_meta_area_masks=jnp.ones((1, 1), dtype=jnp.bool_),
-        reference_actions=jnp.ones((1, 50, 32), dtype=jnp.float32),
+        reference_actions=jnp.ones((1, 50, 14), dtype=jnp.float32),
         reference_action_mask=jnp.ones((1,), dtype=jnp.bool_),
         meta_imagination_alpha=jnp.asarray([0.5], dtype=jnp.float32),
     )
@@ -157,5 +164,108 @@ def test_preprocess_observation_preserves_beta_fields():
     assert out.meta_imagination_alpha is not None
     assert out.condition_images is not None
     assert out.condition_state is not None
+    assert out.condition_tokenized_prompt is not None
+    assert out.condition_tokenized_prompt_mask is not None
     assert out.execution_meta_area_poses is not None
     assert jnp.all(out.execution_meta_area_poses == 1.0)
+
+
+def _make_dummy_beta_config() -> _pi0_config.Pi0Config:
+    return _pi0_config.Pi0Config(
+        pi05=True,
+        meta_model=True,
+        meta_beta_model=True,
+        meta_area_pose_dim=12,
+        meta_action_dim=12,
+        action_dim=32,
+        action_horizon=10,
+        max_token_len=8,
+        max_meta_areas=1,
+        num_meta_latent_tokens=2,
+        reference_action_group_size=5,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+
+
+def _make_dummy_beta_observation(
+    config: _pi0_config.Pi0Config,
+    *,
+    condition_state: jax.Array | None = None,
+    condition_tokenized_prompt: jax.Array | None = None,
+    condition_tokenized_prompt_mask: jax.Array | None = None,
+) -> _model.Observation:
+    image = jnp.zeros((1, 224, 224, 3), dtype=jnp.float32)
+    images = {
+        "base_0_rgb": image,
+        "left_wrist_0_rgb": image,
+        "right_wrist_0_rgb": image,
+    }
+    masks = {key: jnp.ones((1,), dtype=jnp.bool_) for key in images}
+    return _model.Observation(
+        images=images,
+        image_masks=masks,
+        state=jnp.zeros((1, config.action_dim), dtype=jnp.float32),
+        condition_images={key: jnp.ones_like(value) for key, value in images.items()},
+        condition_image_masks=masks,
+        condition_state=condition_state,
+        condition_tokenized_prompt=condition_tokenized_prompt,
+        condition_tokenized_prompt_mask=condition_tokenized_prompt_mask,
+        tokenized_prompt=jnp.zeros((1, config.max_token_len), dtype=jnp.int32),
+        tokenized_prompt_mask=jnp.ones((1, config.max_token_len), dtype=jnp.bool_),
+        meta_area_poses=jnp.zeros((1, config.max_meta_areas, config.meta_area_pose_dim), dtype=jnp.float32),
+        meta_area_dim_masks=jnp.ones((1, config.max_meta_areas, config.meta_area_pose_dim), dtype=jnp.bool_),
+        meta_area_types=jnp.zeros((1, config.max_meta_areas), dtype=jnp.int32),
+        meta_area_masks=jnp.ones((1, config.max_meta_areas), dtype=jnp.bool_),
+        execution_meta_area_poses=jnp.zeros((1, config.max_meta_areas, config.meta_area_pose_dim), dtype=jnp.float32),
+        execution_meta_area_dim_masks=jnp.ones((1, config.max_meta_areas, config.meta_area_pose_dim), dtype=jnp.bool_),
+        execution_meta_area_types=jnp.zeros((1, config.max_meta_areas), dtype=jnp.int32),
+        execution_meta_area_masks=jnp.ones((1, config.max_meta_areas), dtype=jnp.bool_),
+        reference_actions=jnp.zeros((1, config.action_horizon, config.reference_action_dim), dtype=jnp.float32),
+        reference_action_mask=jnp.ones((1,), dtype=jnp.bool_),
+        meta_imagination_alpha=jnp.zeros((1,), dtype=jnp.float32),
+    )
+
+
+def test_pi05_meta_beta_condition_prefix_requires_condition_state():
+    config = _make_dummy_beta_config()
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(config, condition_state=None)
+    with pytest.raises(ValueError, match="condition_state"):
+        model._build_condition_prefix(obs)
+
+
+def test_pi05_meta_beta_condition_prefix_requires_condition_tokenized_prompt():
+    config = _make_dummy_beta_config()
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(
+        config,
+        condition_state=jnp.ones((1, config.action_dim), dtype=jnp.float32),
+    )
+    with pytest.raises(ValueError, match="condition_tokenized_prompt"):
+        model._build_condition_prefix(obs)
+
+
+def test_pi05_meta_beta_condition_prefix_uses_condition_pi05_obs_tokens():
+    config = _make_dummy_beta_config()
+    model = config.create(jax.random.key(0))
+    condition_tokens = jnp.ones((1, config.max_token_len), dtype=jnp.int32)
+    condition_token_mask = jnp.ones((1, config.max_token_len), dtype=jnp.bool_)
+    obs = _make_dummy_beta_observation(
+        config,
+        condition_state=jnp.ones((1, config.action_dim), dtype=jnp.float32),
+        condition_tokenized_prompt=condition_tokens,
+        condition_tokenized_prompt_mask=condition_token_mask,
+    )
+    obs_tokens, _ = model._build_observation_tokens(
+        obs,
+        images=obs.condition_images,
+        image_masks=obs.condition_image_masks,
+        tokenized_prompt=obs.condition_tokenized_prompt,
+        tokenized_prompt_mask=obs.condition_tokenized_prompt_mask,
+    )
+    execution_tokens, _ = model._build_observation_tokens(obs)
+    prefix = model._build_condition_prefix(obs)
+    expected_latent_start = obs_tokens.shape[1] + config.max_meta_areas + model.num_reference_action_tokens
+    assert prefix.latent_start == expected_latent_start
+    assert not jnp.allclose(obs_tokens[:, -config.max_token_len :], execution_tokens[:, -config.max_token_len :])

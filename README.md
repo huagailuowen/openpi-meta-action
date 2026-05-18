@@ -383,11 +383,27 @@ The beta wrapper requires `observation.tool_instance_hash` for same-tool samplin
 lacks it, the structured input transform falls back to hash 0, which keeps training runnable but
 disables meaningful same-tool grouping.
 
-`meta_control.imagination_alpha` is tied to the generated supervision, not directly to chunk1/source
-lineage: it is `1.0` when pair retarget succeeds and the output trajectory is imagined/retargeted,
-and `0.0` for origin/fallback trajectories. This alpha is injected into the first beta special token,
-so the model can distinguish "operate through imagined retargeted supervision" from "operate on the
-real observed trajectory" without coupling the flag to the condition token type.
+The beta model is a two-pass model. The chunk1/source pass uses the existing Pi0.5 observation
+prefix format with condition image plus `condition_tokenized_prompt`, where that prompt is generated
+from the source `condition_prompt` when available, otherwise the current prompt, and normalized
+`condition_state`. The chunk2/execution pass uses the normal Pi0.5 observation prefix with current
+image plus `tokenized_prompt`, generated from the current normalized `state`, and then appends latent
+tokens to generate actions. `condition_image`, `condition_image_mask`, `condition_state`,
+`condition_tokenized_prompt`, and
+`condition_tokenized_prompt_mask` are required for the beta latent path; missing condition observation
+fields are treated as data errors instead of falling back to the current execution observation. The
+beta code does not add a new continuous state projection on top of the existing Pi0.5 state-in-prompt
+encoding.
+
+Reference-action conditioning only encodes the first 14 qpos action dimensions. During training, the
+source `actions` have already passed through the normal delta-action transform, so dims `0:6` and
+`7:13` are relative to the same source state copied into `condition_state`; gripper dims `6` and `13`
+remain absolute. The runtime HDF5 reference loader follows the same rule: it samples the reference
+trajectory, subtracts the reference start-frame qpos for dims `0:6` and `7:13`, returns 14D
+`reference_actions`, and supplies that start-frame qpos as `condition_state`.
+
+`meta_control.imagination_alpha` is no longer injected into beta special tokens. Current beta training
+and inference force this value to `0.0` and keep the field only as a compatibility/debug value.
 
 Pair retarget has two modes. If `data.meta_beta_online_async_enabled` or
 `data.meta_beta_pair_cache_dir` is set, retarget-conditioned training never blocks inside

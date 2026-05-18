@@ -27,6 +27,7 @@ from openpi.training.droid_rlds_dataset import DroidRldsDataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
+_BETA_REFERENCE_ACTION_DIM = 14
 
 
 class Dataset(Protocol[T_co]):
@@ -1238,7 +1239,9 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         self._apply_condition_observation(out, source_sample)
 
     def _apply_reference_action_condition(self, out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
-        out["reference_actions"] = np.asarray(source_sample["actions"], dtype=np.float32).copy()
+        out["reference_actions"] = np.asarray(source_sample["actions"], dtype=np.float32)[
+            ..., :_BETA_REFERENCE_ACTION_DIM
+        ].copy()
         out["reference_action_mask"] = np.asarray(1, dtype=bool)
         self._apply_condition_observation(out, source_sample)
         self._drop_meta_tokens(out)
@@ -1257,6 +1260,8 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 out["condition_image_mask"] = _copy_image_dict(dict(source_sample["image_mask"]))
         if "state" in source_sample:
             out["condition_state"] = np.asarray(source_sample["state"], dtype=np.float32).copy()
+        if "prompt" in source_sample:
+            out["condition_prompt"] = source_sample["prompt"]
 
     @staticmethod
     def _set_meta_imagination_alpha(out: dict[str, typing.Any], *, retarget_applied: bool) -> None:
@@ -1274,7 +1279,8 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
     @staticmethod
     def _ensure_optional_beta_fields(out: dict[str, typing.Any]) -> None:
         if "reference_actions" not in out:
-            out["reference_actions"] = np.zeros_like(np.asarray(out["actions"], dtype=np.float32))
+            actions = np.asarray(out["actions"], dtype=np.float32)
+            out["reference_actions"] = np.zeros((*actions.shape[:-1], _BETA_REFERENCE_ACTION_DIM), dtype=np.float32)
         out.setdefault("reference_action_mask", np.asarray(0, dtype=bool))
         out.setdefault("meta_control", {"imagination_alpha": np.asarray(0.0, dtype=np.float32)})
 

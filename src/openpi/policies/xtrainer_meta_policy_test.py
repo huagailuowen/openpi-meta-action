@@ -95,7 +95,7 @@ def test_xtrainer_structured_meta_inputs_use_explicit_12d_meta_and_dim_masks():
             "type": np.array([3, 4], dtype=np.int32),
             "mask": np.array([True, True], dtype=bool),
         },
-        "reference_actions": np.full((50, 32), 0.25, dtype=np.float32),
+        "reference_actions": np.full((50, 14), 0.25, dtype=np.float32),
         "reference_action_mask": np.array(1, dtype=bool),
     }
 

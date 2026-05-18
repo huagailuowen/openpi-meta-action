@@ -103,6 +103,31 @@ def test_tokenize_prompt():
     assert np.allclose(tok_mask, data["tokenized_prompt_mask"])
 
 
+def test_tokenize_prompt_with_condition_state():
+    tokenizer = _tokenizer.PaligemmaTokenizer(max_len=80)
+    transform = _transforms.TokenizePrompt(tokenizer, discrete_state_input=True)
+    state = np.zeros((4,), dtype=np.float32)
+    condition_state = np.ones((4,), dtype=np.float32) * 0.5
+
+    data = transform(
+        {
+            "prompt": "Use tool",
+            "condition_prompt": "Use source tool",
+            "state": state,
+            "condition_state": condition_state,
+        }
+    )
+
+    tok_prompt, tok_mask = tokenizer.tokenize("Use tool", state)
+    cond_prompt, cond_mask = tokenizer.tokenize("Use source tool", condition_state)
+    assert np.allclose(tok_prompt, data["tokenized_prompt"])
+    assert np.allclose(tok_mask, data["tokenized_prompt_mask"])
+    assert np.allclose(cond_prompt, data["condition_tokenized_prompt"])
+    assert np.allclose(cond_mask, data["condition_tokenized_prompt_mask"])
+    assert not np.allclose(data["tokenized_prompt"], data["condition_tokenized_prompt"])
+    assert "condition_prompt" not in data
+
+
 def test_tokenize_no_prompt():
     transform = _transforms.TokenizePrompt(_tokenizer.PaligemmaTokenizer())
 

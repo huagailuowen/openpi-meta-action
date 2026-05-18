@@ -98,6 +98,8 @@ class Observation(Generic[ArrayT]):
     condition_images: dict[str, at.Float[ArrayT, "*b h w c"]] | None = None
     condition_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
     condition_state: at.Float[ArrayT, "*b s"] | None = None
+    condition_tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
+    condition_tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -144,6 +146,8 @@ class Observation(Generic[ArrayT]):
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
             raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+        if ("condition_tokenized_prompt" in data) != ("condition_tokenized_prompt_mask" in data):
+            raise ValueError("condition_tokenized_prompt and condition_tokenized_prompt_mask must be provided together.")
         if "meta_areas" in data:
             meta_areas = data["meta_areas"]
             has_pose = "pose6d" in meta_areas or "pose12d" in meta_areas
@@ -179,6 +183,8 @@ class Observation(Generic[ArrayT]):
             condition_images=data.get("condition_image"),
             condition_image_masks=data.get("condition_image_mask"),
             condition_state=data.get("condition_state"),
+            condition_tokenized_prompt=data.get("condition_tokenized_prompt"),
+            condition_tokenized_prompt_mask=data.get("condition_tokenized_prompt_mask"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -222,6 +228,8 @@ class Observation(Generic[ArrayT]):
         condition_images = result.pop("condition_images")
         condition_image_masks = result.pop("condition_image_masks")
         condition_state = result.pop("condition_state")
+        condition_tokenized_prompt = result.pop("condition_tokenized_prompt")
+        condition_tokenized_prompt_mask = result.pop("condition_tokenized_prompt_mask")
         meta_area_poses = result.pop("meta_area_poses")
         meta_area_dim_masks = result.pop("meta_area_dim_masks")
         meta_area_types = result.pop("meta_area_types")
@@ -285,6 +293,10 @@ class Observation(Generic[ArrayT]):
             result["condition_image_mask"] = condition_image_masks
         if condition_state is not None:
             result["condition_state"] = condition_state
+        if condition_tokenized_prompt is not None:
+            result["condition_tokenized_prompt"] = condition_tokenized_prompt
+        if condition_tokenized_prompt_mask is not None:
+            result["condition_tokenized_prompt_mask"] = condition_tokenized_prompt_mask
         if reference_actions is not None:
             result["reference_actions"] = reference_actions
         if reference_action_mask is not None:
@@ -396,6 +408,8 @@ def preprocess_observation(
         condition_images=condition_images,
         condition_image_masks=condition_image_masks,
         condition_state=observation.condition_state,
+        condition_tokenized_prompt=observation.condition_tokenized_prompt,
+        condition_tokenized_prompt_mask=observation.condition_tokenized_prompt_mask,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
