@@ -177,10 +177,16 @@ class Pi0Meta(_model.BaseModel):
 
     def _prepare_observation(self, observation: _model.Observation) -> _model.Observation:
         masked_state = self._mask_backbone_channels(observation.state)
+        masked_condition_state = (
+            None if observation.condition_state is None else self._mask_backbone_channels(observation.condition_state)
+        )
         return _model.Observation(
             images=observation.images,
             image_masks=observation.image_masks,
             state=masked_state,
+            condition_images=observation.condition_images,
+            condition_image_masks=observation.condition_image_masks,
+            condition_state=masked_condition_state,
             tokenized_prompt=observation.tokenized_prompt,
             tokenized_prompt_mask=observation.tokenized_prompt_mask,
             token_ar_mask=observation.token_ar_mask,
@@ -356,6 +362,9 @@ class Pi0Meta(_model.BaseModel):
             images=observation.images,
             image_masks=observation.image_masks,
             state=observation.state,
+            condition_images=observation.condition_images,
+            condition_image_masks=observation.condition_image_masks,
+            condition_state=observation.condition_state,
             tokenized_prompt=observation.tokenized_prompt,
             tokenized_prompt_mask=observation.tokenized_prompt_mask,
             token_ar_mask=observation.token_ar_mask,

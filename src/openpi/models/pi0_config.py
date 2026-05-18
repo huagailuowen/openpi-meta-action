@@ -132,6 +132,29 @@ class Pi0Config(_model.BaseModelConfig):
                     "right_wrist_0_rgb": image_mask_spec,
                 },
                 state=jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32),
+                condition_images=(
+                    {
+                        "base_0_rgb": image_spec,
+                        "left_wrist_0_rgb": image_spec,
+                        "right_wrist_0_rgb": image_spec,
+                    }
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                condition_image_masks=(
+                    {
+                        "base_0_rgb": image_mask_spec,
+                        "left_wrist_0_rgb": image_mask_spec,
+                        "right_wrist_0_rgb": image_mask_spec,
+                    }
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                condition_state=(
+                    jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
                 tokenized_prompt_mask=jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool),
                 meta_area_poses=(

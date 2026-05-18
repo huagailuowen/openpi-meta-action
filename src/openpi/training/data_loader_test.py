@@ -137,6 +137,49 @@ def test_beta_pair_dataset_reference_condition_uses_source_actions():
     assert not bool(np.asarray(sample["meta_areas"]["mask"]).reshape(-1)[0])
 
 
+def test_beta_pair_dataset_reference_condition_carries_source_observation():
+    class TinyDataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, idx):
+            sample = _tiny_beta_sample(int(idx), tool=7, episode=0)
+            image = np.full((4, 4, 3), 17, dtype=np.uint8)
+            sample["image"] = {
+                "base_0_rgb": image,
+                "left_wrist_0_rgb": image + 1,
+                "right_wrist_0_rgb": image + 2,
+            }
+            sample["image_mask"] = {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_,
+            }
+            sample["state"] = np.arange(32, dtype=np.float32)
+            return sample
+
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        meta_beta_seed=0,
+        meta_beta_self_same_chunk_prob=1.0,
+        meta_beta_same_episode_diff_chunk_prob=0.0,
+        meta_beta_same_tool_diff_episode_prob=0.0,
+        meta_beta_retarget_conditioned_prob=0.0,
+        meta_beta_meta_area_condition_prob=0.0,
+        meta_beta_reference_action_condition_prob=1.0,
+        meta_beta_obs_only_condition_prob=0.0,
+        meta_beta_non_retarget_obs_only_condition_prob=0.0,
+    )
+    sample = _data_loader.BetaStructuredMetaPairDataset(
+        TinyDataset(),
+        data_config,
+        expected_action_space="delta",
+        delta_action_masks=[],
+    )[0]
+    np.testing.assert_array_equal(sample["condition_image"]["base_0_rgb"], np.full((4, 4, 3), 17, dtype=np.uint8))
+    np.testing.assert_array_equal(sample["condition_state"], np.arange(32, dtype=np.float32))
+
+
 def test_beta_pair_dataset_meta_and_obs_conditions():
     class TinyDataset:
         def __init__(self, source_type: int):
@@ -194,6 +237,58 @@ def test_beta_pair_dataset_meta_and_obs_conditions():
     assert bool(obs_sample["execution_meta_areas"]["mask"][0])
     assert not bool(obs_sample["reference_action_mask"])
     assert float(obs_sample["meta_control"]["imagination_alpha"]) == 0.0
+
+
+def test_beta_pair_dataset_obs_only_uses_source_observation_without_meta_tokens():
+    class TinyDataset:
+        def __init__(self):
+            self.samples = [
+                _tiny_beta_sample(0, tool=7, episode=0, source_type=0),
+                _tiny_beta_sample(1, tool=7, episode=1, source_type=0),
+            ]
+            for idx, sample in enumerate(self.samples):
+                image = np.full((4, 4, 3), 10 + idx, dtype=np.uint8)
+                sample["image"] = {
+                    "base_0_rgb": image,
+                    "left_wrist_0_rgb": image + 1,
+                    "right_wrist_0_rgb": image + 2,
+                }
+                sample["image_mask"] = {
+                    "base_0_rgb": np.True_,
+                    "left_wrist_0_rgb": np.True_,
+                    "right_wrist_0_rgb": np.True_,
+                }
+                sample["state"] = np.full((32,), idx + 3, dtype=np.float32)
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            return self.samples[int(idx)]
+
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        meta_beta_seed=1,
+        meta_beta_self_same_chunk_prob=0.0,
+        meta_beta_same_episode_diff_chunk_prob=0.0,
+        meta_beta_same_tool_diff_episode_prob=1.0,
+        meta_beta_retarget_conditioned_prob=0.0,
+        meta_beta_meta_area_condition_prob=0.0,
+        meta_beta_reference_action_condition_prob=0.0,
+        meta_beta_obs_only_condition_prob=0.0,
+        meta_beta_non_retarget_obs_only_condition_prob=1.0,
+    )
+    sample = _data_loader.BetaStructuredMetaPairDataset(
+        TinyDataset(),
+        data_config,
+        expected_action_space="absolute",
+        delta_action_masks=[],
+    )[0]
+    assert not bool(sample["meta_areas"]["mask"][0])
+    assert not bool(sample["reference_action_mask"])
+    assert "condition_image" in sample
+    assert "condition_state" in sample
+    assert not np.array_equal(sample["condition_image"]["base_0_rgb"], sample["image"]["base_0_rgb"])
 
 
 def test_beta_pair_dataset_imagined_source_never_uses_obs_only_condition():

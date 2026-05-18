@@ -194,6 +194,10 @@ def _copy_meta_areas(meta_areas: dict[str, typing.Any]) -> dict[str, np.ndarray]
     return {key: np.asarray(value).copy() for key, value in meta_areas.items()}
 
 
+def _copy_image_dict(images: dict[str, typing.Any]) -> dict[str, np.ndarray]:
+    return {key: np.asarray(value).copy() for key, value in images.items()}
+
+
 def _apply_retargeted_payload(sample: dict[str, typing.Any], retargeted: dict[str, np.ndarray]) -> dict[str, typing.Any]:
     out = _clone_sample(sample)
     out["state"] = retargeted["state"].astype(np.float32)
@@ -800,7 +804,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         elif condition_id == 1:
             self._apply_reference_action_condition(out, source_sample)
         else:
-            self._apply_obs_only_condition(out)
+            self._apply_obs_only_condition(out, source_sample)
         self._set_meta_imagination_alpha(out, retarget_applied=bool(beta_debug.get("retarget_applied", False)))
         self._ensure_optional_beta_fields(out)
         out["_beta_debug"] = self._stable_beta_debug(beta_debug, condition_id=condition_id)
@@ -1231,16 +1235,28 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         out["meta_areas"] = _copy_meta_areas(dict(source_sample.get("meta_areas", {})))
         out.pop("reference_actions", None)
         out["reference_action_mask"] = np.asarray(0, dtype=bool)
+        self._apply_condition_observation(out, source_sample)
 
     def _apply_reference_action_condition(self, out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
         out["reference_actions"] = np.asarray(source_sample["actions"], dtype=np.float32).copy()
         out["reference_action_mask"] = np.asarray(1, dtype=bool)
+        self._apply_condition_observation(out, source_sample)
         self._drop_meta_tokens(out)
 
-    def _apply_obs_only_condition(self, out: dict[str, typing.Any]) -> None:
+    def _apply_obs_only_condition(self, out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
         out.pop("reference_actions", None)
         out["reference_action_mask"] = np.asarray(0, dtype=bool)
+        self._apply_condition_observation(out, source_sample)
         self._drop_meta_tokens(out)
+
+    @staticmethod
+    def _apply_condition_observation(out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
+        if "image" in source_sample:
+            out["condition_image"] = _copy_image_dict(dict(source_sample["image"]))
+            if "image_mask" in source_sample:
+                out["condition_image_mask"] = _copy_image_dict(dict(source_sample["image_mask"]))
+        if "state" in source_sample:
+            out["condition_state"] = np.asarray(source_sample["state"], dtype=np.float32).copy()
 
     @staticmethod
     def _set_meta_imagination_alpha(out: dict[str, typing.Any], *, retarget_applied: bool) -> None:

@@ -25,6 +25,14 @@ def _get_first(data: dict, *keys: str):
     raise KeyError(f"Expected one of {keys}, got {tuple(data)}")
 
 
+def _structured_image_inputs(images: dict) -> dict[str, np.ndarray]:
+    return {
+        "base_0_rgb": _parse_image(_get_first(images, "cam_high", "top", "base_0_rgb")),
+        "left_wrist_0_rgb": _parse_image(_get_first(images, "cam_left_wrist", "left_wrist", "left_wrist_0_rgb")),
+        "right_wrist_0_rgb": _parse_image(_get_first(images, "cam_right_wrist", "right_wrist", "right_wrist_0_rgb")),
+    }
+
+
 @dataclasses.dataclass(frozen=True)
 class XTrainerMetaInputs(transforms.DataTransformFn):
     """Map xtrainer fields into the generic OpenPI observation format with optional meta-area inputs."""
@@ -34,10 +42,7 @@ class XTrainerMetaInputs(transforms.DataTransformFn):
     zero_meta_state_slice: bool = True
 
     def __call__(self, data: dict) -> dict:
-        images = _get_first(data, "images", "image")
-        top_image = _parse_image(_get_first(images, "cam_high", "top", "base_0_rgb"))
-        left_wrist_image = _parse_image(_get_first(images, "cam_left_wrist", "left_wrist", "left_wrist_0_rgb"))
-        right_wrist_image = _parse_image(_get_first(images, "cam_right_wrist", "right_wrist", "right_wrist_0_rgb"))
+        image_inputs = _structured_image_inputs(_get_first(data, "images", "image"))
         raw_state = np.asarray(_get_first(data, "state", "observation.state"), dtype=np.float32)
         state = raw_state.copy()
 
@@ -64,11 +69,7 @@ class XTrainerMetaInputs(transforms.DataTransformFn):
 
         inputs = {
             "state": state,
-            "image": {
-                "base_0_rgb": top_image,
-                "left_wrist_0_rgb": left_wrist_image,
-                "right_wrist_0_rgb": right_wrist_image,
-            },
+            "image": image_inputs,
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
@@ -118,10 +119,7 @@ class XTrainerStructuredMetaInputs(transforms.DataTransformFn):
     fill_action_meta_slice_from_targets: bool = True
 
     def __call__(self, data: dict) -> dict:
-        images = _get_first(data, "images", "image")
-        top_image = _parse_image(_get_first(images, "cam_high", "top", "base_0_rgb"))
-        left_wrist_image = _parse_image(_get_first(images, "cam_left_wrist", "left_wrist", "left_wrist_0_rgb"))
-        right_wrist_image = _parse_image(_get_first(images, "cam_right_wrist", "right_wrist", "right_wrist_0_rgb"))
+        image_inputs = _structured_image_inputs(_get_first(data, "images", "image"))
         raw_state = np.asarray(_get_first(data, "state", "observation.state"), dtype=np.float32)
         state = raw_state.copy()
 
@@ -183,11 +181,7 @@ class XTrainerStructuredMetaInputs(transforms.DataTransformFn):
             meta_areas_out["dim_mask12"] = meta_area_dim_masks
         inputs = {
             "state": state,
-            "image": {
-                "base_0_rgb": top_image,
-                "left_wrist_0_rgb": left_wrist_image,
-                "right_wrist_0_rgb": right_wrist_image,
-            },
+            "image": image_inputs,
             "image_mask": {
                 "base_0_rgb": np.True_,
                 "left_wrist_0_rgb": np.True_,
@@ -278,6 +272,19 @@ class XTrainerStructuredMetaInputs(transforms.DataTransformFn):
 
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
+        if "condition_images" in data:
+            inputs["condition_image"] = _structured_image_inputs(data["condition_images"])
+            inputs["condition_image_mask"] = {
+                "base_0_rgb": np.True_,
+                "left_wrist_0_rgb": np.True_,
+                "right_wrist_0_rgb": np.True_,
+            }
+        if "condition_state" in data:
+            condition_state = np.asarray(data["condition_state"], dtype=np.float32).copy()
+            if self.zero_meta_state_slice and condition_state.shape[-1] >= 20:
+                condition_state[14:20] = 0.0
+            inputs["condition_state"] = condition_state
+
         for key in ("execution_meta_areas", "meta_control", "reference_actions", "reference_action_mask"):
             if key in data:
                 inputs[key] = data[key]

@@ -103,6 +103,9 @@ def test_pi05_meta_beta_inputs_spec_contains_execution_meta_and_reference():
         action_expert_variant="dummy",
     )
     observation_spec, _ = config.inputs_spec()
+    assert observation_spec.condition_images is not None
+    assert observation_spec.condition_image_masks is not None
+    assert observation_spec.condition_state is not None
     assert observation_spec.execution_meta_area_poses is not None
     assert observation_spec.execution_meta_area_poses.shape[-1] == 12
     assert observation_spec.execution_meta_area_dim_masks is not None
@@ -124,6 +127,17 @@ def test_preprocess_observation_preserves_beta_fields():
             "right_wrist_0_rgb": jnp.ones((1,), dtype=jnp.bool_),
         },
         state=jnp.zeros((1, 32), dtype=jnp.float32),
+        condition_images={
+            "base_0_rgb": jnp.ones((1, 224, 224, 3), dtype=jnp.float32),
+            "left_wrist_0_rgb": jnp.ones((1, 224, 224, 3), dtype=jnp.float32),
+            "right_wrist_0_rgb": jnp.ones((1, 224, 224, 3), dtype=jnp.float32),
+        },
+        condition_image_masks={
+            "base_0_rgb": jnp.ones((1,), dtype=jnp.bool_),
+            "left_wrist_0_rgb": jnp.ones((1,), dtype=jnp.bool_),
+            "right_wrist_0_rgb": jnp.ones((1,), dtype=jnp.bool_),
+        },
+        condition_state=jnp.ones((1, 32), dtype=jnp.float32),
         meta_area_poses=jnp.zeros((1, 1, 12), dtype=jnp.float32),
         meta_area_dim_masks=jnp.ones((1, 1, 12), dtype=jnp.bool_),
         meta_area_types=jnp.zeros((1, 1), dtype=jnp.int32),
@@ -141,5 +155,7 @@ def test_preprocess_observation_preserves_beta_fields():
     assert out.reference_actions is not None
     assert out.reference_action_mask is not None
     assert out.meta_imagination_alpha is not None
+    assert out.condition_images is not None
+    assert out.condition_state is not None
     assert out.execution_meta_area_poses is not None
     assert jnp.all(out.execution_meta_area_poses == 1.0)

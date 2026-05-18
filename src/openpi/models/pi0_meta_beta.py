@@ -21,6 +21,15 @@ class _BetaPrefix:
     action_visible_mask: at.Bool[at.Array, "b p"]
 
 
+@dataclasses.dataclass(frozen=True)
+class _ConditionPrefix:
+    tokens: at.Float[at.Array, "b p emb"]
+    input_mask: at.Bool[at.Array, "b p"]
+    attn_mask: at.Bool[at.Array, "b p p"]
+    latent_start: int
+    latent_end: int
+
+
 class Pi0MetaBeta(Pi0Meta):
     """Beta structured-meta model with latent tokens.
 
@@ -61,14 +70,20 @@ class Pi0MetaBeta(Pi0Meta):
         self.meta_imagination_in = nnx.Linear(1, width, rngs=rngs)
 
     def _build_observation_tokens(
-        self, obs: _model.Observation
+        self,
+        obs: _model.Observation,
+        *,
+        images: dict[str, at.Float[at.Array, "b h w c"]] | None = None,
+        image_masks: dict[str, at.Bool[at.Array, "b"]] | None = None,
     ) -> tuple[at.Float[at.Array, "b o emb"], at.Bool[at.Array, "b o"]]:
+        images = obs.images if images is None else images
+        image_masks = obs.image_masks if image_masks is None else image_masks
         tokens = []
         input_mask = []
-        for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+        for name in images:
+            image_tokens, _ = self.PaliGemma.img(images[name], train=False)
             tokens.append(image_tokens)
-            input_mask.append(einops.repeat(obs.image_masks[name], "b -> b s", s=image_tokens.shape[1]))
+            input_mask.append(einops.repeat(image_masks[name], "b -> b s", s=image_tokens.shape[1]))
 
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
@@ -127,6 +142,9 @@ class Pi0MetaBeta(Pi0Meta):
             images=observation.images,
             image_masks=observation.image_masks,
             state=observation.state,
+            condition_images=observation.condition_images,
+            condition_image_masks=observation.condition_image_masks,
+            condition_state=observation.condition_state,
             tokenized_prompt=observation.tokenized_prompt,
             tokenized_prompt_mask=observation.tokenized_prompt_mask,
             token_ar_mask=observation.token_ar_mask,
@@ -149,8 +167,14 @@ class Pi0MetaBeta(Pi0Meta):
         )
         return self._build_meta_context_tokens(execution_observation)
 
-    def _build_beta_prefix(self, obs: _model.Observation) -> _BetaPrefix:
-        obs_tokens, obs_mask = self._build_observation_tokens(obs)
+    def _build_condition_prefix(self, obs: _model.Observation) -> _ConditionPrefix:
+        condition_images = obs.images if obs.condition_images is None else obs.condition_images
+        condition_masks = obs.image_masks if obs.condition_image_masks is None else obs.condition_image_masks
+        obs_tokens, obs_mask = self._build_observation_tokens(
+            obs,
+            images=condition_images,
+            image_masks=condition_masks,
+        )
         meta_tokens, meta_mask = self._build_meta_context_tokens(obs)
         ref_tokens, ref_mask = self._build_reference_action_tokens(obs)
 
@@ -159,32 +183,19 @@ class Pi0MetaBeta(Pi0Meta):
         latent_tokens = jnp.broadcast_to(latent_tokens, (obs.state.shape[0], self.num_meta_latent_tokens, latent_tokens.shape[-1]))
         latent_mask = jnp.ones(latent_tokens.shape[:2], dtype=jnp.bool_)
 
-        special_tokens = self._build_beta_special_tokens(obs)
-        special_mask = jnp.ones((obs.state.shape[0], self.num_meta_special_tokens), dtype=jnp.bool_)
-
-        execution_meta_tokens, execution_meta_mask = self._build_execution_meta_context_tokens(obs)
-
-        tokens = jnp.concatenate(
-            [obs_tokens, meta_tokens, ref_tokens, latent_tokens, special_tokens, execution_meta_tokens], axis=1
-        )
-        input_mask = jnp.concatenate(
-            [obs_mask, meta_mask, ref_mask, latent_mask, special_mask, execution_meta_mask], axis=1
-        )
+        tokens = jnp.concatenate([obs_tokens, meta_tokens, ref_tokens, latent_tokens], axis=1)
+        input_mask = jnp.concatenate([obs_mask, meta_mask, ref_mask, latent_mask], axis=1)
 
         obs_len = obs_tokens.shape[1]
         meta_len = meta_tokens.shape[1]
         ref_len = ref_tokens.shape[1]
         latent_len = latent_tokens.shape[1]
-        special_len = special_tokens.shape[1]
-        execution_meta_len = execution_meta_tokens.shape[1]
         segments = jnp.concatenate(
             [
                 jnp.zeros((obs_len,), dtype=jnp.int32),
                 jnp.ones((meta_len,), dtype=jnp.int32),
                 jnp.full((ref_len,), 2, dtype=jnp.int32),
                 jnp.full((latent_len,), 3, dtype=jnp.int32),
-                jnp.full((special_len,), 4, dtype=jnp.int32),
-                jnp.full((execution_meta_len,), 5, dtype=jnp.int32),
             ],
             axis=0,
         )
@@ -196,16 +207,72 @@ class Pi0MetaBeta(Pi0Meta):
                 jnp.logical_and(q_seg == 1, jnp.logical_or(k_seg == 0, k_seg == 1)),
                 jnp.logical_or(
                     jnp.logical_and(q_seg == 2, jnp.logical_or(k_seg == 0, k_seg == 2)),
-                    jnp.logical_or(
-                        jnp.logical_and(q_seg == 3, k_seg <= 3),
-                        jnp.logical_or(
-                            jnp.logical_and(
-                                q_seg == 4,
-                                jnp.logical_or(k_seg == 0, jnp.logical_or(k_seg == 3, k_seg == 4)),
-                            ),
-                            jnp.logical_and(q_seg == 5, jnp.logical_or(k_seg == 0, k_seg == 5)),
-                        ),
-                    ),
+                    jnp.logical_and(q_seg == 3, k_seg <= 3),
+                ),
+            ),
+        )
+        valid = jnp.logical_and(input_mask[:, :, None], input_mask[:, None, :])
+        attn_mask = jnp.logical_and(allowed[None, :, :], valid)
+        latent_start = obs_len + meta_len + ref_len
+        latent_end = latent_start + latent_len
+        return _ConditionPrefix(
+            tokens=tokens,
+            input_mask=input_mask,
+            attn_mask=attn_mask,
+            latent_start=latent_start,
+            latent_end=latent_end,
+        )
+
+    def _encode_condition_latents(
+        self, obs: _model.Observation
+    ) -> at.Float[at.Array, "b latent emb"]:
+        condition_prefix = self._build_condition_prefix(obs)
+        condition_positions = jnp.cumsum(condition_prefix.input_mask, axis=1) - 1
+        condition_outputs, _ = self.PaliGemma.llm(
+            [condition_prefix.tokens, None],
+            mask=condition_prefix.attn_mask,
+            positions=condition_positions,
+        )
+        condition_out = condition_outputs[0] if isinstance(condition_outputs, tuple | list) else condition_outputs
+        assert condition_out is not None
+        return condition_out[:, condition_prefix.latent_start : condition_prefix.latent_end]
+
+    def _build_execution_prefix(
+        self,
+        obs: _model.Observation,
+        latent_tokens: at.Float[at.Array, "b latent emb"],
+    ) -> _BetaPrefix:
+        obs_tokens, obs_mask = self._build_observation_tokens(obs)
+        latent_mask = jnp.ones(latent_tokens.shape[:2], dtype=jnp.bool_)
+        special_tokens = self._build_beta_special_tokens(obs)
+        special_mask = jnp.ones((obs.state.shape[0], self.num_meta_special_tokens), dtype=jnp.bool_)
+        execution_meta_tokens, execution_meta_mask = self._build_execution_meta_context_tokens(obs)
+
+        tokens = jnp.concatenate([obs_tokens, latent_tokens, special_tokens, execution_meta_tokens], axis=1)
+        input_mask = jnp.concatenate([obs_mask, latent_mask, special_mask, execution_meta_mask], axis=1)
+
+        obs_len = obs_tokens.shape[1]
+        latent_len = latent_tokens.shape[1]
+        special_len = special_tokens.shape[1]
+        execution_meta_len = execution_meta_tokens.shape[1]
+        segments = jnp.concatenate(
+            [
+                jnp.zeros((obs_len,), dtype=jnp.int32),
+                jnp.full((latent_len,), 3, dtype=jnp.int32),
+                jnp.full((special_len,), 4, dtype=jnp.int32),
+                jnp.full((execution_meta_len,), 5, dtype=jnp.int32),
+            ],
+            axis=0,
+        )
+        q_seg = segments[:, None]
+        k_seg = segments[None, :]
+        allowed = jnp.logical_or(
+            jnp.logical_and(q_seg == 0, k_seg == 0),
+            jnp.logical_or(
+                jnp.logical_and(q_seg == 3, k_seg == 3),
+                jnp.logical_or(
+                    jnp.logical_and(q_seg == 4, jnp.logical_or(k_seg == 0, jnp.logical_or(k_seg == 3, k_seg == 4))),
+                    jnp.logical_and(q_seg == 5, jnp.logical_or(k_seg == 0, k_seg == 5)),
                 ),
             ),
         )
@@ -261,6 +328,9 @@ class Pi0MetaBeta(Pi0Meta):
             images=observation.images,
             image_masks=observation.image_masks,
             state=observation.state,
+            condition_images=observation.condition_images,
+            condition_image_masks=observation.condition_image_masks,
+            condition_state=observation.condition_state,
             tokenized_prompt=observation.tokenized_prompt,
             tokenized_prompt_mask=observation.tokenized_prompt_mask,
             token_ar_mask=observation.token_ar_mask,
@@ -281,7 +351,8 @@ class Pi0MetaBeta(Pi0Meta):
             reference_action_mask=observation.reference_action_mask,
             meta_imagination_alpha=observation.meta_imagination_alpha,
         )
-        beta_prefix = self._build_beta_prefix(observation_for_meta)
+        condition_latents = self._encode_condition_latents(observation_for_meta)
+        beta_prefix = self._build_execution_prefix(observation_for_meta, condition_latents)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation_for_meta, x_t, time)
         suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
         prefix_to_suffix_mask = einops.repeat(beta_prefix.action_visible_mask, "b p -> b s p", s=suffix_tokens.shape[1])
@@ -375,7 +446,8 @@ class Pi0MetaBeta(Pi0Meta):
     ) -> dict[str, _model.Actions | at.Array]:
         observation = _model.preprocess_observation(None, observation, train=False)
         observation = self._prepare_observation(observation)
-        beta_prefix = self._build_beta_prefix(observation)
+        condition_latents = self._encode_condition_latents(observation)
+        beta_prefix = self._build_execution_prefix(observation, condition_latents)
         prefix_positions = jnp.cumsum(beta_prefix.input_mask, axis=1) - 1
         prefix_outputs, kv_cache = self.PaliGemma.llm(
             [beta_prefix.tokens, None],

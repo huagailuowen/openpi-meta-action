@@ -133,6 +133,9 @@ class Normalize(DataTransformFn):
             self._normalize_quantile if self.use_quantiles else self._normalize,
             strict=self.strict,
         )
+        if "condition_state" in data and isinstance(self.norm_stats, Mapping) and "state" in self.norm_stats:
+            fn = self._normalize_quantile if self.use_quantiles else self._normalize
+            data["condition_state"] = fn(data["condition_state"], self.norm_stats["state"])
         if "reference_actions" in data and isinstance(self.norm_stats, Mapping) and "actions" in self.norm_stats:
             fn = self._normalize_quantile if self.use_quantiles else self._normalize
             data["reference_actions"] = fn(data["reference_actions"], self.norm_stats["actions"])

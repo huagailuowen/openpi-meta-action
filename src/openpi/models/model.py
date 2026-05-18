@@ -93,6 +93,11 @@ class Observation(Generic[ArrayT]):
     image_masks: dict[str, at.Bool[ArrayT, "*b"]]
     # Low-dimensional robot state.
     state: at.Float[ArrayT, "*b s"]
+    # Optional chunk1/source observation used by beta latent models. The normal
+    # images/state remain the chunk2/current execution observation.
+    condition_images: dict[str, at.Float[ArrayT, "*b h w c"]] | None = None
+    condition_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
+    condition_state: at.Float[ArrayT, "*b s"] | None = None
 
     # Tokenized prompt.
     tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
@@ -157,15 +162,23 @@ class Observation(Generic[ArrayT]):
             if not (has_pose and "mask" in meta_targets):
                 raise ValueError("meta_action_targets must contain pose6d or pose12d, plus mask, when provided.")
         # If images are uint8, convert them to [-1, 1] float32.
-        for key in data["image"]:
-            if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
-            elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+        for image_key in ("image", "condition_image"):
+            if image_key not in data or data[image_key] is None:
+                continue
+            for key in data[image_key]:
+                if data[image_key][key].dtype == np.uint8:
+                    data[image_key][key] = data[image_key][key].astype(np.float32) / 255.0 * 2.0 - 1.0
+                elif hasattr(data[image_key][key], "dtype") and data[image_key][key].dtype == torch.uint8:
+                    data[image_key][key] = (
+                        data[image_key][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+                    )
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
             state=data["state"],
+            condition_images=data.get("condition_image"),
+            condition_image_masks=data.get("condition_image_mask"),
+            condition_state=data.get("condition_state"),
             tokenized_prompt=data.get("tokenized_prompt"),
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
@@ -206,6 +219,9 @@ class Observation(Generic[ArrayT]):
         result = dataclasses.asdict(self)
         result["image"] = result.pop("images")
         result["image_mask"] = result.pop("image_masks")
+        condition_images = result.pop("condition_images")
+        condition_image_masks = result.pop("condition_image_masks")
+        condition_state = result.pop("condition_state")
         meta_area_poses = result.pop("meta_area_poses")
         meta_area_dim_masks = result.pop("meta_area_dim_masks")
         meta_area_types = result.pop("meta_area_types")
@@ -263,6 +279,12 @@ class Observation(Generic[ArrayT]):
             result["meta_control"] = {"alpha": meta_control_alpha}
         if meta_imagination_alpha is not None:
             result.setdefault("meta_control", {})["imagination_alpha"] = meta_imagination_alpha
+        if condition_images is not None:
+            result["condition_image"] = condition_images
+        if condition_image_masks is not None:
+            result["condition_image_mask"] = condition_image_masks
+        if condition_state is not None:
+            result["condition_state"] = condition_state
         if reference_actions is not None:
             result["reference_actions"] = reference_actions
         if reference_action_mask is not None:
@@ -275,28 +297,25 @@ class Observation(Generic[ArrayT]):
 Actions = at.Float[ArrayT, "*b ah ad"]
 
 
-def preprocess_observation(
+def _preprocess_image_dict(
+    images: dict[str, at.Float[ArrayT, "*b h w c"]],
+    image_masks: dict[str, at.Bool[ArrayT, "*b"]],
     rng: at.KeyArrayLike | None,
-    observation: Observation,
     *,
-    train: bool = False,
-    image_keys: Sequence[str] = IMAGE_KEYS,
-    image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
-) -> Observation:
-    """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
-    filling in a default image mask (if necessary).
-    """
-
-    if not set(image_keys).issubset(observation.images):
-        raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
-
-    batch_shape = observation.state.shape[:-1]
+    train: bool,
+    image_keys: Sequence[str],
+    image_resolution: tuple[int, int],
+    batch_shape: tuple[int, ...],
+    log_prefix: str,
+) -> tuple[dict[str, at.Float[ArrayT, "*b h w c"]], dict[str, at.Bool[ArrayT, "*b"]]]:
+    if not set(image_keys).issubset(images):
+        raise ValueError(f"{log_prefix} dict missing keys: expected {image_keys}, got {list(images)}")
 
     out_images = {}
-    for key in image_keys:
-        image = observation.images[key]
+    for image_index, key in enumerate(image_keys):
+        image = images[key]
         if image.shape[1:3] != image_resolution:
-            logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
+            logger.info(f"Resizing {log_prefix} {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
 
         if train:
@@ -314,7 +333,8 @@ def preprocess_observation(
             transforms += [
                 augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
             ]
-            sub_rngs = jax.random.split(rng, image.shape[0])
+            image_rng = None if rng is None else jax.random.fold_in(rng, image_index)
+            sub_rngs = jax.random.split(image_rng, image.shape[0])
             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
 
             # Back to [-1, 1].
@@ -322,19 +342,60 @@ def preprocess_observation(
 
         out_images[key] = image
 
-    # obtain mask
     out_masks = {}
     for key in out_images:
-        if key not in observation.image_masks:
-            # do not mask by default
+        if key not in image_masks:
             out_masks[key] = jnp.ones(batch_shape, dtype=jnp.bool)
         else:
-            out_masks[key] = jnp.asarray(observation.image_masks[key])
+            out_masks[key] = jnp.asarray(image_masks[key])
+    return out_images, out_masks
+
+
+def preprocess_observation(
+    rng: at.KeyArrayLike | None,
+    observation: Observation,
+    *,
+    train: bool = False,
+    image_keys: Sequence[str] = IMAGE_KEYS,
+    image_resolution: tuple[int, int] = IMAGE_RESOLUTION,
+) -> Observation:
+    """Preprocess the observations by performing image augmentations (if train=True), resizing (if necessary), and
+    filling in a default image mask (if necessary).
+    """
+
+    batch_shape = observation.state.shape[:-1]
+    out_images, out_masks = _preprocess_image_dict(
+        observation.images,
+        observation.image_masks,
+        rng,
+        train=train,
+        image_keys=image_keys,
+        image_resolution=image_resolution,
+        batch_shape=batch_shape,
+        log_prefix="image",
+    )
+    condition_images = None
+    condition_image_masks = None
+    if observation.condition_images is not None:
+        condition_masks_in = observation.condition_image_masks or {}
+        condition_images, condition_image_masks = _preprocess_image_dict(
+            observation.condition_images,
+            condition_masks_in,
+            None if rng is None else jax.random.fold_in(rng, 1729),
+            train=train,
+            image_keys=image_keys,
+            image_resolution=image_resolution,
+            batch_shape=batch_shape,
+            log_prefix="condition_image",
+        )
 
     return Observation(
         images=out_images,
         image_masks=out_masks,
         state=observation.state,
+        condition_images=condition_images,
+        condition_image_masks=condition_image_masks,
+        condition_state=observation.condition_state,
         tokenized_prompt=observation.tokenized_prompt,
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
