@@ -401,6 +401,90 @@ def test_beta_self_same_chunk_condition_distribution_uses_twenty_percent_referen
     np.testing.assert_allclose(np.sum(probs), 1.0, rtol=1e-6)
 
 
+def test_beta_sampling_metadata_reads_hf_columns_without_getitem():
+    class RawDataset:
+        def __init__(self):
+            self.hf_dataset = {
+                "observation.tool_instance_hash": [[1], [1], [2], [1]],
+                "observation.source_type_id": [[0], [1], [0], [0]],
+                "episode_index": [0, 1, 2, 3],
+            }
+
+        def __len__(self):
+            return 4
+
+        def __getitem__(self, idx):
+            raise AssertionError(f"metadata sampling should not load sample {idx}")
+
+    metadata = _data_loader._build_beta_sampling_metadata(_data_loader.TransformedDataset(RawDataset(), []))  # noqa: SLF001
+    assert metadata is not None
+
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        source_index = _data_loader._sample_beta_source_index_from_metadata(  # noqa: SLF001
+            metadata,
+            rng,
+            4,
+            0,
+            3,
+            same_tool_only=True,
+        )
+        assert source_index == 3
+
+    relation2_source = _data_loader._sample_beta_source_index_from_metadata(  # noqa: SLF001
+        metadata,
+        np.random.default_rng(1),
+        4,
+        0,
+        2,
+        same_tool_only=True,
+    )
+    assert relation2_source in {1, 3}
+
+
+def test_beta_pair_dataset_metadata_fast_path_avoids_rejected_candidate_getitem():
+    class RawDataset:
+        def __init__(self):
+            self.hf_dataset = {
+                "observation.tool_instance_hash": [[1], [2], [1]],
+                "observation.source_type_id": [[0], [0], [0]],
+                "episode_index": [0, 1, 2],
+            }
+            self.loaded_indices = []
+
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, idx):
+            idx = int(idx)
+            self.loaded_indices.append(idx)
+            return _tiny_beta_sample(idx, tool=[1, 2, 1][idx], episode=idx)
+
+    raw = RawDataset()
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        meta_retarget_cache_prob=1.0,
+        meta_beta_seed=0,
+        meta_beta_self_same_chunk_prob=0.0,
+        meta_beta_same_episode_diff_chunk_prob=0.0,
+        meta_beta_same_tool_diff_episode_prob=0.0,
+        meta_beta_retarget_conditioned_prob=1.0,
+        meta_beta_meta_area_condition_prob=1.0,
+        meta_beta_reference_action_condition_prob=0.0,
+        meta_beta_obs_only_condition_prob=0.0,
+    )
+    wrapped = _data_loader.BetaStructuredMetaPairDataset(
+        _data_loader.TransformedDataset(raw, []),
+        data_config,
+        expected_action_space="absolute",
+        delta_action_masks=[],
+    )
+
+    target_index, source_index = wrapped._sample_pair_retarget_indices()  # noqa: SLF001
+    assert {target_index, source_index} == {0, 2}
+    assert raw.loaded_indices == []
+
+
 def _tiny_beta_sample(idx: int, *, tool: int, episode: int, source_type: int = 0) -> dict:
     pose = np.zeros((1, 12), dtype=np.float32)
     pose[0, :3] = [float(idx), 0.0, 0.0]

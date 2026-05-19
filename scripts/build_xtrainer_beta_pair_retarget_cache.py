@@ -202,6 +202,7 @@ def main(
 
     action_horizon = data_config.data_action_horizon_override or train_config.model.action_horizon
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, train_config.model)
+    sampling_metadata = _data_loader._build_beta_sampling_metadata(dataset)  # noqa: SLF001
     max_meta_areas = _chunk_cache._infer_max_meta_areas(data_config)  # noqa: SLF001
     action_stride = _chunk_cache._infer_action_stride(data_config)  # noqa: SLF001
     delta_action_masks = _chunk_cache._infer_delta_action_masks(data_config)  # noqa: SLF001
@@ -245,6 +246,7 @@ def main(
         "delta_action_masks": delta_action_masks_json,
         "max_meta_areas": max_meta_areas,
         "same_tool_only": bool(same_tool_only),
+        "metadata_source_sampling": sampling_metadata is not None,
         "generator_config": generator_config.to_json_dict(),
     }
     (cache_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -280,6 +282,18 @@ def main(
             if rng.random() > target_prob:
                 skipped_probability += variants_per_target
                 continue
+            if same_tool_only and sampling_metadata is not None:
+                source_probe = _data_loader._sample_beta_source_index_from_metadata(  # noqa: SLF001
+                    sampling_metadata,
+                    rng,
+                    len(dataset),
+                    target_index,
+                    3,
+                    same_tool_only=True,
+                )
+                if source_probe is None:
+                    skipped_no_same_tool_source += variants_per_target
+                    continue
             raw_target = dataset[target_index]
             target = _chunk_cache._canonicalize_sample(  # noqa: SLF001
                 raw_target,
@@ -292,23 +306,41 @@ def main(
                     break
                 source_index = None
                 source = None
-                for _ in range(64):
-                    if len(dataset) <= 1:
-                        break
-                    candidate_index = int(rng.integers(len(dataset) - 1))
-                    if candidate_index >= target_index:
-                        candidate_index += 1
-                    raw_source = dataset[candidate_index]
-                    candidate_source = _chunk_cache._canonicalize_sample(  # noqa: SLF001
-                        raw_source,
-                        data_config,
-                        max_meta_areas=max_meta_areas,
-                        action_stride=action_stride,
+                if sampling_metadata is not None:
+                    source_index = _data_loader._sample_beta_source_index_from_metadata(  # noqa: SLF001
+                        sampling_metadata,
+                        rng,
+                        len(dataset),
+                        target_index,
+                        3,
+                        same_tool_only=same_tool_only,
                     )
-                    if not same_tool_only or _valid_same_tool_pair(target, candidate_source):
-                        source_index = candidate_index
-                        source = candidate_source
-                        break
+                    if source_index is not None:
+                        raw_source = dataset[source_index]
+                        source = _chunk_cache._canonicalize_sample(  # noqa: SLF001
+                            raw_source,
+                            data_config,
+                            max_meta_areas=max_meta_areas,
+                            action_stride=action_stride,
+                        )
+                else:
+                    for _ in range(64):
+                        if len(dataset) <= 1:
+                            break
+                        candidate_index = int(rng.integers(len(dataset) - 1))
+                        if candidate_index >= target_index:
+                            candidate_index += 1
+                        raw_source = dataset[candidate_index]
+                        candidate_source = _chunk_cache._canonicalize_sample(  # noqa: SLF001
+                            raw_source,
+                            data_config,
+                            max_meta_areas=max_meta_areas,
+                            action_stride=action_stride,
+                        )
+                        if not same_tool_only or _valid_same_tool_pair(target, candidate_source):
+                            source_index = candidate_index
+                            source = candidate_source
+                            break
                 if source_index is None or source is None:
                     skipped_no_same_tool_source += 1
                     continue

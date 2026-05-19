@@ -30,6 +30,15 @@ T_co = TypeVar("T_co", covariant=True)
 _BETA_REFERENCE_ACTION_DIM = 14
 
 
+class _BetaSamplingMetadata(typing.NamedTuple):
+    tool_instance_hash: np.ndarray
+    source_type_id: np.ndarray
+    episode_index: np.ndarray
+    by_episode: dict[int, np.ndarray]
+    by_tool: dict[int, np.ndarray]
+    origin_by_tool: dict[int, np.ndarray]
+
+
 class Dataset(Protocol[T_co]):
     """Interface for a dataset with random access."""
 
@@ -499,6 +508,135 @@ def _valid_same_tool_pair_retarget_samples(
     return _is_origin_sample(target_sample) and _is_origin_sample(source_sample) and _same_tool_sample_pair(target_sample, source_sample)
 
 
+def _unwrap_raw_dataset(dataset: Dataset) -> Dataset:
+    seen: set[int] = set()
+    current: typing.Any = dataset
+    while id(current) not in seen:
+        seen.add(id(current))
+        wrapped = getattr(current, "_dataset", None)
+        if wrapped is None:
+            return typing.cast(Dataset, current)
+        current = wrapped
+    return typing.cast(Dataset, current)
+
+
+def _metadata_scalar_array(hf_dataset: typing.Any, key: str, length: int, *, default: int = -1) -> np.ndarray:
+    try:
+        column = hf_dataset[key]
+    except (KeyError, TypeError, AttributeError):
+        return np.full((length,), default, dtype=np.int64)
+    values = np.full((length,), default, dtype=np.int64)
+    for index, value in enumerate(column):
+        if index >= length:
+            break
+        values[index] = _scalar_int(value, default=default)
+    return values
+
+
+def _index_pools(values: np.ndarray, *, mask: np.ndarray | None = None) -> dict[int, np.ndarray]:
+    values = np.asarray(values, dtype=np.int64)
+    valid = values >= 0
+    if mask is not None:
+        valid &= np.asarray(mask, dtype=bool)
+    pools: dict[int, np.ndarray] = {}
+    for value in np.unique(values[valid]):
+        pools[int(value)] = np.flatnonzero(valid & (values == value)).astype(np.int64)
+    return pools
+
+
+def _build_beta_sampling_metadata(dataset: Dataset) -> _BetaSamplingMetadata | None:
+    raw = _unwrap_raw_dataset(dataset)
+    hf_dataset = getattr(raw, "hf_dataset", None)
+    if hf_dataset is None:
+        return None
+    length = len(dataset)
+    tool_instance_hash = _metadata_scalar_array(hf_dataset, "observation.tool_instance_hash", length)
+    source_type_id = _metadata_scalar_array(hf_dataset, "observation.source_type_id", length, default=0)
+    episode_index = _metadata_scalar_array(hf_dataset, "episode_index", length)
+    if np.all(tool_instance_hash < 0) or np.all(episode_index < 0):
+        return None
+    origin_mask = source_type_id == 0
+    return _BetaSamplingMetadata(
+        tool_instance_hash=tool_instance_hash,
+        source_type_id=source_type_id,
+        episode_index=episode_index,
+        by_episode=_index_pools(episode_index),
+        by_tool=_index_pools(tool_instance_hash),
+        origin_by_tool=_index_pools(tool_instance_hash, mask=origin_mask),
+    )
+
+
+def _sample_from_pool_excluding(
+    pool: np.ndarray,
+    rng: np.random.Generator,
+    *,
+    excluded: set[int],
+    episode_index: np.ndarray | None = None,
+    excluded_episode: int | None = None,
+) -> int | None:
+    pool = np.asarray(pool, dtype=np.int64)
+    if pool.size == 0:
+        return None
+    for _ in range(32):
+        candidate = int(pool[int(rng.integers(pool.size))])
+        if candidate in excluded:
+            continue
+        if episode_index is not None and excluded_episode is not None and int(episode_index[candidate]) == excluded_episode:
+            continue
+        return candidate
+    valid = [int(candidate) for candidate in pool if int(candidate) not in excluded]
+    if episode_index is not None and excluded_episode is not None:
+        valid = [candidate for candidate in valid if int(episode_index[candidate]) != excluded_episode]
+    if not valid:
+        return None
+    return int(valid[int(rng.integers(len(valid)))])
+
+
+def _sample_beta_source_index_from_metadata(
+    metadata: _BetaSamplingMetadata | None,
+    rng: np.random.Generator,
+    dataset_len: int,
+    base_index: int,
+    relation_id: int,
+    *,
+    same_tool_only: bool,
+) -> int | None:
+    if metadata is None or not 0 <= base_index < dataset_len:
+        return None
+    if relation_id == 0:
+        return base_index
+    target_tool = int(metadata.tool_instance_hash[base_index])
+    target_episode = int(metadata.episode_index[base_index])
+    if relation_id == 1:
+        return _sample_from_pool_excluding(
+            metadata.by_episode.get(target_episode, np.asarray([], dtype=np.int64)),
+            rng,
+            excluded={base_index},
+        )
+    if relation_id == 2:
+        return _sample_from_pool_excluding(
+            metadata.by_tool.get(target_tool, np.asarray([], dtype=np.int64)),
+            rng,
+            excluded={base_index},
+            episode_index=metadata.episode_index,
+            excluded_episode=target_episode,
+        )
+    if relation_id == 3 and same_tool_only:
+        if int(metadata.source_type_id[base_index]) != 0 or target_tool < 0:
+            return None
+        return _sample_from_pool_excluding(
+            metadata.origin_by_tool.get(target_tool, np.asarray([], dtype=np.int64)),
+            rng,
+            excluded={base_index},
+        )
+    if relation_id == 3 and dataset_len > 1:
+        source_index = int(rng.integers(dataset_len - 1))
+        if source_index >= base_index:
+            source_index += 1
+        return source_index
+    return None
+
+
 def _retarget_result_to_payload(
     result: _meta_retarget.MetaRetargetResult,
     *,
@@ -712,6 +850,9 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         self._delta_action_masks = [np.asarray(mask, dtype=bool) for mask in delta_action_masks]
         self._pair_retarget_max_attempts = max(1, int(data_config.meta_beta_pair_retarget_max_attempts))
         self._pair_retarget_same_tool_only = bool(data_config.meta_beta_pair_retarget_same_tool_only)
+        self._sampling_metadata = _build_beta_sampling_metadata(dataset)
+        if self._sampling_metadata is None:
+            logging.warning("Beta same-tool sampling metadata unavailable; falling back to dataset probing.")
         self._retarget_config = _meta_retarget.MetaRetargetGeneratorConfig()
         self._records_by_index = (
             RetargetCacheDataset._load_manifest(self._cache_dir) if self._cache_dir is not None else {}
@@ -937,6 +1078,16 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
     ) -> tuple[int, dict[str, typing.Any]]:
         if relation_id == 0:
             return base_index, target_sample
+        metadata_index = _sample_beta_source_index_from_metadata(
+            self._sampling_metadata,
+            self._rng,
+            len(self._dataset),
+            base_index,
+            relation_id,
+            same_tool_only=self._pair_retarget_same_tool_only,
+        )
+        if metadata_index is not None:
+            return metadata_index, typing.cast(dict[str, typing.Any], self._dataset[metadata_index])
         target_tool = _scalar_int(target_sample.get("tool_instance_hash"), default=-1)
         target_episode = _scalar_int(target_sample.get("episode_index"), default=-1)
         require_same_episode = relation_id == 1
@@ -1153,6 +1304,20 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
     def _sample_pair_retarget_indices(self) -> tuple[int, int] | None:
         dataset_len = len(self._dataset)
         if dataset_len <= 1:
+            return None
+        if self._sampling_metadata is not None:
+            for _ in range(128):
+                target_index = int(self._rng.integers(dataset_len))
+                source_index = _sample_beta_source_index_from_metadata(
+                    self._sampling_metadata,
+                    self._rng,
+                    dataset_len,
+                    target_index,
+                    3,
+                    same_tool_only=self._pair_retarget_same_tool_only,
+                )
+                if source_index is not None:
+                    return target_index, source_index
             return None
         for _ in range(128):
             target_index = int(self._rng.integers(dataset_len))
