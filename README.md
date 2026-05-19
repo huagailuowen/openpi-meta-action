@@ -412,6 +412,16 @@ then falls back to a random beta pair cache record, and only then falls back to 
 If both online async and pair cache are disabled, the wrapper keeps the legacy synchronous retry path,
 bounded by `data.meta_beta_pair_retarget_max_attempts` (default `4`).
 
+There is one extra chunk-cache shortcut for stable imagine training. When a retarget-conditioned
+sample has selected meta-area conditioning, `data.meta_beta_imagine_cache_condition_prob` controls the
+probability of drawing a random accepted record directly from the chunk-level retarget cache at
+`data.meta_retarget_cache_dir`. This is not keyed by the current dataloader index. The cached retargeted
+chunk becomes both chunk1 and chunk2: its cached meta-area start is used as the condition meta area, its
+cached state/actions are used for qpos supervision, and its cached `meta_action_targets` are used for
+meta-action supervision. The remaining probability continues through the beta pair cache / online queue
+path. This path requires rebuilding the chunk retarget cache with the current retarget planner; old chunk
+cache records will preserve old trajectory behavior.
+
 Current beta retarget-conditioned samples are restricted to original chunks from the same
 `tool_instance_id` (`data.meta_beta_pair_retarget_same_tool_only=true`). Cross-tool chunk1/chunk2 pair
 retargets are intentionally skipped because asymmetric IK success rates can bias the distribution
@@ -685,6 +695,7 @@ Beta training with online producer and cache fallback:
 python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta \
     --exp-name my_beta_run_12d \
     --overrides data.repo_id=/path/to/your/classified_structured_12d_lerobot_dataset \
+    --overrides data.meta_retarget_cache_dir=/path/to/chunk_retarget_cache_12d \
     --overrides data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache \
     --overrides data.meta_beta_online_async_enabled=true \
     --overrides data.meta_beta_online_worker_group=dataloader \

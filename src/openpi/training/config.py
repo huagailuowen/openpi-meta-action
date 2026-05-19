@@ -139,6 +139,7 @@ class DataConfig:
     meta_beta_self_same_chunk_reference_action_condition_prob: float = 0.20
     meta_beta_obs_only_condition_prob: float = 0.0
     meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
+    meta_beta_imagine_cache_condition_prob: float = 0.50
     meta_beta_pair_retarget_max_attempts: int = 4
     meta_beta_pair_retarget_same_tool_only: bool = True
     # Optional beta pair-retarget cache and non-blocking online producer. When
@@ -461,6 +462,7 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     meta_beta_self_same_chunk_reference_action_condition_prob: float = 0.20
     meta_beta_obs_only_condition_prob: float = 0.0
     meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
+    meta_beta_imagine_cache_condition_prob: float = 0.50
     meta_beta_pair_retarget_max_attempts: int = 4
     meta_beta_pair_retarget_same_tool_only: bool = True
     meta_beta_pair_cache_dir: str | None = None
@@ -573,6 +575,7 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
             ),
             meta_beta_obs_only_condition_prob=self.meta_beta_obs_only_condition_prob,
             meta_beta_non_retarget_obs_only_condition_prob=self.meta_beta_non_retarget_obs_only_condition_prob,
+            meta_beta_imagine_cache_condition_prob=self.meta_beta_imagine_cache_condition_prob,
             meta_beta_pair_retarget_max_attempts=self.meta_beta_pair_retarget_max_attempts,
             meta_beta_pair_retarget_same_tool_only=self.meta_beta_pair_retarget_same_tool_only,
             meta_beta_pair_cache_dir=self.meta_beta_pair_cache_dir,
@@ -645,6 +648,7 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     meta_beta_self_same_chunk_reference_action_condition_prob: float = 0.20
     meta_beta_obs_only_condition_prob: float = 0.0
     meta_beta_non_retarget_obs_only_condition_prob: float = 0.10
+    meta_beta_imagine_cache_condition_prob: float = 0.50
     meta_beta_pair_retarget_max_attempts: int = 4
     meta_beta_pair_retarget_same_tool_only: bool = True
     meta_beta_pair_cache_dir: str | None = None
@@ -815,6 +819,7 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
             ),
             meta_beta_obs_only_condition_prob=self.meta_beta_obs_only_condition_prob,
             meta_beta_non_retarget_obs_only_condition_prob=self.meta_beta_non_retarget_obs_only_condition_prob,
+            meta_beta_imagine_cache_condition_prob=self.meta_beta_imagine_cache_condition_prob,
             meta_beta_pair_retarget_max_attempts=self.meta_beta_pair_retarget_max_attempts,
             meta_beta_pair_retarget_same_tool_only=self.meta_beta_pair_retarget_same_tool_only,
             meta_beta_pair_cache_dir=self.meta_beta_pair_cache_dir,
@@ -1657,6 +1662,7 @@ _CONFIGS = [
             meta_area_pose_dim=12,
             use_delta_joint_actions=True,
             action_stride=3,
+            meta_retarget_cache_dir="./assets/pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3/retarget_cache",
             meta_retarget_cache_prob=1.0,
             meta_beta_enabled=True,
             meta_beta_self_same_chunk_prob=0.12,
@@ -1668,6 +1674,7 @@ _CONFIGS = [
             meta_beta_self_same_chunk_reference_action_condition_prob=0.20,
             meta_beta_obs_only_condition_prob=0.0,
             meta_beta_non_retarget_obs_only_condition_prob=0.10,
+            meta_beta_imagine_cache_condition_prob=0.50,
             meta_beta_pair_cache_dir="./assets/pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3/beta_pair_retarget_cache",
             meta_beta_pair_retarget_same_tool_only=True,
             meta_beta_online_async_enabled=True,

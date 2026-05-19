@@ -793,16 +793,25 @@ def _load_beta_pair_cache_manifest(cache_dir: pathlib.Path) -> list[dict[str, ty
     return records
 
 
-def _beta_pair_cache_payload(cache_dir: pathlib.Path, record: dict[str, typing.Any]) -> dict[str, np.ndarray] | None:
+def _npz_cache_payload(
+    cache_dir: pathlib.Path,
+    record: dict[str, typing.Any],
+    *,
+    cache_name: str,
+) -> dict[str, np.ndarray] | None:
     variant_path = cache_dir / str(record["path"])
     try:
         with np.load(variant_path) as cached:
             return {key: cached[key].copy() for key in cached.files}
     except FileNotFoundError:
-        logging.warning("Beta pair cache entry missing: %s", variant_path)
+        logging.warning("%s cache entry missing: %s", cache_name, variant_path)
     except OSError as exc:
-        logging.warning("Failed to load beta pair cache entry %s: %s", variant_path, exc)
+        logging.warning("Failed to load %s cache entry %s: %s", cache_name, variant_path, exc)
     return None
+
+
+def _beta_pair_cache_payload(cache_dir: pathlib.Path, record: dict[str, typing.Any]) -> dict[str, np.ndarray] | None:
+    return _npz_cache_payload(cache_dir, record, cache_name="Beta pair")
 
 
 def _retarget_debug_from_record(record: dict[str, typing.Any], *, status_id: int = 0) -> dict[str, typing.Any]:
@@ -834,6 +843,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         "sync": 2,
         "origin_fallback": 3,
         "gated": 4,
+        "chunk_cache": 5,
     }
 
     def __init__(
@@ -856,6 +866,10 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         self._retarget_config = _meta_retarget.MetaRetargetGeneratorConfig()
         self._records_by_index = (
             RetargetCacheDataset._load_manifest(self._cache_dir) if self._cache_dir is not None else {}
+        )
+        self._chunk_cache_records = [record for records in self._records_by_index.values() for record in records]
+        self._imagine_cache_condition_prob = float(
+            np.clip(data_config.meta_beta_imagine_cache_condition_prob, 0.0, 1.0)
         )
         if self._cache_dir is not None:
             RetargetCacheDataset._warn_if_action_space_mismatch(self._cache_dir, expected_action_space)
@@ -952,14 +966,31 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         origin_sample = typing.cast(dict[str, typing.Any], self._dataset[index])
         target_sample = origin_sample
         relation_id = int(self._rng.choice(4, p=self._relation_probs))
-        source_sample = self._sample_source(base_index, target_sample, relation_id)
+        source_sample = target_sample
+        condition_id: int | None = None
         beta_debug: dict[str, typing.Any] = {"relation_id": relation_id, "retarget_applied": False}
         if relation_id == 3:
-            target_sample, source_sample, beta_debug = self._maybe_apply_pair_retarget_with_retries(
-                base_index,
-                target_sample,
-                source_sample,
-            )
+            requested_condition_id = int(self._rng.choice(3, p=self._retarget_condition_probs))
+            chunk_cache_result = None
+            if (
+                requested_condition_id == 0
+                and self._imagine_cache_condition_prob > 0.0
+                and self._chunk_cache_records
+                and self._rng.random() < self._imagine_cache_condition_prob
+            ):
+                chunk_cache_result = self._sample_global_chunk_retarget_cache()
+            if chunk_cache_result is not None:
+                target_sample, source_sample, beta_debug = chunk_cache_result
+                condition_id = 0
+            else:
+                source_sample = self._sample_source(base_index, target_sample, relation_id)
+                target_sample, source_sample, beta_debug = self._maybe_apply_pair_retarget_with_retries(
+                    base_index,
+                    target_sample,
+                    source_sample,
+                )
+                if bool(beta_debug.get("retarget_applied", False)):
+                    condition_id = requested_condition_id
             if not bool(beta_debug.get("retarget_applied", False)):
                 # Only fall back after exhausting fresh random target/source
                 # attempts. This prevents failed/dismissed pairs from becoming
@@ -971,11 +1002,14 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                     **beta_debug,
                     "relation_id": relation_id,
                 }
+        else:
+            source_sample = self._sample_source(base_index, target_sample, relation_id)
 
         out = _clone_sample(target_sample)
         self._set_execution_meta_from_current_meta(out)
-        condition_probs = self._condition_probabilities_for_source(relation_id, source_sample)
-        condition_id = int(self._rng.choice(3, p=condition_probs))
+        if condition_id is None:
+            condition_probs = self._condition_probabilities_for_source(relation_id, source_sample)
+            condition_id = int(self._rng.choice(3, p=condition_probs))
         if condition_id == 0:
             self._apply_meta_area_condition(out, source_sample)
         elif condition_id == 1:
@@ -1454,6 +1488,38 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             debug["retarget_source"] = "cache"
             self._stats_cache_hit += 1
             return _apply_retargeted_payload(target_sample, payload), source_sample, debug
+        self._stats_cache_miss += 1
+        return None
+
+    def _sample_global_chunk_retarget_cache(
+        self,
+    ) -> tuple[dict[str, typing.Any], dict[str, typing.Any], dict[str, typing.Any]] | None:
+        if self._cache_dir is None or not self._chunk_cache_records:
+            self._stats_cache_miss += 1
+            return None
+        for _ in range(8):
+            record = self._chunk_cache_records[int(self._rng.integers(len(self._chunk_cache_records)))]
+            base_index = int(record["base_index"])
+            if not (0 <= base_index < len(self._dataset)):
+                logging.warning(
+                    "Chunk retarget cache record has out-of-range base_index: base=%s len=%s",
+                    base_index,
+                    len(self._dataset),
+                )
+                continue
+            cache_start = time.perf_counter()
+            payload = _npz_cache_payload(self._cache_dir, record, cache_name="Chunk retarget")
+            self._stats_cache_load_s += time.perf_counter() - cache_start
+            if payload is None:
+                continue
+            base_sample = typing.cast(dict[str, typing.Any], self._dataset[base_index])
+            retargeted_sample = _apply_retargeted_payload(base_sample, payload)
+            debug = _retarget_debug_from_record(record)
+            debug["retarget_source"] = "chunk_cache"
+            debug["target_index"] = base_index
+            debug["source_index"] = base_index
+            self._stats_cache_hit += 1
+            return retargeted_sample, retargeted_sample, debug
         self._stats_cache_miss += 1
         return None
 
