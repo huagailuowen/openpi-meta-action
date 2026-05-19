@@ -203,6 +203,10 @@ class ResizeImages(DataTransformFn):
 
     def __call__(self, data: DataDict) -> DataDict:
         data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
+        if "condition_image" in data and data["condition_image"] is not None:
+            data["condition_image"] = {
+                k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["condition_image"].items()
+            }
         return data
 
 
