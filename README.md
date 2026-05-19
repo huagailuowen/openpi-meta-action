@@ -412,6 +412,14 @@ then falls back to a random beta pair cache record, and only then falls back to 
 If both online async and pair cache are disabled, the wrapper keeps the legacy synchronous retry path,
 bounded by `data.meta_beta_pair_retarget_max_attempts` (default `4`).
 
+Current beta retarget-conditioned samples are restricted to original chunks from the same
+`tool_instance_id` (`data.meta_beta_pair_retarget_same_tool_only=true`). Cross-tool chunk1/chunk2 pair
+retargets are intentionally skipped because asymmetric IK success rates can bias the distribution
+toward tools that are easy to retarget into. The offline beta pair cache builder uses the same rule by
+default; use `--no-same-tool-only` only for explicit ablations.
+Any beta pair cache built before this same-tool-only rule must be discarded and regenerated; old cache
+records contain cross-tool pairs and no longer represent the intended training distribution.
+
 The online producer can run in two worker groups. `data.meta_beta_online_worker_group="dataloader"`
 keeps the older per-DataLoader-worker thread producer. `data.meta_beta_online_worker_group="process"`
 starts a separate multiprocessing retarget worker group from the main process and shares request/result
@@ -438,9 +446,15 @@ and the token mask shapes no longer match.
 
 That config also sets `data.meta_retarget_cache_prob=1.0`. In the beta dataloader, relation sampling
 already controls how often retarget-conditioned pairs are attempted through
-`data.meta_beta_retarget_conditioned_prob=0.30`; leaving the old `0.2` value would add a second random
-gate and reduce the effective attempt rate to `0.30 * 0.20 = 0.06`. Retarget/IK failures are still
+`data.meta_beta_retarget_conditioned_prob=0.15`; leaving the old `0.2` value would add a second random
+gate and reduce the effective attempt rate to `0.15 * 0.20 = 0.03`. Retarget/IK failures are still
 handled by bounded retries and fallback logic.
+
+The default beta relation mix is now `self_same_chunk=0.12`,
+`same_episode_diff_chunk=0.08`, `same_tool_diff_episode=0.65`, and
+`retarget_conditioned=0.15`. For `self_same_chunk`, reference-action conditioning is capped at
+`0.20`; the removed reference probability is assigned to obs-only conditioning, yielding the default
+self condition mix `meta_area=0.45`, `reference_action=0.20`, `obs_only=0.35`.
 
 For throughput, `TrainConfig.data_loader_prefetch_factor` defaults to `4` when `num_workers > 0`.
 Increasing `num_workers`, building a beta pair cache, and enabling the online producer are the main

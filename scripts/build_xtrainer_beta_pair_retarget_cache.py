@@ -58,6 +58,29 @@ def _write_jsonl_record(path: pathlib.Path, record: dict[str, Any]) -> None:
         f.write(json.dumps(record, ensure_ascii=True, sort_keys=True) + "\n")
 
 
+def _scalar_int(value: Any, *, default: int = -1) -> int:
+    if value is None:
+        return default
+    array = np.asarray(value).reshape(-1)
+    if array.size == 0:
+        return default
+    return int(array[0])
+
+
+def _is_origin_sample(sample: dict[str, Any]) -> bool:
+    return _scalar_int(sample.get("source_type_id"), default=0) == 0
+
+
+def _same_tool_sample_pair(target_sample: dict[str, Any], source_sample: dict[str, Any]) -> bool:
+    target_tool = _scalar_int(target_sample.get("tool_instance_hash"), default=-1)
+    source_tool = _scalar_int(source_sample.get("tool_instance_hash"), default=-2)
+    return target_tool >= 0 and target_tool == source_tool
+
+
+def _valid_same_tool_pair(target_sample: dict[str, Any], source_sample: dict[str, Any]) -> bool:
+    return _is_origin_sample(target_sample) and _is_origin_sample(source_sample) and _same_tool_sample_pair(target_sample, source_sample)
+
+
 def _generate_pair_worker(
     *,
     target_index: int,
@@ -143,6 +166,7 @@ def main(
     accept_max_step_joint_delta_rad: float = 0.35,
     accept_max_abs_action_value: float = 1e4,
     accept_max_camera_rotvec_norm_rad: float = 3.143,
+    same_tool_only: bool = True,
 ) -> None:
     """Build a reusable pair-retarget cache for one beta OpenPI training config."""
 
@@ -220,6 +244,7 @@ def main(
         "cache_action_space": "delta" if delta_action_masks else "absolute",
         "delta_action_masks": delta_action_masks_json,
         "max_meta_areas": max_meta_areas,
+        "same_tool_only": bool(same_tool_only),
         "generator_config": generator_config.to_json_dict(),
     }
     (cache_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -232,6 +257,7 @@ def main(
     rejected = 0
     skipped_existing = 0
     skipped_probability = 0
+    skipped_no_same_tool_source = 0
 
     pending: dict[futures.Future, tuple[int, int, int]] = {}
 
@@ -264,23 +290,32 @@ def main(
             for variant_id in range(variants_per_target):
                 if max_pairs is not None and submitted >= max_pairs:
                     break
-                if len(dataset) <= 1:
-                    source_index = target_index
-                else:
-                    source_index = int(rng.integers(len(dataset) - 1))
-                    if source_index >= target_index:
-                        source_index += 1
+                source_index = None
+                source = None
+                for _ in range(64):
+                    if len(dataset) <= 1:
+                        break
+                    candidate_index = int(rng.integers(len(dataset) - 1))
+                    if candidate_index >= target_index:
+                        candidate_index += 1
+                    raw_source = dataset[candidate_index]
+                    candidate_source = _chunk_cache._canonicalize_sample(  # noqa: SLF001
+                        raw_source,
+                        data_config,
+                        max_meta_areas=max_meta_areas,
+                        action_stride=action_stride,
+                    )
+                    if not same_tool_only or _valid_same_tool_pair(target, candidate_source):
+                        source_index = candidate_index
+                        source = candidate_source
+                        break
+                if source_index is None or source is None:
+                    skipped_no_same_tool_source += 1
+                    continue
                 pair = (target_index, source_index, variant_id)
                 if pair in existing_pairs:
                     skipped_existing += 1
                     continue
-                raw_source = dataset[source_index]
-                source = _chunk_cache._canonicalize_sample(  # noqa: SLF001
-                    raw_source,
-                    data_config,
-                    max_meta_areas=max_meta_areas,
-                    action_stride=action_stride,
-                )
                 retarget_mode = "future_near" if rng.random() < future_near_mode_prob else "correction"
                 pending[
                     executor.submit(
@@ -313,6 +348,7 @@ def main(
         "rejected": rejected,
         "skipped_existing": skipped_existing,
         "skipped_probability": skipped_probability,
+        "skipped_no_same_tool_source": skipped_no_same_tool_source,
         "manifest_path": str(manifest_path),
         "failure_path": str(failure_path),
     }

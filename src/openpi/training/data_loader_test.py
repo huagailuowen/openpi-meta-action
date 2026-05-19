@@ -122,6 +122,7 @@ def test_beta_pair_dataset_reference_condition_uses_source_actions():
         meta_beta_retarget_conditioned_prob=0.0,
         meta_beta_meta_area_condition_prob=0.0,
         meta_beta_reference_action_condition_prob=1.0,
+        meta_beta_self_same_chunk_reference_action_condition_prob=1.0,
         meta_beta_obs_only_condition_prob=0.0,
         meta_beta_non_retarget_obs_only_condition_prob=0.0,
     )
@@ -178,6 +179,7 @@ def test_beta_reference_actions_are_delta_relative_to_condition_state():
         meta_beta_retarget_conditioned_prob=0.0,
         meta_beta_meta_area_condition_prob=0.0,
         meta_beta_reference_action_condition_prob=1.0,
+        meta_beta_self_same_chunk_reference_action_condition_prob=1.0,
         meta_beta_obs_only_condition_prob=0.0,
         meta_beta_non_retarget_obs_only_condition_prob=0.0,
     )
@@ -227,6 +229,7 @@ def test_beta_pair_dataset_reference_condition_carries_source_observation():
         meta_beta_retarget_conditioned_prob=0.0,
         meta_beta_meta_area_condition_prob=0.0,
         meta_beta_reference_action_condition_prob=1.0,
+        meta_beta_self_same_chunk_reference_action_condition_prob=1.0,
         meta_beta_obs_only_condition_prob=0.0,
         meta_beta_non_retarget_obs_only_condition_prob=0.0,
     )
@@ -391,6 +394,13 @@ def test_beta_non_retarget_condition_distribution_uses_ten_percent_obs_only():
     np.testing.assert_allclose(np.sum(probs), 1.0, rtol=1e-6)
 
 
+def test_beta_self_same_chunk_condition_distribution_uses_twenty_percent_reference():
+    probs = _data_loader._condition_probabilities_with_fixed_reference(0.45, 0.20)  # noqa: SLF001
+
+    np.testing.assert_allclose(probs, np.asarray([0.45, 0.20, 0.35]), rtol=1e-6)
+    np.testing.assert_allclose(np.sum(probs), 1.0, rtol=1e-6)
+
+
 def _tiny_beta_sample(idx: int, *, tool: int, episode: int, source_type: int = 0) -> dict:
     pose = np.zeros((1, 12), dtype=np.float32)
     pose[0, :3] = [float(idx), 0.0, 0.0]
@@ -421,7 +431,7 @@ def test_beta_pair_dataset_retarget_condition_uses_source_and_retarget_target(mo
         def __init__(self):
             self.samples = [
                 _tiny_beta_sample(0, tool=1, episode=0),
-                _tiny_beta_sample(1, tool=2, episode=1),
+                _tiny_beta_sample(1, tool=1, episode=1),
             ]
 
         def __len__(self):
@@ -432,7 +442,9 @@ def test_beta_pair_dataset_retarget_condition_uses_source_and_retarget_target(mo
 
     def fake_pair_retarget(target_data, source_data, *, rng, config):
         del rng, config
-        assert np.asarray(source_data["tool_instance_hash"]).reshape(-1)[0] in (1, 2)
+        assert np.asarray(source_data["tool_instance_hash"]).reshape(-1)[0] == np.asarray(
+            target_data["tool_instance_hash"]
+        ).reshape(-1)[0]
         actions = np.full_like(target_data["actions"], 9.0)
         retargeted_meta = np.asarray(target_data["meta_areas"]["pose12d"], dtype=np.float32).copy()
         retargeted_meta[:, :3] = 77.0
@@ -498,7 +510,7 @@ def test_beta_pair_dataset_retarget_failure_retries_random_target(monkeypatch):
         def __init__(self):
             self.samples = [
                 _tiny_beta_sample(0, tool=1, episode=0),
-                _tiny_beta_sample(1, tool=2, episode=1),
+                _tiny_beta_sample(1, tool=1, episode=1),
             ]
 
         def __len__(self):
@@ -576,7 +588,7 @@ def test_beta_pair_dataset_failed_retarget_falls_back_to_origin(monkeypatch):
         def __init__(self):
             self.samples = [
                 _tiny_beta_sample(0, tool=1, episode=0),
-                _tiny_beta_sample(1, tool=2, episode=1, source_type=1),
+                _tiny_beta_sample(1, tool=1, episode=1, source_type=1),
             ]
 
         def __len__(self):
@@ -625,7 +637,7 @@ def test_beta_pair_dataset_uses_pair_cache_when_online_queue_empty(tmp_path):
         def __init__(self):
             self.samples = [
                 _tiny_beta_sample(0, tool=1, episode=0),
-                _tiny_beta_sample(1, tool=2, episode=1),
+                _tiny_beta_sample(1, tool=1, episode=1),
             ]
 
         def __len__(self):
@@ -699,7 +711,7 @@ def test_beta_pair_dataset_consumes_ready_online_retarget(monkeypatch):
         def __init__(self):
             self.samples = [
                 _tiny_beta_sample(0, tool=1, episode=0),
-                _tiny_beta_sample(1, tool=2, episode=1),
+                _tiny_beta_sample(1, tool=1, episode=1),
             ]
 
         def __len__(self):
