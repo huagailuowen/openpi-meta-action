@@ -139,6 +139,13 @@ class Normalize(DataTransformFn):
         if "reference_actions" in data and isinstance(self.norm_stats, Mapping) and "actions" in self.norm_stats:
             fn = self._normalize_quantile if self.use_quantiles else self._normalize
             data["reference_actions"] = fn(data["reference_actions"], self.norm_stats["actions"])
+        if (
+            "contrastive_reference_actions" in data
+            and isinstance(self.norm_stats, Mapping)
+            and "actions" in self.norm_stats
+        ):
+            fn = self._normalize_quantile if self.use_quantiles else self._normalize
+            data["contrastive_reference_actions"] = fn(data["contrastive_reference_actions"], self.norm_stats["actions"])
         return data
 
     def _normalize(self, x, stats: NormStats):

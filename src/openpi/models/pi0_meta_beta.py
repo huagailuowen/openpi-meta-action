@@ -48,6 +48,7 @@ class Pi0MetaBeta(Pi0Meta):
         self.num_meta_latent_tokens = int(config.num_meta_latent_tokens)
         self.reference_action_group_size = int(config.reference_action_group_size)
         self.reference_action_dim = int(config.reference_action_dim)
+        self.meta_contrastive_loss_weight = float(config.meta_contrastive_loss_weight)
         if self.reference_action_dim <= 0 or self.reference_action_dim > config.action_dim:
             raise ValueError(
                 "Pi0MetaBeta requires 0 < reference_action_dim <= action_dim; "
@@ -204,9 +205,56 @@ class Pi0MetaBeta(Pi0Meta):
             meta_control_alpha=observation.meta_control_alpha,
             reference_actions=observation.reference_actions,
             reference_action_mask=observation.reference_action_mask,
+            contrastive_meta_area_poses=observation.contrastive_meta_area_poses,
+            contrastive_meta_area_dim_masks=observation.contrastive_meta_area_dim_masks,
+            contrastive_meta_area_types=observation.contrastive_meta_area_types,
+            contrastive_meta_area_masks=observation.contrastive_meta_area_masks,
+            contrastive_reference_actions=observation.contrastive_reference_actions,
+            contrastive_reference_action_mask=observation.contrastive_reference_action_mask,
             meta_imagination_alpha=observation.meta_imagination_alpha,
         )
         return self._build_meta_context_tokens(execution_observation)
+
+    def _condition_observation_for_contrastive(
+        self, observation: _model.Observation, *, mode: str
+    ) -> _model.Observation:
+        batch_size = observation.state.shape[0]
+        if mode == "meta":
+            if observation.contrastive_meta_area_masks is None:
+                meta_masks = jnp.zeros((batch_size, self.max_meta_areas), dtype=jnp.bool_)
+            else:
+                meta_masks = observation.contrastive_meta_area_masks
+            ref_mask = jnp.zeros((batch_size,), dtype=jnp.bool_)
+            return dataclasses.replace(
+                observation,
+                meta_area_poses=observation.contrastive_meta_area_poses,
+                meta_area_dim_masks=observation.contrastive_meta_area_dim_masks,
+                meta_area_types=observation.contrastive_meta_area_types,
+                meta_area_masks=meta_masks,
+                reference_actions=None,
+                reference_action_mask=ref_mask,
+            )
+        if mode == "reference":
+            meta_masks = (
+                jnp.zeros((batch_size, self.max_meta_areas), dtype=jnp.bool_)
+                if observation.contrastive_meta_area_masks is None
+                else jnp.zeros_like(observation.contrastive_meta_area_masks)
+            )
+            ref_mask = (
+                jnp.zeros((batch_size,), dtype=jnp.bool_)
+                if observation.contrastive_reference_action_mask is None
+                else observation.contrastive_reference_action_mask.astype(jnp.bool_)
+            )
+            return dataclasses.replace(
+                observation,
+                meta_area_poses=observation.contrastive_meta_area_poses,
+                meta_area_dim_masks=observation.contrastive_meta_area_dim_masks,
+                meta_area_types=observation.contrastive_meta_area_types,
+                meta_area_masks=meta_masks,
+                reference_actions=observation.contrastive_reference_actions,
+                reference_action_mask=ref_mask,
+            )
+        raise ValueError(f"Unknown contrastive condition mode: {mode}")
 
     def _build_condition_prefix(self, obs: _model.Observation) -> _ConditionPrefix:
         condition_images, condition_masks, condition_prompt, condition_prompt_mask = self._require_condition_observation(
@@ -280,6 +328,30 @@ class Pi0MetaBeta(Pi0Meta):
         condition_out = condition_outputs[0] if isinstance(condition_outputs, tuple | list) else condition_outputs
         assert condition_out is not None
         return condition_out[:, condition_prefix.latent_start : condition_prefix.latent_end]
+
+    def _contrastive_latent_loss(self, observation: _model.Observation) -> at.Array:
+        if self.meta_contrastive_loss_weight <= 0.0:
+            return jnp.zeros((observation.state.shape[0],), dtype=observation.state.dtype)
+        if (
+            observation.contrastive_meta_area_masks is None
+            or observation.contrastive_reference_actions is None
+            or observation.contrastive_reference_action_mask is None
+        ):
+            return jnp.zeros((observation.state.shape[0],), dtype=observation.state.dtype)
+
+        meta_obs = self._condition_observation_for_contrastive(observation, mode="meta")
+        ref_obs = self._condition_observation_for_contrastive(observation, mode="reference")
+        meta_latents = self._encode_condition_latents(meta_obs)
+        ref_latents = self._encode_condition_latents(ref_obs)
+        meta_vec = jnp.mean(meta_latents, axis=1)
+        ref_vec = jnp.mean(ref_latents, axis=1)
+        meta_vec = meta_vec / jnp.maximum(jnp.linalg.norm(meta_vec, axis=-1, keepdims=True), 1e-6)
+        ref_vec = ref_vec / jnp.maximum(jnp.linalg.norm(ref_vec, axis=-1, keepdims=True), 1e-6)
+        cosine = jnp.sum(meta_vec * ref_vec, axis=-1)
+        meta_valid = jnp.any(observation.contrastive_meta_area_masks.astype(jnp.bool_), axis=-1)
+        ref_valid = observation.contrastive_reference_action_mask.astype(jnp.bool_)
+        valid = jnp.logical_and(meta_valid, ref_valid)
+        return jnp.where(valid, 1.0 - cosine, 0.0)
 
     def _build_execution_prefix(
         self,
@@ -395,8 +467,15 @@ class Pi0MetaBeta(Pi0Meta):
             meta_control_alpha=observation.meta_control_alpha,
             reference_actions=observation.reference_actions,
             reference_action_mask=observation.reference_action_mask,
+            contrastive_meta_area_poses=observation.contrastive_meta_area_poses,
+            contrastive_meta_area_dim_masks=observation.contrastive_meta_area_dim_masks,
+            contrastive_meta_area_types=observation.contrastive_meta_area_types,
+            contrastive_meta_area_masks=observation.contrastive_meta_area_masks,
+            contrastive_reference_actions=observation.contrastive_reference_actions,
+            contrastive_reference_action_mask=observation.contrastive_reference_action_mask,
             meta_imagination_alpha=observation.meta_imagination_alpha,
         )
+        contrastive_loss = self._contrastive_latent_loss(observation_for_meta)
         condition_latents = self._encode_condition_latents(observation_for_meta)
         beta_prefix = self._build_execution_prefix(observation_for_meta, condition_latents)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation_for_meta, x_t, time)
@@ -479,7 +558,11 @@ class Pi0MetaBeta(Pi0Meta):
         meta_loss = jnp.sum(jnp.square(meta_pred - meta_target) * meta_dim_weights, axis=-1) / meta_dim_denom
         denom = jnp.maximum(jnp.sum(meta_loss_mask, axis=-1), 1)
         meta_loss = jnp.sum(meta_loss * meta_loss_mask, axis=-1) / denom
-        return self.action_loss_weight * base_loss + self.meta_loss_weight * meta_loss
+        return (
+            self.action_loss_weight * base_loss
+            + self.meta_loss_weight * meta_loss
+            + self.meta_contrastive_loss_weight * contrastive_loss[:, None]
+        )
 
     @override
     def sample_actions_with_aux(

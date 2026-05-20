@@ -97,6 +97,14 @@ def test_xtrainer_structured_meta_inputs_use_explicit_12d_meta_and_dim_masks():
         },
         "reference_actions": np.full((50, 14), 0.25, dtype=np.float32),
         "reference_action_mask": np.array(1, dtype=bool),
+        "contrastive_meta_areas": {
+            "pose12d": np.full((2, 12), 9.0, dtype=np.float32),
+            "dim_mask12": dim_mask12,
+            "type": np.array([5, 6], dtype=np.int32),
+            "mask": np.array([True, False], dtype=bool),
+        },
+        "contrastive_reference_actions": np.full((50, 14), 0.5, dtype=np.float32),
+        "contrastive_reference_action_mask": np.array(1, dtype=bool),
     }
 
     out = transform(sample)
@@ -114,6 +122,14 @@ def test_xtrainer_structured_meta_inputs_use_explicit_12d_meta_and_dim_masks():
     np.testing.assert_array_equal(out["execution_meta_areas"], sample["execution_meta_areas"])
     np.testing.assert_array_equal(out["reference_actions"], sample["reference_actions"])
     assert bool(out["reference_action_mask"])
+    np.testing.assert_array_equal(
+        out["contrastive_meta_areas"]["pose12d"], sample["contrastive_meta_areas"]["pose12d"]
+    )
+    np.testing.assert_array_equal(out["contrastive_meta_areas"]["dim_mask12"], dim_mask12)
+    np.testing.assert_array_equal(out["contrastive_meta_areas"]["type"], np.array([5, 6], dtype=np.int32))
+    np.testing.assert_array_equal(out["contrastive_meta_areas"]["mask"], np.array([True, False], dtype=bool))
+    np.testing.assert_array_equal(out["contrastive_reference_actions"], sample["contrastive_reference_actions"])
+    assert bool(out["contrastive_reference_action_mask"])
 
 
 def test_xtrainer_meta_outputs_can_zero_unused_12d_slice():

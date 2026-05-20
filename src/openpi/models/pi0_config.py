@@ -60,6 +60,9 @@ class Pi0Config(_model.BaseModelConfig):
     # Reference-action conditioning only uses the bimanual qpos action prefix.
     # Camera/meta/padding channels are deliberately excluded from the latent path.
     reference_action_dim: int = 14
+    # Optional beta-only alignment between the meta-area-conditioned latent and
+    # reference-action-conditioned latent for the same chunk1/source observation.
+    meta_contrastive_loss_weight: float = 0.0
     # When True, stop gradients from the meta loss from flowing back into the shared
     # backbone (prefix_out / suffix_out). The meta head still receives full gradients
     # through its own new parameters. Recommended while loading from a pre-trained
@@ -238,6 +241,36 @@ class Pi0Config(_model.BaseModelConfig):
                     else None
                 ),
                 reference_action_mask=(
+                    jax.ShapeDtypeStruct([batch_size], jnp.bool_)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                contrastive_meta_area_poses=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, self.meta_area_pose_dim], jnp.float32)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                contrastive_meta_area_dim_masks=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, self.meta_area_pose_dim], jnp.bool_)
+                    if self.meta_model and self.meta_beta_model and self.meta_area_pose_dim == 12
+                    else None
+                ),
+                contrastive_meta_area_types=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.int32)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                contrastive_meta_area_masks=(
+                    jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.bool_)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                contrastive_reference_actions=(
+                    jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.reference_action_dim], jnp.float32)
+                    if self.meta_model and self.meta_beta_model
+                    else None
+                ),
+                contrastive_reference_action_mask=(
                     jax.ShapeDtypeStruct([batch_size], jnp.bool_)
                     if self.meta_model and self.meta_beta_model
                     else None

@@ -161,10 +161,24 @@ Attention is intentionally restricted:
 
 - condition meta attends only to observation and itself;
 - reference action attends only to observation and itself;
-- latent attends to observation, condition meta, reference action, and latent;
+- the selected latent path attends to observation plus the selected condition tokens; meta-area and
+  reference-action conditions are not mixed unless a sample incorrectly enables both selected masks;
 - special attends only to observation, latent, and special;
 - action suffix attends only to observation, latent, and special;
 - execution meta is used for the meta-action head and is not visible to the action suffix.
+
+Beta training can additionally compute a small cosine contrastive loss between the two chunk1
+condition views. For non-obs-only samples, the dataloader keeps `contrastive_meta_areas` and
+`contrastive_reference_actions` from the same chunk1/source sample, including pair-cache and
+imagine chunk-cache samples. The model encodes these as two independent condition passes,
+`condition obs + meta_area -> latent_meta` and `condition obs + reference_actions -> latent_ref`,
+then applies `1 - cosine(mean(latent_meta), mean(latent_ref))`. Only the sampled selected latent is
+injected into chunk2 execution; the contrastive branch is training-only. The weight is controlled by
+`model.meta_contrastive_loss_weight` and defaults to `0.0`; the current beta configs set it to `0.4`.
+Obs-only samples carry zero contrastive masks and do not contribute to this loss. When tuning this
+weight, inspect the unweighted/raw action, meta-action, and contrastive loss magnitudes together; if
+raw contrastive loss is around `0.7-1.2`, `0.4` contributes roughly `0.28-0.48` before any task-loss
+scaling, so reduce it if action or meta-action loss regresses.
 
 Retarget cache supports the same structured fields. For 12D line/surface tools, if `approach3` is
 active, retargeting aligns the shape matrix and approach direction together instead of only

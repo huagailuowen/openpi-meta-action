@@ -163,6 +163,9 @@ def test_beta_pair_dataset_reference_condition_uses_source_actions():
     np.testing.assert_array_equal(sample["reference_actions"], np.ones((4, 14), dtype=np.float32))
     assert bool(sample["reference_action_mask"])
     assert not bool(np.asarray(sample["meta_areas"]["mask"]).reshape(-1)[0])
+    np.testing.assert_array_equal(sample["contrastive_reference_actions"], np.ones((4, 14), dtype=np.float32))
+    assert bool(sample["contrastive_reference_action_mask"])
+    assert bool(np.asarray(sample["contrastive_meta_areas"]["mask"]).reshape(-1)[0])
 
 
 def test_beta_reference_actions_are_delta_relative_to_condition_state():
@@ -326,6 +329,8 @@ def test_beta_pair_dataset_meta_and_obs_conditions():
     assert not bool(obs_sample["meta_areas"]["mask"][0])
     assert bool(obs_sample["execution_meta_areas"]["mask"][0])
     assert not bool(obs_sample["reference_action_mask"])
+    assert not bool(obs_sample["contrastive_reference_action_mask"])
+    assert not bool(obs_sample["contrastive_meta_areas"]["mask"][0])
     assert float(obs_sample["meta_control"]["imagination_alpha"]) == 0.0
 
 

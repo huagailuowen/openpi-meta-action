@@ -136,6 +136,15 @@ class Observation(Generic[ArrayT]):
     # to infer latent tool-operation tokens. It is not a supervised target.
     reference_actions: at.Float[ArrayT, "*b ah ad"] | None = None
     reference_action_mask: at.Bool[ArrayT, "*b"] | None = None
+    # Optional paired condition views used only by beta contrastive training.
+    # They share the chunk1/source observation with reference_actions/meta_areas,
+    # but are not used to decide which latent path is injected into chunk2.
+    contrastive_meta_area_poses: at.Float[ArrayT, "*b m d"] | None = None
+    contrastive_meta_area_dim_masks: at.Bool[ArrayT, "*b m d"] | None = None
+    contrastive_meta_area_types: at.Int[ArrayT, "*b m"] | None = None
+    contrastive_meta_area_masks: at.Bool[ArrayT, "*b m"] | None = None
+    contrastive_reference_actions: at.Float[ArrayT, "*b ah ad"] | None = None
+    contrastive_reference_action_mask: at.Bool[ArrayT, "*b"] | None = None
     # 0 means the supplied meta area is real/origin; 1 means it is imagined or
     # retargeted. This is only meaningful when meta-area tokens are present.
     meta_imagination_alpha: at.Float[ArrayT, "*b"] | None = None
@@ -215,6 +224,16 @@ class Observation(Generic[ArrayT]):
             meta_control_alpha=data.get("meta_control", {}).get("alpha", data.get("meta_control_alpha")),
             reference_actions=data.get("reference_actions"),
             reference_action_mask=data.get("reference_action_mask"),
+            contrastive_meta_area_poses=(
+                data.get("contrastive_meta_areas", {}).get("pose12d")
+                if "pose12d" in data.get("contrastive_meta_areas", {})
+                else data.get("contrastive_meta_areas", {}).get("pose6d")
+            ),
+            contrastive_meta_area_dim_masks=data.get("contrastive_meta_areas", {}).get("dim_mask12"),
+            contrastive_meta_area_types=data.get("contrastive_meta_areas", {}).get("type"),
+            contrastive_meta_area_masks=data.get("contrastive_meta_areas", {}).get("mask"),
+            contrastive_reference_actions=data.get("contrastive_reference_actions"),
+            contrastive_reference_action_mask=data.get("contrastive_reference_action_mask"),
             meta_imagination_alpha=data.get("meta_control", {}).get(
                 "imagination_alpha", data.get("meta_imagination_alpha")
             ),
@@ -244,6 +263,12 @@ class Observation(Generic[ArrayT]):
         meta_control_alpha = result.pop("meta_control_alpha")
         reference_actions = result.pop("reference_actions")
         reference_action_mask = result.pop("reference_action_mask")
+        contrastive_meta_area_poses = result.pop("contrastive_meta_area_poses")
+        contrastive_meta_area_dim_masks = result.pop("contrastive_meta_area_dim_masks")
+        contrastive_meta_area_types = result.pop("contrastive_meta_area_types")
+        contrastive_meta_area_masks = result.pop("contrastive_meta_area_masks")
+        contrastive_reference_actions = result.pop("contrastive_reference_actions")
+        contrastive_reference_action_mask = result.pop("contrastive_reference_action_mask")
         meta_imagination_alpha = result.pop("meta_imagination_alpha")
         if meta_area_poses is not None or meta_area_types is not None or meta_area_masks is not None:
             pose_key = "pose12d" if getattr(meta_area_poses, "shape", ()) and meta_area_poses.shape[-1] == 12 else "pose6d"
@@ -301,6 +326,28 @@ class Observation(Generic[ArrayT]):
             result["reference_actions"] = reference_actions
         if reference_action_mask is not None:
             result["reference_action_mask"] = reference_action_mask
+        if (
+            contrastive_meta_area_poses is not None
+            or contrastive_meta_area_types is not None
+            or contrastive_meta_area_masks is not None
+        ):
+            pose_key = (
+                "pose12d"
+                if getattr(contrastive_meta_area_poses, "shape", ())
+                and contrastive_meta_area_poses.shape[-1] == 12
+                else "pose6d"
+            )
+            result["contrastive_meta_areas"] = {
+                pose_key: contrastive_meta_area_poses,
+                "type": contrastive_meta_area_types,
+                "mask": contrastive_meta_area_masks,
+            }
+            if contrastive_meta_area_dim_masks is not None:
+                result["contrastive_meta_areas"]["dim_mask12"] = contrastive_meta_area_dim_masks
+        if contrastive_reference_actions is not None:
+            result["contrastive_reference_actions"] = contrastive_reference_actions
+        if contrastive_reference_action_mask is not None:
+            result["contrastive_reference_action_mask"] = contrastive_reference_action_mask
         return result
 
 
@@ -428,6 +475,12 @@ def preprocess_observation(
         meta_control_alpha=observation.meta_control_alpha,
         reference_actions=observation.reference_actions,
         reference_action_mask=observation.reference_action_mask,
+        contrastive_meta_area_poses=observation.contrastive_meta_area_poses,
+        contrastive_meta_area_dim_masks=observation.contrastive_meta_area_dim_masks,
+        contrastive_meta_area_types=observation.contrastive_meta_area_types,
+        contrastive_meta_area_masks=observation.contrastive_meta_area_masks,
+        contrastive_reference_actions=observation.contrastive_reference_actions,
+        contrastive_reference_action_mask=observation.contrastive_reference_action_mask,
         meta_imagination_alpha=observation.meta_imagination_alpha,
     )
 

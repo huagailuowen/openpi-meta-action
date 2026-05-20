@@ -190,6 +190,52 @@ class XTrainerStructuredMetaInputs(transforms.DataTransformFn):
             "meta_areas": meta_areas_out,
         }
 
+        contrastive_meta_areas = data.get("contrastive_meta_areas")
+        if contrastive_meta_areas is not None:
+            contrastive_key = "pose12d" if meta_dim == 12 and "pose12d" in contrastive_meta_areas else "pose6d"
+            if contrastive_key not in contrastive_meta_areas:
+                raise KeyError(
+                    f"contrastive_meta_areas must contain {contrastive_key}, plus type/mask, when provided."
+                )
+            contrastive_poses_in = np.asarray(contrastive_meta_areas[contrastive_key], dtype=np.float32)
+            if contrastive_poses_in.shape[-1] != meta_dim:
+                raise ValueError(
+                    f"Expected contrastive_meta_areas.{contrastive_key} last dim {meta_dim}, "
+                    f"got {contrastive_poses_in.shape}"
+                )
+            contrastive_types_in = np.asarray(contrastive_meta_areas["type"], dtype=np.int32)
+            contrastive_masks_in = np.asarray(contrastive_meta_areas["mask"], dtype=bool)
+            if contrastive_key == "pose12d":
+                raw_contrastive_dim_masks = contrastive_meta_areas.get("dim_mask12")
+                contrastive_dim_masks_in = (
+                    np.asarray(raw_contrastive_dim_masks, dtype=bool)
+                    if raw_contrastive_dim_masks is not None
+                    else np.ones(contrastive_poses_in.shape, dtype=bool)
+                )
+            else:
+                contrastive_dim_masks_in = np.ones(contrastive_poses_in.shape, dtype=bool)
+            if contrastive_types_in.ndim > 1 and contrastive_types_in.shape[-1] == 1:
+                contrastive_types_in = np.squeeze(contrastive_types_in, axis=-1)
+            if contrastive_masks_in.ndim > 1 and contrastive_masks_in.shape[-1] == 1:
+                contrastive_masks_in = np.squeeze(contrastive_masks_in, axis=-1)
+
+            contrastive_poses = np.zeros((self.max_meta_areas, meta_dim), dtype=np.float32)
+            contrastive_dim_masks = np.zeros((self.max_meta_areas, meta_dim), dtype=bool)
+            contrastive_types = np.full((self.max_meta_areas,), _DEFAULT_META_TYPE_LINE, dtype=np.int32)
+            contrastive_masks = np.zeros((self.max_meta_areas,), dtype=bool)
+            contrastive_count = min(self.max_meta_areas, contrastive_poses_in.shape[0])
+            contrastive_poses[:contrastive_count] = contrastive_poses_in[:contrastive_count]
+            contrastive_dim_masks[:contrastive_count] = contrastive_dim_masks_in[:contrastive_count]
+            contrastive_types[:contrastive_count] = contrastive_types_in[:contrastive_count]
+            contrastive_masks[:contrastive_count] = contrastive_masks_in[:contrastive_count]
+            inputs["contrastive_meta_areas"] = {
+                contrastive_key: contrastive_poses,
+                "type": contrastive_types,
+                "mask": contrastive_masks,
+            }
+            if contrastive_key == "pose12d":
+                inputs["contrastive_meta_areas"]["dim_mask12"] = contrastive_dim_masks
+
         meta_targets = data.get("meta_action_targets")
         if meta_targets is not None:
             target_key = "pose12d" if meta_dim == 12 and "pose12d" in meta_targets else "pose6d"
@@ -285,7 +331,14 @@ class XTrainerStructuredMetaInputs(transforms.DataTransformFn):
                 condition_state[14:20] = 0.0
             inputs["condition_state"] = condition_state
 
-        for key in ("execution_meta_areas", "meta_control", "reference_actions", "reference_action_mask"):
+        for key in (
+            "execution_meta_areas",
+            "meta_control",
+            "reference_actions",
+            "reference_action_mask",
+            "contrastive_reference_actions",
+            "contrastive_reference_action_mask",
+        ):
             if key in data:
                 inputs[key] = data[key]
         for key in ("tool_instance_hash", "source_type_id", "episode_index"):

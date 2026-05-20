@@ -228,7 +228,7 @@ class RetargetCacheDataset(Dataset[T_co]):
 
 def _clone_sample(sample: dict[str, typing.Any]) -> dict[str, typing.Any]:
     out: dict[str, typing.Any] = dict(sample)
-    for key in ("meta_areas", "execution_meta_areas", "meta_action_targets", "meta_control"):
+    for key in ("meta_areas", "execution_meta_areas", "contrastive_meta_areas", "meta_action_targets", "meta_control"):
         if isinstance(out.get(key), dict):
             out[key] = dict(out[key])
     return out
@@ -1065,6 +1065,8 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             self._apply_reference_action_condition(out, source_sample)
         else:
             self._apply_obs_only_condition(out, source_sample)
+        if condition_id in (0, 1):
+            self._apply_contrastive_condition_fields(out, source_sample)
         self._set_meta_imagination_alpha(out, retarget_applied=bool(beta_debug.get("retarget_applied", False)))
         self._ensure_optional_beta_fields(out)
         out["_beta_debug"] = self._stable_beta_debug(beta_debug, condition_id=condition_id)
@@ -1594,6 +1596,17 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         self._drop_meta_tokens(out)
 
     @staticmethod
+    def _apply_contrastive_condition_fields(out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
+        meta_areas = source_sample.get("meta_areas")
+        if isinstance(meta_areas, dict):
+            out["contrastive_meta_areas"] = _copy_meta_areas(dict(meta_areas))
+        if "actions" in source_sample:
+            out["contrastive_reference_actions"] = np.asarray(source_sample["actions"], dtype=np.float32)[
+                ..., :_BETA_REFERENCE_ACTION_DIM
+            ].copy()
+            out["contrastive_reference_action_mask"] = np.asarray(1, dtype=bool)
+
+    @staticmethod
     def _apply_condition_observation(out: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> None:
         if "image" in source_sample:
             out["condition_image"] = _copy_image_dict(dict(source_sample["image"]))
@@ -1623,6 +1636,19 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             actions = np.asarray(out["actions"], dtype=np.float32)
             out["reference_actions"] = np.zeros((*actions.shape[:-1], _BETA_REFERENCE_ACTION_DIM), dtype=np.float32)
         out.setdefault("reference_action_mask", np.asarray(0, dtype=bool))
+        if "contrastive_reference_actions" not in out:
+            actions = np.asarray(out["actions"], dtype=np.float32)
+            out["contrastive_reference_actions"] = np.zeros(
+                (*actions.shape[:-1], _BETA_REFERENCE_ACTION_DIM), dtype=np.float32
+            )
+        out.setdefault("contrastive_reference_action_mask", np.asarray(0, dtype=bool))
+        if "contrastive_meta_areas" not in out and isinstance(out.get("meta_areas"), dict):
+            contrastive_meta_areas = _copy_meta_areas(dict(out["meta_areas"]))
+            if "mask" in contrastive_meta_areas:
+                contrastive_meta_areas["mask"] = np.zeros_like(
+                    np.asarray(contrastive_meta_areas["mask"], dtype=bool)
+                )
+            out["contrastive_meta_areas"] = contrastive_meta_areas
         out.setdefault("meta_control", {"imagination_alpha": np.asarray(0.0, dtype=np.float32)})
 
     def _stable_beta_debug(self, debug: dict[str, typing.Any], *, condition_id: int) -> dict[str, np.ndarray]:

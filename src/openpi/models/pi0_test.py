@@ -114,6 +114,10 @@ def test_pi05_meta_beta_inputs_spec_contains_execution_meta_and_reference():
     assert observation_spec.execution_meta_area_dim_masks is not None
     assert observation_spec.reference_actions is not None
     assert observation_spec.reference_actions.shape[1:] == (50, 14)
+    assert observation_spec.contrastive_meta_area_poses is not None
+    assert observation_spec.contrastive_meta_area_poses.shape[-1] == 12
+    assert observation_spec.contrastive_reference_actions is not None
+    assert observation_spec.contrastive_reference_actions.shape[1:] == (50, 14)
     assert observation_spec.meta_imagination_alpha is not None
 
 
@@ -155,6 +159,12 @@ def test_preprocess_observation_preserves_beta_fields():
         execution_meta_area_masks=jnp.ones((1, 1), dtype=jnp.bool_),
         reference_actions=jnp.ones((1, 50, 14), dtype=jnp.float32),
         reference_action_mask=jnp.ones((1,), dtype=jnp.bool_),
+        contrastive_meta_area_poses=jnp.ones((1, 1, 12), dtype=jnp.float32) * 2.0,
+        contrastive_meta_area_dim_masks=jnp.ones((1, 1, 12), dtype=jnp.bool_),
+        contrastive_meta_area_types=jnp.ones((1, 1), dtype=jnp.int32),
+        contrastive_meta_area_masks=jnp.ones((1, 1), dtype=jnp.bool_),
+        contrastive_reference_actions=jnp.ones((1, 50, 14), dtype=jnp.float32) * 3.0,
+        contrastive_reference_action_mask=jnp.ones((1,), dtype=jnp.bool_),
         meta_imagination_alpha=jnp.asarray([0.5], dtype=jnp.float32),
     )
     out = _model.preprocess_observation(None, obs, train=False)
@@ -168,6 +178,10 @@ def test_preprocess_observation_preserves_beta_fields():
     assert out.condition_tokenized_prompt_mask is not None
     assert out.execution_meta_area_poses is not None
     assert jnp.all(out.execution_meta_area_poses == 1.0)
+    assert out.contrastive_meta_area_poses is not None
+    assert jnp.all(out.contrastive_meta_area_poses == 2.0)
+    assert out.contrastive_reference_actions is not None
+    assert jnp.all(out.contrastive_reference_actions == 3.0)
 
 
 def _make_dummy_beta_config() -> _pi0_config.Pi0Config:
