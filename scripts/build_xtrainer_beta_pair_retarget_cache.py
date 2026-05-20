@@ -177,6 +177,13 @@ def main(
         raise ValueError("--variants-per-target must be >= 1")
     if num_workers < 1:
         raise ValueError("--num-workers must be >= 1")
+    if same_tool_only:
+        raise ValueError(
+            "Same-tool beta pair cache generation is disabled. Default same-tool beta retarget-conditioned "
+            "training samples same-tool imagine chunks from data.meta_retarget_cache_dir. Rebuild the "
+            "chunk-level retarget cache instead, or pass --no-same-tool-only only for explicit cross-tool "
+            "pair-retarget ablations."
+        )
 
     cache_dir = pathlib.Path(output_dir).expanduser().resolve()
     if overwrite and cache_dir.exists():

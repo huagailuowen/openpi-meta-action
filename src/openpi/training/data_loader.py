@@ -909,9 +909,20 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             RetargetCacheDataset._load_manifest(self._cache_dir) if self._cache_dir is not None else {}
         )
         self._chunk_cache_records = [record for records in self._records_by_index.values() for record in records]
+        self._chunk_cache_records_by_tool = self._build_chunk_cache_records_by_tool()
         self._imagine_cache_condition_prob = float(
             np.clip(data_config.meta_beta_imagine_cache_condition_prob, 0.0, 1.0)
         )
+        if (
+            self._pair_retarget_same_tool_only
+            and data_config.meta_beta_retarget_conditioned_prob > 0.0
+            and not self._chunk_cache_records_by_tool
+        ):
+            raise ValueError(
+                "Beta same-tool retarget-conditioned training requires a chunk-level retarget cache with "
+                "tool_instance_hash metadata. Build meta_retarget_cache_dir first, or set "
+                "meta_beta_retarget_conditioned_prob=0 for non-retarget beta training."
+            )
         if self._cache_dir is not None:
             RetargetCacheDataset._warn_if_metadata_mismatch(
                 self._cache_dir,
@@ -933,7 +944,9 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 expected_retarget_algorithm=data_config.meta_retarget_algorithm,
             )
         self._pair_cache_rng = np.random.default_rng(data_config.meta_beta_pair_cache_seed)
-        self._online_async_enabled = bool(data_config.meta_beta_online_async_enabled)
+        # Default same-tool beta retarget no longer uses pair-retarget producers:
+        # relation-3 samples are drawn directly from the chunk-level imagine cache.
+        self._online_async_enabled = bool(data_config.meta_beta_online_async_enabled) and not self._pair_retarget_same_tool_only
         self._online_num_workers = max(1, int(data_config.meta_beta_online_num_workers))
         self._online_queue_size = max(0, int(data_config.meta_beta_online_queue_size))
         self._online_max_pending = (
@@ -1030,17 +1043,16 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         beta_debug: dict[str, typing.Any] = {"relation_id": relation_id, "retarget_applied": False}
         if relation_id == 3:
             requested_condition_id = int(self._rng.choice(3, p=self._retarget_condition_probs))
-            chunk_cache_result = None
-            if (
-                requested_condition_id == 0
-                and self._imagine_cache_condition_prob > 0.0
-                and self._chunk_cache_records
-                and self._rng.random() < self._imagine_cache_condition_prob
-            ):
-                chunk_cache_result = self._sample_global_chunk_retarget_cache()
-            if chunk_cache_result is not None:
+            if self._pair_retarget_same_tool_only:
+                chunk_cache_result = self._sample_same_tool_chunk_retarget_cache(base_index, target_sample)
+                if chunk_cache_result is None:
+                    raise RuntimeError(
+                        "Failed to sample same-tool imagine retarget chunk cache for beta retarget-conditioned "
+                        f"sample index={base_index}. Rebuild the chunk-level retarget cache so every beta tool "
+                        "has accepted imagine variants."
+                    )
                 target_sample, source_sample, beta_debug = chunk_cache_result
-                condition_id = 0
+                condition_id = requested_condition_id
             else:
                 source_sample = self._sample_source(base_index, target_sample, relation_id)
                 target_sample, source_sample, beta_debug = self._maybe_apply_pair_retarget_with_retries(
@@ -1050,17 +1062,16 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 )
                 if bool(beta_debug.get("retarget_applied", False)):
                     condition_id = requested_condition_id
-            if not bool(beta_debug.get("retarget_applied", False)):
-                # Only fall back after exhausting fresh random target/source
-                # attempts. This prevents failed/dismissed pairs from becoming
-                # cross-tool non-retarget samples while avoiding an infinite loop.
-                target_sample = origin_sample
-                source_sample = origin_sample
-                relation_id = 0
-                beta_debug = {
-                    **beta_debug,
-                    "relation_id": relation_id,
-                }
+                else:
+                    # Cross-tool ablations may still fail IK. They fall back to
+                    # self-decode, but the default same-tool path above is cache-only.
+                    target_sample = origin_sample
+                    source_sample = origin_sample
+                    relation_id = 0
+                    beta_debug = {
+                        **beta_debug,
+                        "relation_id": relation_id,
+                    }
         else:
             source_sample = self._sample_source(base_index, target_sample, relation_id)
 
@@ -1398,6 +1409,8 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         return True
 
     def _sample_pair_retarget_indices(self) -> tuple[int, int] | None:
+        if self._pair_retarget_same_tool_only:
+            return None
         dataset_len = len(self._dataset)
         if dataset_len <= 1:
             return None
@@ -1553,14 +1566,38 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         self._stats_cache_miss += 1
         return None
 
-    def _sample_global_chunk_retarget_cache(
+    def _build_chunk_cache_records_by_tool(self) -> dict[int, list[dict[str, typing.Any]]]:
+        if self._sampling_metadata is None:
+            return {}
+        records_by_tool: dict[int, list[dict[str, typing.Any]]] = {}
+        for base_index, records in self._records_by_index.items():
+            if not (0 <= base_index < len(self._sampling_metadata.tool_instance_hash)):
+                continue
+            tool = int(self._sampling_metadata.tool_instance_hash[base_index])
+            if tool < 0:
+                continue
+            records_by_tool.setdefault(tool, []).extend(records)
+        return records_by_tool
+
+    def _sample_same_tool_chunk_retarget_cache(
         self,
+        target_index: int,
+        target_sample: dict[str, typing.Any],
     ) -> tuple[dict[str, typing.Any], dict[str, typing.Any], dict[str, typing.Any]] | None:
-        if self._cache_dir is None or not self._chunk_cache_records:
+        if self._cache_dir is None or not self._chunk_cache_records_by_tool:
             self._stats_cache_miss += 1
             return None
-        for _ in range(8):
-            record = self._chunk_cache_records[int(self._rng.integers(len(self._chunk_cache_records)))]
+        target_tool = (
+            int(self._sampling_metadata.tool_instance_hash[target_index])
+            if self._sampling_metadata is not None and 0 <= target_index < len(self._sampling_metadata.tool_instance_hash)
+            else _scalar_int(target_sample.get("tool_instance_hash"), default=-1)
+        )
+        records = self._chunk_cache_records_by_tool.get(target_tool, [])
+        if not records:
+            self._stats_cache_miss += 1
+            return None
+        for _ in range(16):
+            record = records[int(self._rng.integers(len(records)))]
             base_index = int(record["base_index"])
             if not (0 <= base_index < len(self._dataset)):
                 logging.warning(
@@ -1580,6 +1617,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             debug["retarget_source"] = "chunk_cache"
             debug["target_index"] = base_index
             debug["source_index"] = base_index
+            debug["requested_target_index"] = int(target_index)
             self._stats_cache_hit += 1
             return retargeted_sample, retargeted_sample, debug
         self._stats_cache_miss += 1
