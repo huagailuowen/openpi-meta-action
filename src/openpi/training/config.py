@@ -109,6 +109,7 @@ class DataConfig:
     meta_retarget_cache_dir: str | None = None
     meta_retarget_cache_prob: float = 0.0
     meta_retarget_cache_seed: int = 0
+    meta_retarget_algorithm: str = "legacy_structured_min_rotation"
 
     # Optional alpha-controlled structured-meta training wrapper. Existing
     # configs keep this disabled and continue using meta_retarget_cache_prob.
@@ -437,6 +438,7 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
     meta_retarget_cache_dir: str | None = None
     meta_retarget_cache_prob: float = 0.5
     meta_retarget_cache_seed: int = 0
+    meta_retarget_algorithm: str = "legacy_structured_min_rotation"
     meta_alpha_enabled: bool = False
     meta_alpha_seed: int = 0
     meta_alpha_original_prob: float = 0.8
@@ -548,6 +550,7 @@ class LeRobotXTrainerMetaDataConfig(DataConfigFactory):
             meta_retarget_cache_dir=self.meta_retarget_cache_dir,
             meta_retarget_cache_prob=self.meta_retarget_cache_prob,
             meta_retarget_cache_seed=self.meta_retarget_cache_seed,
+            meta_retarget_algorithm=self.meta_retarget_algorithm,
             meta_alpha_enabled=self.meta_alpha_enabled,
             meta_alpha_seed=self.meta_alpha_seed,
             meta_alpha_original_prob=self.meta_alpha_original_prob,
@@ -623,6 +626,7 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
     meta_retarget_cache_dir: str | None = None
     meta_retarget_cache_prob: float = 0.5
     meta_retarget_cache_seed: int = 0
+    meta_retarget_algorithm: str = "legacy_structured_min_rotation"
     meta_alpha_enabled: bool = False
     meta_alpha_seed: int = 0
     meta_alpha_original_prob: float = 0.8
@@ -792,6 +796,7 @@ class LeRobotXTrainerStructuredMetaDataConfig(DataConfigFactory):
             meta_retarget_cache_dir=self.meta_retarget_cache_dir,
             meta_retarget_cache_prob=self.meta_retarget_cache_prob,
             meta_retarget_cache_seed=self.meta_retarget_cache_seed,
+            meta_retarget_algorithm=self.meta_retarget_algorithm,
             meta_alpha_enabled=self.meta_alpha_enabled,
             meta_alpha_seed=self.meta_alpha_seed,
             meta_alpha_original_prob=self.meta_alpha_original_prob,

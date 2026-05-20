@@ -317,6 +317,7 @@ def main(
     accept_max_step_joint_delta_rad: float = 0.35,
     accept_max_abs_action_value: float = 1e4,
     accept_max_camera_rotvec_norm_rad: float = 3.143,
+    retarget_algorithm: str | None = None,
     sample_retarget_scale: bool = False,
     retarget_scale_min: float = 0.7,
     retarget_scale_max: float = 1.0,
@@ -361,6 +362,12 @@ def main(
         meta_alpha_enabled=False,
         meta_beta_enabled=False,
     )
+    effective_retarget_algorithm = retarget_algorithm or data_config.meta_retarget_algorithm
+    if effective_retarget_algorithm not in _retarget.SUPPORTED_RETARGET_ALGORITHMS:
+        raise ValueError(
+            f"--retarget-algorithm must be one of {sorted(_retarget.SUPPORTED_RETARGET_ALGORITHMS)}, "
+            f"got {effective_retarget_algorithm!r}"
+        )
 
     action_horizon = data_config.data_action_horizon_override or train_config.model.action_horizon
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, train_config.model)
@@ -370,6 +377,7 @@ def main(
     delta_action_masks_json = [mask.astype(bool).tolist() for mask in delta_action_masks]
 
     generator_config = _retarget.MetaRetargetGeneratorConfig(
+        retarget_algorithm=effective_retarget_algorithm,
         position_noise_max_m=position_noise_max_m,
         direction_noise_max_deg=direction_noise_max_deg,
         future_near_mode_prob=future_near_mode_prob,
@@ -408,6 +416,7 @@ def main(
         "model_action_horizon": train_config.model.action_horizon,
         "action_stride": action_stride,
         "cache_action_space": "delta" if delta_action_masks else "absolute",
+        "retarget_algorithm": effective_retarget_algorithm,
         "delta_action_masks": delta_action_masks_json,
         "retarget_mode_sampling": "per_variant_fixed_before_retries",
         "sample_retarget_scale": sample_retarget_scale,

@@ -98,13 +98,18 @@ class RetargetCacheDataset(Dataset[T_co]):
         sample_prob: float,
         seed: int,
         expected_action_space: str,
+        expected_retarget_algorithm: str,
     ):
         self._dataset = dataset
         self._cache_dir = pathlib.Path(cache_dir).expanduser()
         self._sample_prob = float(sample_prob)
         self._rng = np.random.default_rng(seed)
         self._records_by_index = self._load_manifest(self._cache_dir)
-        self._warn_if_action_space_mismatch(self._cache_dir, expected_action_space)
+        self._warn_if_metadata_mismatch(
+            self._cache_dir,
+            expected_action_space=expected_action_space,
+            expected_retarget_algorithm=expected_retarget_algorithm,
+        )
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
         sample = self._dataset[index]
@@ -157,7 +162,12 @@ class RetargetCacheDataset(Dataset[T_co]):
         return records_by_index
 
     @staticmethod
-    def _warn_if_action_space_mismatch(cache_dir: pathlib.Path, expected_action_space: str) -> None:
+    def _warn_if_metadata_mismatch(
+        cache_dir: pathlib.Path,
+        *,
+        expected_action_space: str,
+        expected_retarget_algorithm: str | None = None,
+    ) -> None:
         metadata_path = cache_dir / "metadata.json"
         if not metadata_path.exists():
             if expected_action_space == "delta":
@@ -167,6 +177,15 @@ class RetargetCacheDataset(Dataset[T_co]):
                     metadata_path,
                 )
             return
+
+        def _metadata_retarget_algorithm(metadata: dict[str, typing.Any]) -> str | None:
+            value = metadata.get("retarget_algorithm")
+            if value is not None:
+                return str(value)
+            generator_config = metadata.get("generator_config")
+            if isinstance(generator_config, dict) and generator_config.get("retarget_algorithm") is not None:
+                return str(generator_config["retarget_algorithm"])
+            return None
 
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -182,14 +201,29 @@ class RetargetCacheDataset(Dataset[T_co]):
                     "to avoid mixing absolute actions into a delta training pipeline.",
                     metadata_path,
                 )
-            return
-
-        if actual_action_space != expected_action_space:
+        elif actual_action_space != expected_action_space:
             logging.warning(
                 "Retarget cache action space mismatch: cache has %s actions but this data config expects %s actions.",
                 actual_action_space,
                 expected_action_space,
             )
+        actual_algorithm = _metadata_retarget_algorithm(metadata)
+        if expected_retarget_algorithm is not None and actual_algorithm != expected_retarget_algorithm:
+            logging.warning(
+                "Retarget cache algorithm mismatch for %s: cache has %s but this data config expects %s. "
+                "The cache will still be used; rebuild it if strict algorithm consistency is required.",
+                cache_dir,
+                actual_algorithm,
+                expected_retarget_algorithm,
+            )
+
+    @staticmethod
+    def _warn_if_action_space_mismatch(cache_dir: pathlib.Path, expected_action_space: str) -> None:
+        RetargetCacheDataset._warn_if_metadata_mismatch(
+            cache_dir,
+            expected_action_space=expected_action_space,
+            expected_retarget_algorithm=None,
+        )
 
 
 def _clone_sample(sample: dict[str, typing.Any]) -> dict[str, typing.Any]:
@@ -261,7 +295,11 @@ class AlphaMetaRetargetDataset(Dataset[T_co]):
             RetargetCacheDataset._load_manifest(self._cache_dir) if self._cache_dir is not None else {}
         )
         if self._cache_dir is not None:
-            RetargetCacheDataset._warn_if_action_space_mismatch(self._cache_dir, expected_action_space)
+            RetargetCacheDataset._warn_if_metadata_mismatch(
+                self._cache_dir,
+                expected_action_space=expected_action_space,
+                expected_retarget_algorithm=data_config.meta_retarget_algorithm,
+            )
         self._delta_action_masks = [np.asarray(mask, dtype=bool) for mask in delta_action_masks]
         self._original_prob = float(np.clip(data_config.meta_alpha_original_prob, 0.0, 1.0))
         self._sigmoid_k = float(data_config.meta_alpha_sigmoid_k)
@@ -720,12 +758,13 @@ def _beta_online_retarget_process_loop(
     result_queue: typing.Any,
     dataset: Dataset,
     delta_action_masks: Sequence[np.ndarray],
+    retarget_config_dict: dict[str, typing.Any],
     worker_id: int,
 ) -> None:
     """Generate beta pair-retarget payloads in a dedicated CPU worker process."""
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
     os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
-    retarget_config = _meta_retarget.MetaRetargetGeneratorConfig()
+    retarget_config = _meta_retarget.MetaRetargetGeneratorConfig(**retarget_config_dict)
     while True:
         job = request_queue.get()
         if job is None:
@@ -863,7 +902,9 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         self._sampling_metadata = _build_beta_sampling_metadata(dataset)
         if self._sampling_metadata is None:
             logging.warning("Beta same-tool sampling metadata unavailable; falling back to dataset probing.")
-        self._retarget_config = _meta_retarget.MetaRetargetGeneratorConfig()
+        self._retarget_config = _meta_retarget.MetaRetargetGeneratorConfig(
+            retarget_algorithm=data_config.meta_retarget_algorithm,
+        )
         self._records_by_index = (
             RetargetCacheDataset._load_manifest(self._cache_dir) if self._cache_dir is not None else {}
         )
@@ -872,7 +913,11 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             np.clip(data_config.meta_beta_imagine_cache_condition_prob, 0.0, 1.0)
         )
         if self._cache_dir is not None:
-            RetargetCacheDataset._warn_if_action_space_mismatch(self._cache_dir, expected_action_space)
+            RetargetCacheDataset._warn_if_metadata_mismatch(
+                self._cache_dir,
+                expected_action_space=expected_action_space,
+                expected_retarget_algorithm=data_config.meta_retarget_algorithm,
+            )
         self._pair_cache_dir = (
             pathlib.Path(data_config.meta_beta_pair_cache_dir).expanduser()
             if data_config.meta_beta_pair_cache_dir
@@ -882,7 +927,11 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             _load_beta_pair_cache_manifest(self._pair_cache_dir) if self._pair_cache_dir is not None else []
         )
         if self._pair_cache_dir is not None:
-            RetargetCacheDataset._warn_if_action_space_mismatch(self._pair_cache_dir, expected_action_space)
+            RetargetCacheDataset._warn_if_metadata_mismatch(
+                self._pair_cache_dir,
+                expected_action_space=expected_action_space,
+                expected_retarget_algorithm=data_config.meta_retarget_algorithm,
+            )
         self._pair_cache_rng = np.random.default_rng(data_config.meta_beta_pair_cache_seed)
         self._online_async_enabled = bool(data_config.meta_beta_online_async_enabled)
         self._online_num_workers = max(1, int(data_config.meta_beta_online_num_workers))
@@ -1062,6 +1111,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                     self._online_result_queue,
                     self._dataset,
                     delta_action_masks,
+                    self._retarget_config.to_json_dict(),
                     worker_id,
                 ),
                 daemon=True,
@@ -1704,6 +1754,7 @@ def maybe_wrap_retarget_cache_dataset(dataset: Dataset, data_config: _config.Dat
         sample_prob=data_config.meta_retarget_cache_prob,
         seed=data_config.meta_retarget_cache_seed,
         expected_action_space=_expected_retarget_cache_action_space(data_config),
+        expected_retarget_algorithm=data_config.meta_retarget_algorithm,
     )
 
 

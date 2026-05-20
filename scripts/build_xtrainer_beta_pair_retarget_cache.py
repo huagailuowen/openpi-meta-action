@@ -166,6 +166,7 @@ def main(
     accept_max_step_joint_delta_rad: float = 0.35,
     accept_max_abs_action_value: float = 1e4,
     accept_max_camera_rotvec_norm_rad: float = 3.143,
+    retarget_algorithm: str | None = None,
     same_tool_only: bool = True,
 ) -> None:
     """Build a reusable pair-retarget cache for one beta OpenPI training config."""
@@ -199,6 +200,12 @@ def main(
         meta_beta_pair_cache_dir=None,
         meta_beta_online_async_enabled=False,
     )
+    effective_retarget_algorithm = retarget_algorithm or data_config.meta_retarget_algorithm
+    if effective_retarget_algorithm not in _retarget.SUPPORTED_RETARGET_ALGORITHMS:
+        raise ValueError(
+            f"--retarget-algorithm must be one of {sorted(_retarget.SUPPORTED_RETARGET_ALGORITHMS)}, "
+            f"got {effective_retarget_algorithm!r}"
+        )
 
     action_horizon = data_config.data_action_horizon_override or train_config.model.action_horizon
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, train_config.model)
@@ -209,6 +216,7 @@ def main(
     delta_action_masks_json = [mask.astype(bool).tolist() for mask in delta_action_masks]
 
     generator_config = _retarget.MetaRetargetGeneratorConfig(
+        retarget_algorithm=effective_retarget_algorithm,
         future_near_mode_prob=future_near_mode_prob,
         future_near_window_frames=future_near_window_frames,
         future_near_transition_steps=future_near_transition_steps,
@@ -243,6 +251,7 @@ def main(
         "model_action_horizon": train_config.model.action_horizon,
         "action_stride": action_stride,
         "cache_action_space": "delta" if delta_action_masks else "absolute",
+        "retarget_algorithm": effective_retarget_algorithm,
         "delta_action_masks": delta_action_masks_json,
         "max_meta_areas": max_meta_areas,
         "same_tool_only": bool(same_tool_only),

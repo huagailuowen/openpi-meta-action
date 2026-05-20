@@ -601,9 +601,10 @@ Useful flags:
 | `--correction-forward-exclusion-angle-deg` | `70.0` | Reject correction offsets inside this forward cone around the fitted local motion direction |
 | `--correction-min-position-offset-m` | `0.02` | Correction mode requires this much position offset unless direction offset is large enough |
 | `--correction-min-direction-offset-deg` | `13.0` | Correction mode requires this much direction offset unless position offset is large enough |
-| `--approach-joint-step-rad` | `0.02` | Dynamic approach length is `ceil(max(|Δq_right|) / this)` |
+| `--approach-joint-step-rad` | `0.03` | Dynamic approach length is `ceil(max(|Δq_right|) / this)` |
 | `--accept-max-camera-rotvec-norm-rad` | `3.143` | Reject cached variants whose recomputed camera rotvec is outside the canonical near-π range |
 | `--accept-max-abs-action-value` | `1e4` | Reject catastrophic non-camera action values before cache write |
+| `--retarget-algorithm` | config `data.meta_retarget_algorithm` | Retarget planner: `legacy_structured_min_rotation` or `wrist_pose_v2` |
 
 The builder writes accepted retargeted chunks to `variants/` and records them in `manifest.jsonl`.
 If IK or validation fails, it retries random perturbations up to `--max-attempts-per-variant`; failed
@@ -611,6 +612,19 @@ records go to `failures.jsonl` and are not sampled during training. Validation a
 non-finite or clearly out-of-range retarget actions; camera rotvecs are recomputed with a
 near-180-degree-stable SO(3) conversion and are bounded by
 `--accept-max-camera-rotvec-norm-rad` before cache write.
+
+`data.meta_retarget_algorithm` controls the planner used by chunk-cache generation, beta pair-cache
+generation, and training-time online/sync beta pair retargeting. The default
+`legacy_structured_min_rotation` keeps the pre-alpha/beta structured retarget behavior: correction
+first aligns to the original trajectory start, future-near follows the old smooth shifted-trajectory
+decay, and IK directly minimizes the meta feature residual. The only intentional legacy fix is 12D
+shape sign handling: shape axes remain undirected, so when shape and approach can both be aligned,
+the planner chooses the lower-angle rotation instead of an arbitrary near-180-degree equivalent.
+Use `--retarget-algorithm wrist_pose_v2` or `--overrides data.meta_retarget_algorithm=wrist_pose_v2`
+only for explicit new-planner ablations. Cache metadata records the algorithm; training warns, but
+does not reject, if a configured algorithm differs from an existing cache. Caches generated before
+this switch do not contain a `retarget_algorithm` field; they are treated as backward-compatible and
+will also emit only this warning, not a hard error.
 
 Training-time sampling is independent from cache generation. The base `DataConfig` keeps retarget
 disabled by default, so old/non-meta training configs do not use this path. The x-trainer
@@ -688,6 +702,10 @@ python scripts/build_xtrainer_beta_pair_retarget_cache.py \
     --num-workers 8 \
     --max-attempts-per-pair 4
 ```
+
+The beta pair-cache builder uses the same `data.meta_retarget_algorithm` default as training. Rebuild
+both chunk and beta pair caches when switching algorithms if you need distributionally clean
+experiments; mixed caches are allowed but will emit warnings.
 
 Beta training with online producer and cache fallback:
 

@@ -93,6 +93,123 @@ def test_pose12_anchor_offset_rotates_shape_and_approach_together():
     np.testing.assert_allclose(shifted[9:12], new_anchor[9:12], atol=1e-6)
 
 
+def test_legacy_min_rotation_aligns_line_shape_as_undirected_axis():
+    r_small = retarget._rotvec_to_matrix(np.array([0.0, 0.0, np.deg2rad(10.0)], dtype=np.float32))  # noqa: SLF001
+    source = np.zeros(12, dtype=np.float32)
+    source[3:9] = retarget._matrix_to_shape6(np.outer([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]))  # noqa: SLF001
+    source[9:12] = [0.0, 1.0, 0.0]
+    target = np.zeros(12, dtype=np.float32)
+    target_axis = r_small @ np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    target[3:9] = retarget._matrix_to_shape6(np.outer(target_axis, target_axis))  # noqa: SLF001
+    target[9:12] = r_small @ np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    rotation = retarget._legacy_rotation_between_pose12(  # noqa: SLF001
+        "line",
+        source,
+        target,
+        dim_mask12=np.ones(12, dtype=bool),
+        config=retarget.MetaRetargetGeneratorConfig(
+            retarget_algorithm=retarget.RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION
+        ),
+    )
+
+    assert np.rad2deg(np.linalg.norm(retarget._matrix_to_rotvec(rotation))) < 10.1  # noqa: SLF001
+    assert retarget._angle_between_unit_vectors_deg(rotation @ source[9:12], target[9:12]) < 1e-3  # noqa: SLF001
+    assert retarget._shape_angle_deg_for_pose12(  # noqa: SLF001
+        "line",
+        retarget._interpolate_meta_pose_legacy(  # noqa: SLF001
+            "line",
+            source,
+            target,
+            1.0,
+            dim_mask12=np.ones(12, dtype=bool),
+            config=retarget.MetaRetargetGeneratorConfig(),
+        ),
+        target,
+        np.ones(12, dtype=bool),
+    ) < 1e-3
+
+
+def test_legacy_min_rotation_applies_to_surface_normal_axis():
+    r_small = retarget._rotvec_to_matrix(np.array([0.0, 0.0, np.deg2rad(-12.0)], dtype=np.float32))  # noqa: SLF001
+    source = np.zeros(12, dtype=np.float32)
+    source[3:9] = retarget._matrix_to_shape6(retarget._shape_matrix_from_axis("surface", np.array([1.0, 0.0, 0.0])))  # noqa: SLF001
+    source[9:12] = [0.0, 1.0, 0.0]
+    target = np.zeros(12, dtype=np.float32)
+    target_normal = r_small @ np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    target[3:9] = retarget._matrix_to_shape6(retarget._shape_matrix_from_axis("surface", target_normal))  # noqa: SLF001
+    target[9:12] = r_small @ np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+    rotation = retarget._legacy_rotation_between_pose12(  # noqa: SLF001
+        "surface",
+        source,
+        target,
+        dim_mask12=np.ones(12, dtype=bool),
+        config=retarget.MetaRetargetGeneratorConfig(),
+    )
+
+    assert np.rad2deg(np.linalg.norm(retarget._matrix_to_rotvec(rotation))) < 12.1  # noqa: SLF001
+    assert retarget._angle_between_unit_vectors_deg(rotation @ source[9:12], target[9:12]) < 1e-3  # noqa: SLF001
+
+
+def test_legacy_min_rotation_near_parallel_shape_approach_does_not_flip():
+    r_small = retarget._rotvec_to_matrix(np.array([0.0, 0.0, np.deg2rad(20.0)], dtype=np.float32))  # noqa: SLF001
+    source = np.zeros(12, dtype=np.float32)
+    source[3:9] = retarget._matrix_to_shape6(np.outer([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]))  # noqa: SLF001
+    source[9:12] = retarget._normalize(np.array([1.0, 0.01, 0.0], dtype=np.float32))  # noqa: SLF001
+    target = np.zeros(12, dtype=np.float32)
+    target_axis = r_small @ np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    target[3:9] = retarget._matrix_to_shape6(np.outer(target_axis, target_axis))  # noqa: SLF001
+    target[9:12] = retarget._normalize(r_small @ source[9:12])  # noqa: SLF001
+
+    rotation = retarget._legacy_rotation_between_pose12(  # noqa: SLF001
+        "line",
+        source,
+        target,
+        dim_mask12=np.ones(12, dtype=bool),
+        config=retarget.MetaRetargetGeneratorConfig(),
+    )
+
+    assert np.all(np.isfinite(rotation))
+    assert np.rad2deg(np.linalg.norm(retarget._matrix_to_rotvec(rotation))) < 25.0  # noqa: SLF001
+    assert retarget._angle_between_unit_vectors_deg(rotation @ source[9:12], target[9:12]) < 1.0  # noqa: SLF001
+
+
+def test_legacy_future_near_keeps_old_smooth_transition_distinct_from_v2_direct_follow():
+    old_input = np.zeros(12, dtype=np.float32)
+    old_input[3:9] = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    old_targets = np.stack([old_input.copy() for _ in range(5)], axis=0)
+    for i in range(old_targets.shape[0]):
+        old_targets[i, 0] = 0.02 * float(i + 1)
+
+    new_anchor = old_targets[1].copy()
+    new_anchor[1] += 0.006
+    legacy_targets, source_indices = retarget._build_smooth_chase_targets_legacy(  # noqa: SLF001
+        "line",
+        old_targets,
+        old_anchor_pose=old_targets[1],
+        new_anchor_pose=new_anchor,
+        trajectory_start_index=1,
+        transition_steps=4,
+        dim_mask12=np.ones(12, dtype=bool),
+        config=retarget.MetaRetargetGeneratorConfig(
+            retarget_algorithm=retarget.RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION
+        ),
+    )
+    v2_direct_targets = old_targets[source_indices]
+
+    np.testing.assert_array_equal(source_indices, np.array([1, 2, 3, 4, 4], dtype=np.int32))
+    assert not np.allclose(legacy_targets[0, :3], v2_direct_targets[0, :3])
+    np.testing.assert_allclose(legacy_targets[-1, :3], v2_direct_targets[-1, :3], atol=1e-6)
+
+
+def test_meta_retarget_generator_default_uses_legacy_algorithm():
+    assert (
+        retarget.MetaRetargetGeneratorConfig().retarget_algorithm
+        == retarget.RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION
+    )
+
+
 def test_generate_retargeted_chunk_accepts_zero_noise_line_case():
     helpers = retarget._load_xtrainer_helpers()
     qpos = np.zeros(14, dtype=np.float32)

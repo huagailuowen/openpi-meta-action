@@ -88,6 +88,33 @@ def test_with_real_dataset():
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
 
 
+def test_retarget_cache_metadata_missing_algorithm_only_warns(tmp_path, caplog):
+    class TinyDataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, idx):
+            del idx
+            return {"state": np.zeros((32,), dtype=np.float32), "actions": np.zeros((2, 32), dtype=np.float32)}
+
+    (tmp_path / "metadata.json").write_text('{"cache_action_space": "delta"}', encoding="utf-8")
+    (tmp_path / "manifest.jsonl").write_text("", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        wrapped = _data_loader.RetargetCacheDataset(
+            TinyDataset(),
+            tmp_path,
+            sample_prob=0.0,
+            seed=0,
+            expected_action_space="delta",
+            expected_retarget_algorithm=_meta_retarget.RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION,
+        )
+
+    assert len(wrapped) == 1
+    assert "Retarget cache algorithm mismatch" in caplog.text
+    assert "will still be used" in caplog.text
+
+
 def test_beta_pair_dataset_reference_condition_uses_source_actions():
     class TinyDataset:
         def __len__(self):

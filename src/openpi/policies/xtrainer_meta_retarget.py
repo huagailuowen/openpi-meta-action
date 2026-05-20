@@ -41,6 +41,15 @@ ACTION_CAMERA_INPUT_SLICE = slice(20, 26)
 RIGHT_ARM_QPOS_SLICE = slice(7, 13)
 META12_DIM = 12
 META6_DIM = 6
+RETARGET_ALGORITHM_WRIST_POSE_V2 = "wrist_pose_v2"
+RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION = "legacy_structured_min_rotation"
+RETARGET_ALGORITHM_DEFAULT = RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION
+SUPPORTED_RETARGET_ALGORITHMS = frozenset(
+    {
+        RETARGET_ALGORITHM_WRIST_POSE_V2,
+        RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION,
+    }
+)
 
 
 def _meta_slice_for_dim(meta_dim: int) -> slice:
@@ -56,6 +65,10 @@ def _camera_slice_for_dim(meta_dim: int) -> slice:
 class MetaRetargetGeneratorConfig:
     """Configuration for one canonical chunk retarget attempt."""
 
+    retarget_algorithm: str = RETARGET_ALGORITHM_DEFAULT
+    legacy_min_rotation_shape_tolerance_deg: float = 5.0
+    legacy_min_rotation_approach_tolerance_deg: float = 5.0
+    legacy_min_rotation_min_pair_angle_deg: float = 15.0
     position_noise_max_m: float = 0.04
     direction_noise_max_deg: float = 35.0
     future_near_mode_prob: float = 0.5
@@ -322,6 +335,30 @@ def generate_retargeted_chunk(
 ) -> MetaRetargetResult | None:
     """Generate one retargeted chunk, returning ``None`` if the sample is not usable."""
 
+    _validate_retarget_algorithm(config)
+    if config.retarget_algorithm == RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION:
+        return _generate_retargeted_chunk_legacy(data, rng=rng, config=config)
+    return _generate_retargeted_chunk_wrist_pose_v2(data, rng=rng, config=config)
+
+
+def _validate_retarget_algorithm(config: MetaRetargetGeneratorConfig) -> None:
+    if config.retarget_algorithm not in SUPPORTED_RETARGET_ALGORITHMS:
+        raise ValueError(
+            f"Unsupported retarget_algorithm={config.retarget_algorithm!r}; "
+            f"expected one of {sorted(SUPPORTED_RETARGET_ALGORITHMS)}"
+        )
+
+
+def _uses_legacy_retarget_algorithm(config: MetaRetargetGeneratorConfig) -> bool:
+    return config.retarget_algorithm == RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION
+
+
+def _generate_retargeted_chunk_wrist_pose_v2(
+    data: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    config: MetaRetargetGeneratorConfig,
+) -> MetaRetargetResult | None:
     helpers = _load_xtrainer_helpers()
     item = _prepare_retarget_chunk(data, rng=rng, config=config, helpers=helpers)
     if item is None:
@@ -367,6 +404,19 @@ def generate_pair_retargeted_chunk(
     no legal anchor is found, the pair is dismissed by returning ``None``.
     """
 
+    _validate_retarget_algorithm(config)
+    if config.retarget_algorithm == RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION:
+        return _generate_pair_retargeted_chunk_legacy(target_data, source_data, rng=rng, config=config)
+    return _generate_pair_retargeted_chunk_wrist_pose_v2(target_data, source_data, rng=rng, config=config)
+
+
+def _generate_pair_retargeted_chunk_wrist_pose_v2(
+    target_data: dict[str, Any],
+    source_data: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    config: MetaRetargetGeneratorConfig,
+) -> MetaRetargetResult | None:
     helpers = _load_xtrainer_helpers()
     fixed = _pair_source_affordance_as_target_input_pose(source_data, target_data, helpers=helpers)
     if fixed is None:
@@ -398,6 +448,77 @@ def generate_pair_retargeted_chunk(
         )
 
     return _generate_correction_chunk_from_item(item, config=config, helpers=helpers)
+
+
+def _generate_retargeted_chunk_legacy(
+    data: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    config: MetaRetargetGeneratorConfig,
+) -> MetaRetargetResult | None:
+    helpers = _load_xtrainer_helpers()
+    item = _prepare_retarget_chunk(data, rng=rng, config=config, helpers=helpers)
+    if item is None:
+        return None
+    if int(item.get("meta_dim", META6_DIM)) == META12_DIM and config.ik_backend == "jax":
+        config = dataclasses.replace(config, ik_backend="numpy")
+
+    if item["retarget_mode"] == "future_near":
+        qpos_sim, converged = _solve_smooth_chase_sequence_legacy(
+            item,
+            initial_qpos_sim=item["initial_seed_sim"],
+            config=config,
+            helpers=helpers,
+        )
+        return _assemble_smooth_chase_result(
+            item,
+            qpos_sim=np.asarray(qpos_sim, dtype=np.float32),
+            converged=np.asarray(converged, dtype=bool),
+            config=config,
+            helpers=helpers,
+        )
+
+    return _generate_correction_chunk_from_item_legacy(item, config=config, helpers=helpers)
+
+
+def _generate_pair_retargeted_chunk_legacy(
+    target_data: dict[str, Any],
+    source_data: dict[str, Any],
+    *,
+    rng: np.random.Generator,
+    config: MetaRetargetGeneratorConfig,
+) -> MetaRetargetResult | None:
+    helpers = _load_xtrainer_helpers()
+    fixed = _pair_source_affordance_as_target_input_pose(source_data, target_data, helpers=helpers)
+    if fixed is None:
+        return None
+
+    data = dict(target_data)
+    data["_retarget_fixed_input_pose12d"] = fixed["input_pose12d"]
+    data["_retarget_fixed_area_type_id"] = fixed["area_type_id"]
+    data["_retarget_fixed_dim_mask12"] = fixed["dim_mask12"]
+    item = _prepare_retarget_chunk(data, rng=rng, config=config, helpers=helpers)
+    if item is None:
+        return None
+    if int(item.get("meta_dim", META6_DIM)) == META12_DIM and config.ik_backend == "jax":
+        config = dataclasses.replace(config, ik_backend="numpy")
+
+    if item["retarget_mode"] == "future_near":
+        qpos_sim, converged = _solve_smooth_chase_sequence_legacy(
+            item,
+            initial_qpos_sim=item["initial_seed_sim"],
+            config=config,
+            helpers=helpers,
+        )
+        return _assemble_smooth_chase_result(
+            item,
+            qpos_sim=np.asarray(qpos_sim, dtype=np.float32),
+            converged=np.asarray(converged, dtype=bool),
+            config=config,
+            helpers=helpers,
+        )
+
+    return _generate_correction_chunk_from_item_legacy(item, config=config, helpers=helpers)
 
 
 def _generate_correction_chunk_from_item(
@@ -598,6 +719,215 @@ def _generate_correction_chunk_from_item(
     )
 
 
+def _generate_correction_chunk_from_item_legacy(
+    item: dict[str, Any],
+    *,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+) -> MetaRetargetResult:
+    state = item["state"].copy()
+    actions = item["actions"]
+    meta_area_pose6d = item["meta_area_pose6d"].copy()
+    meta_area_pose12d = None if item["meta_area_pose12d"] is None else item["meta_area_pose12d"].copy()
+    meta_area_dim_mask12 = None if item["meta_area_dim_mask12"] is None else item["meta_area_dim_mask12"].copy()
+    out_target_pose12d = None if item["meta_action_target_pose12d"] is None else item["meta_action_target_pose12d"].copy()
+    out_target_dim_mask12 = (
+        None if item["meta_action_target_dim_mask12"] is None else item["meta_action_target_dim_mask12"].copy()
+    )
+    out_target_mask = None if item["meta_action_target_mask"] is None else item["meta_action_target_mask"].copy()
+    meta_area_type = item["meta_area_type"].copy()
+    meta_area_mask = item["meta_area_mask"].copy()
+    meta_dim = int(item.get("meta_dim", META6_DIM))
+    action_meta_slice = item.get("action_meta_slice", _meta_slice_for_dim(meta_dim))
+    action_camera_slice = item.get("action_camera_slice", _camera_slice_for_dim(meta_dim))
+    dim_mask12 = item.get("dim_mask12")
+    horizon = int(item["horizon"])
+    area_type = item["area_type"]
+    state_qpos = item["state_qpos"]
+    T_wrist_meta_new = item["T_wrist_meta_new"]
+    new_input_pose = item["new_input_pose"]
+    old_target_meta = item["old_target_meta"]
+    seed_sim = item["initial_seed_sim"]
+    approach_plan = _compute_dynamic_approach_plan_legacy(
+        area_type=area_type,
+        state_qpos=state_qpos,
+        first_target_meta=old_target_meta[0],
+        T_wrist_meta=T_wrist_meta_new,
+        initial_qpos_sim=seed_sim,
+        config=config,
+        helpers=helpers,
+        horizon=horizon,
+        dim_mask12=dim_mask12,
+    )
+    approach_steps = approach_plan.steps
+
+    out_actions = actions.copy()
+    previous_real_qpos = state_qpos.copy()
+
+    ik_nonconverged = 0 if approach_plan.converged else 1
+    position_errors: list[float] = []
+    direction_errors: list[float] = []
+    joint_step_deltas: list[float] = []
+    T_wrist_cam = _camera_pose_to_transform(state[action_camera_slice]) if state.shape[-1] >= action_camera_slice.stop else None
+    align_pos_err, align_dir_err = _meta_tracking_errors(
+        area_type=area_type,
+        qpos_real=approach_plan.aligned_qpos_real,
+        T_wrist_meta=T_wrist_meta_new,
+        target_meta_pose=old_target_meta[0],
+        dim_mask12=dim_mask12,
+        fk_fn=helpers["fk"],
+    )
+    position_errors.append(align_pos_err)
+    direction_errors.append(align_dir_err)
+
+    jax_follow: dict[str, Any] | None = None
+    if config.ik_backend == "jax" and approach_steps < horizon:
+        follow_seed_sim = (
+            helpers["real_to_sim_arm"](approach_plan.aligned_qpos_real[RIGHT_ARM_QPOS_SLICE], "right")
+            if approach_steps > 0
+            else seed_sim
+        )
+        jax_follow = _solve_right_arm_meta_ik_sequence_jax(
+            target_meta_poses=old_target_meta,
+            T_wrist_meta=T_wrist_meta_new,
+            area_type=area_type,
+            initial_qpos_sim=follow_seed_sim,
+            config=config,
+        )
+
+    for step in range(horizon):
+        if step < approach_steps:
+            alpha = float(step + 1) / float(max(approach_steps, 1))
+            target_meta = _interpolate_meta_pose_legacy(
+                area_type,
+                new_input_pose,
+                old_target_meta[0],
+                alpha,
+                dim_mask12=dim_mask12,
+                config=config,
+            )
+            out_action = actions[0].copy()
+            out_action[:14] = state_qpos
+            out_action[RIGHT_ARM_QPOS_SLICE] = (
+                (1.0 - alpha) * state_qpos[RIGHT_ARM_QPOS_SLICE]
+                + alpha * approach_plan.aligned_qpos_real[RIGHT_ARM_QPOS_SLICE]
+            ).astype(np.float32)
+            _set_retarget_meta_action(out_action, out_target_pose12d, step, target_meta, action_meta_slice, meta_dim)
+            seed_sim = helpers["real_to_sim_arm"](out_action[RIGHT_ARM_QPOS_SLICE], "right")
+        else:
+            source_idx = min(step - approach_steps, horizon - 1)
+            out_action = actions[source_idx].copy()
+            target_meta = old_target_meta[source_idx]
+
+            if jax_follow is None:
+                ik_result = _solve_right_arm_meta_ik_legacy(
+                    template_qpos_real=out_action[:14],
+                    target_meta_pose=target_meta,
+                    T_wrist_meta=T_wrist_meta_new,
+                    area_type=area_type,
+                    initial_qpos_sim=seed_sim,
+                    config=config,
+                    helpers=helpers,
+                    dim_mask12=dim_mask12,
+                )
+                solved_sim = _wrap_near_seed(ik_result["qpos_sim"], seed_sim)
+                converged = bool(ik_result["converged"])
+            else:
+                solved_sim = np.asarray(jax_follow["qpos_sim"][source_idx], dtype=np.float32)
+                converged = bool(jax_follow["converged"][source_idx])
+
+            solved_real = _sim_to_real_right_arm_qpos(solved_sim, helpers)
+
+            out_action[RIGHT_ARM_QPOS_SLICE] = solved_real
+            _set_retarget_meta_action(out_action, out_target_pose12d, step, target_meta, action_meta_slice, meta_dim)
+            seed_sim = solved_sim
+            if not converged:
+                ik_nonconverged += 1
+
+        if config.recompute_action_camera_pose and T_wrist_cam is not None and out_action.shape[-1] >= action_camera_slice.stop:
+            T_action_wrist = np.asarray(helpers["fk"](out_action[:14], "right_wrist"), dtype=np.float32)
+            out_action[action_camera_slice] = _transform_to_camera_pose(T_action_wrist @ T_wrist_cam)
+
+        out_actions[step] = out_action
+
+        pos_err, dir_err = _meta_tracking_errors(
+            area_type=area_type,
+            qpos_real=out_action[:14],
+            T_wrist_meta=T_wrist_meta_new,
+            target_meta_pose=_retarget_meta_for_error(out_action, out_target_pose12d, step, target_meta, action_meta_slice, meta_dim),
+            dim_mask12=dim_mask12,
+            fk_fn=helpers["fk"],
+        )
+        position_errors.append(pos_err)
+        direction_errors.append(dir_err)
+        joint_step_deltas.append(float(np.max(np.abs(out_action[:14] - previous_real_qpos[:14]))))
+        previous_real_qpos = out_action[:14].copy()
+
+    if meta_area_pose12d is not None:
+        meta_area_pose12d[0] = new_input_pose
+        meta_area_pose6d[0] = _pose12_to_pose6d(area_type, new_input_pose, dim_mask12)
+    else:
+        meta_area_pose6d[0] = new_input_pose
+    max_position_error = float(max(position_errors, default=np.inf))
+    max_direction_error = float(max(direction_errors, default=0.0))
+    max_joint_delta = float(max(joint_step_deltas, default=0.0))
+    (
+        values_ok,
+        actions_finite,
+        max_abs_action,
+        max_camera_rotvec_norm,
+        value_reason,
+    ) = _action_value_diagnostics(out_actions, config, meta_dim=meta_dim)
+
+    accepted = (
+        max_position_error <= config.accept_max_position_error_m
+        and max_direction_error <= config.accept_max_direction_error_rad
+        and max_joint_delta <= config.accept_max_step_joint_delta_rad
+        and values_ok
+    )
+    reason = ""
+    if not accepted:
+        reason_parts = [
+            f"ik_nonconverged={ik_nonconverged}",
+            f"max_position_error_m={max_position_error:.6f}",
+            f"max_direction_error_rad={max_direction_error:.6f}",
+            f"max_step_joint_delta_rad={max_joint_delta:.6f}",
+        ]
+        if value_reason:
+            reason_parts.append(value_reason)
+        reason = ", ".join(reason_parts)
+
+    diagnostics = MetaRetargetDiagnostics(
+        accepted=accepted,
+        area_type=area_type,
+        horizon=horizon,
+        approach_steps=approach_steps,
+        ik_nonconverged=ik_nonconverged,
+        max_position_error_m=max_position_error,
+        max_direction_error_rad=max_direction_error,
+        max_step_joint_delta_rad=max_joint_delta,
+        reason=reason,
+        actions_finite=actions_finite,
+        max_abs_action_value=max_abs_action,
+        max_camera_rotvec_norm_rad=max_camera_rotvec_norm,
+        retarget_mode=item["retarget_mode"],
+        trajectory_start_index=int(item["trajectory_start_index"]),
+    )
+    return MetaRetargetResult(
+        state=state.astype(np.float32),
+        actions=out_actions.astype(np.float32),
+        meta_area_pose6d=meta_area_pose6d.astype(np.float32),
+        meta_area_type=meta_area_type.astype(np.int32),
+        meta_area_mask=meta_area_mask.astype(bool),
+        diagnostics=diagnostics,
+        meta_area_pose12d=None if meta_area_pose12d is None else meta_area_pose12d.astype(np.float32),
+        meta_area_dim_mask12=None if meta_area_dim_mask12 is None else meta_area_dim_mask12.astype(bool),
+        meta_action_target_pose12d=None if out_target_pose12d is None else out_target_pose12d.astype(np.float32),
+        meta_action_target_dim_mask12=None if out_target_dim_mask12 is None else out_target_dim_mask12.astype(bool),
+        meta_action_target_mask=None if out_target_mask is None else out_target_mask.astype(bool),
+    )
+
+
 def generate_retargeted_chunks_batch(
     data_batch: list[dict[str, Any]],
     *,
@@ -610,6 +940,12 @@ def generate_retargeted_chunks_batch(
         raise ValueError(f"data_batch and rngs length mismatch: {len(data_batch)} != {len(rngs)}")
     if not data_batch:
         return []
+    _validate_retarget_algorithm(config)
+    if config.retarget_algorithm == RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION:
+        return [
+            generate_retargeted_chunk(data, rng=rng, config=config)
+            for data, rng in zip(data_batch, rngs, strict=True)
+        ]
     if config.ik_backend != "jax":
         return [
             generate_retargeted_chunk(data, rng=rng, config=config)
@@ -1445,6 +1781,80 @@ def _build_smooth_chase_targets(
     return targets.astype(np.float32), source_indices
 
 
+def _apply_pose_offset_from_anchor_legacy(
+    area_type: str,
+    pose: np.ndarray,
+    *,
+    old_anchor_pose: np.ndarray,
+    new_anchor_pose: np.ndarray,
+    dim_mask12: np.ndarray | None = None,
+    config: MetaRetargetGeneratorConfig,
+) -> np.ndarray:
+    shifted = np.asarray(pose, dtype=np.float32).reshape(-1).copy()
+    old_anchor_pose = np.asarray(old_anchor_pose, dtype=np.float32).reshape(-1)
+    new_anchor_pose = np.asarray(new_anchor_pose, dtype=np.float32).reshape(-1)
+    shifted[:3] += new_anchor_pose[:3] - old_anchor_pose[:3]
+    if shifted.shape[0] == META12_DIM:
+        if area_type != "point":
+            rot_delta = _legacy_rotation_between_pose12(
+                area_type,
+                old_anchor_pose,
+                new_anchor_pose,
+                dim_mask12=dim_mask12,
+                config=config,
+            )
+            shifted[3:9] = _matrix_to_shape6(_project_psd_trace1(rot_delta @ _shape6_to_matrix(shifted[3:9]) @ rot_delta.T))
+            if _pose12_has_approach(shifted, dim_mask12):
+                shifted[9:12] = _normalize(rot_delta @ shifted[9:12])
+        else:
+            shifted[3:12] = 0.0
+        return shifted.astype(np.float32)
+
+    if area_type != "point":
+        rot_delta = _rotation_between_unit_vectors(old_anchor_pose[3:6], new_anchor_pose[3:6])
+        shifted[3:6] = _normalize(rot_delta @ _normalize(shifted[3:6]))
+    else:
+        shifted[3:6] = 0.0
+    return shifted.astype(np.float32)
+
+
+def _build_smooth_chase_targets_legacy(
+    area_type: str,
+    old_target_meta: np.ndarray,
+    *,
+    old_anchor_pose: np.ndarray,
+    new_anchor_pose: np.ndarray,
+    trajectory_start_index: int,
+    transition_steps: int,
+    dim_mask12: np.ndarray | None = None,
+    config: MetaRetargetGeneratorConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    horizon = int(old_target_meta.shape[0])
+    source_indices = np.minimum(np.arange(horizon, dtype=np.int32) + int(trajectory_start_index), horizon - 1)
+    targets = np.zeros_like(old_target_meta, dtype=np.float32)
+    transition = max(1, int(transition_steps))
+    for step, source_idx in enumerate(source_indices):
+        base_pose = old_target_meta[int(source_idx)]
+        shifted_pose = _apply_pose_offset_from_anchor_legacy(
+            area_type,
+            base_pose,
+            old_anchor_pose=old_anchor_pose,
+            new_anchor_pose=new_anchor_pose,
+            dim_mask12=dim_mask12,
+            config=config,
+        )
+        alpha = min(float(step + 1) / float(transition), 1.0)
+        targets[step] = _interpolate_meta_pose_legacy(
+            area_type,
+            shifted_pose,
+            base_pose,
+            alpha,
+            dim_mask12=dim_mask12,
+            config=config,
+        )
+    return targets.astype(np.float32), source_indices
+
+
 def _smoothstep(x: float) -> float:
     x = float(np.clip(x, 0.0, 1.0))
     return x * x * (3.0 - 2.0 * x)
@@ -1589,6 +1999,18 @@ def _prepare_retarget_chunk(
         trajectory_start_index = int(selected["trajectory_start_index"])
         target_meta_sequence = selected["target_meta_sequence"]
         source_indices = selected["source_indices"]
+        if _uses_legacy_retarget_algorithm(config) and retarget_mode == "future_near":
+            anchor_pose = _trajectory_frame_pose(old_input_pose, old_target_meta, trajectory_start_index)
+            target_meta_sequence, source_indices = _build_smooth_chase_targets_legacy(
+                area_type,
+                old_target_meta,
+                old_anchor_pose=anchor_pose,
+                new_anchor_pose=new_input_pose,
+                trajectory_start_index=trajectory_start_index,
+                transition_steps=config.future_near_transition_steps,
+                dim_mask12=dim_mask12,
+                config=config,
+            )
     elif retarget_mode == "future_near":
         max_frame = min(max(int(config.future_near_window_frames) - 1, 0), horizon - 1)
         selected_frame_index = int(rng.integers(max_frame + 1))
@@ -1602,8 +2024,20 @@ def _prepare_retarget_chunk(
             dim_mask12=dim_mask12,
         )
         trajectory_start_index = min(selected_frame_index, horizon - 1)
-        source_indices = _direct_follow_source_indices(old_target_meta, trajectory_start_index=trajectory_start_index)
-        target_meta_sequence = old_target_meta[source_indices].astype(np.float32)
+        if _uses_legacy_retarget_algorithm(config):
+            target_meta_sequence, source_indices = _build_smooth_chase_targets_legacy(
+                area_type,
+                old_target_meta,
+                old_anchor_pose=selected_pose,
+                new_anchor_pose=new_input_pose,
+                trajectory_start_index=trajectory_start_index,
+                transition_steps=config.future_near_transition_steps,
+                dim_mask12=dim_mask12,
+                config=config,
+            )
+        else:
+            source_indices = _direct_follow_source_indices(old_target_meta, trajectory_start_index=trajectory_start_index)
+            target_meta_sequence = old_target_meta[source_indices].astype(np.float32)
     else:
         new_input_pose = _sample_correction_pose(
             area_type,
@@ -1693,6 +2127,49 @@ def _solve_smooth_chase_sequence(
         solved_real = _sim_to_real_right_arm_qpos(seed_sim, helpers)
         previous_real_qpos = np.asarray(item["actions"][source_idx, :14], dtype=np.float32).copy()
         previous_real_qpos[RIGHT_ARM_QPOS_SLICE] = solved_real
+        qpos_sequence.append(seed_sim)
+        converged_sequence.append(bool(ik_result["converged"]))
+
+    return np.asarray(qpos_sequence, dtype=np.float32), np.asarray(converged_sequence, dtype=bool)
+
+
+def _solve_smooth_chase_sequence_legacy(
+    item: dict[str, Any],
+    *,
+    initial_qpos_sim: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+) -> tuple[np.ndarray, np.ndarray]:
+    target_meta_sequence = np.asarray(item["target_meta_sequence"], dtype=np.float32)
+    if config.ik_backend == "jax":
+        solved = _solve_right_arm_meta_ik_sequence_jax(
+            target_meta_poses=target_meta_sequence,
+            T_wrist_meta=item["T_wrist_meta_new"],
+            area_type=item["area_type"],
+            initial_qpos_sim=initial_qpos_sim,
+            config=config,
+        )
+        return solved["qpos_sim"], solved["converged"]
+
+    if config.ik_backend != "numpy":
+        raise ValueError(f"Unsupported ik_backend={config.ik_backend!r}; expected 'numpy' or 'jax'")
+
+    seed_sim = np.asarray(initial_qpos_sim, dtype=np.float32)
+    qpos_sequence = []
+    converged_sequence = []
+    for step, target_meta in enumerate(target_meta_sequence):
+        source_idx = int(item["source_indices"][step])
+        ik_result = _solve_right_arm_meta_ik_numpy_legacy(
+            template_qpos_real=item["actions"][source_idx, :14],
+            target_meta_pose=target_meta,
+            T_wrist_meta=item["T_wrist_meta_new"],
+            area_type=item["area_type"],
+            initial_qpos_sim=seed_sim,
+            config=config,
+            helpers=helpers,
+            dim_mask12=item.get("dim_mask12"),
+        )
+        seed_sim = _wrap_near_seed(ik_result["qpos_sim"], seed_sim)
         qpos_sequence.append(seed_sim)
         converged_sequence.append(bool(ik_result["converged"]))
 
@@ -2216,6 +2693,55 @@ def _rotation_from_direction_pairs(start_dirs: list[np.ndarray], end_dirs: list[
     return R.astype(np.float32)
 
 
+def _legacy_rotation_between_pose12(
+    area_type: str,
+    start_pose: np.ndarray,
+    end_pose: np.ndarray,
+    *,
+    dim_mask12: np.ndarray | None,
+    config: MetaRetargetGeneratorConfig | None,
+) -> np.ndarray:
+    if area_type == "point":
+        return np.eye(3, dtype=np.float32)
+    start_pose = np.asarray(start_pose, dtype=np.float32).reshape(12)
+    end_pose = np.asarray(end_pose, dtype=np.float32).reshape(12)
+    start_shape = _shape_axis_from_pose12(area_type, start_pose, dim_mask12)
+    end_shape = _shape_axis_from_pose12(area_type, end_pose, dim_mask12)
+    has_approach = _pose12_has_approach(start_pose, dim_mask12) or _pose12_has_approach(end_pose, dim_mask12)
+    if not has_approach:
+        if float(np.dot(start_shape, end_shape)) < 0.0:
+            end_shape = -end_shape
+        return _rotation_between_unit_vectors(start_shape, end_shape)
+
+    start_app = _normalize(start_pose[9:12])
+    end_app = _normalize(end_pose[9:12])
+    pair_angle_min_deg = 15.0 if config is None else float(config.legacy_min_rotation_min_pair_angle_deg)
+    stable = (
+        _angle_between_unit_vectors_deg(start_shape, start_app, unsigned=True) >= pair_angle_min_deg
+        and _angle_between_unit_vectors_deg(end_shape, end_app, unsigned=True) >= pair_angle_min_deg
+    )
+    if not stable:
+        return _rotation_from_direction_pairs([start_shape, start_app], [end_shape, end_app])
+
+    shape_tol = 5.0 if config is None else float(config.legacy_min_rotation_shape_tolerance_deg)
+    approach_tol = 5.0 if config is None else float(config.legacy_min_rotation_approach_tolerance_deg)
+    candidates: list[tuple[bool, float, float, float, np.ndarray]] = []
+    for shape_sign in (1.0, -1.0):
+        R = _rotation_from_direction_pairs([start_shape, start_app], [shape_sign * end_shape, end_app])
+        rotated_shape = _normalize(R @ start_shape)
+        rotated_app = _normalize(R @ start_app)
+        shape_err = _angle_between_unit_vectors_deg(rotated_shape, end_shape, unsigned=True)
+        app_err = _angle_between_unit_vectors_deg(rotated_app, end_app, unsigned=False)
+        rot_angle = float(np.rad2deg(np.linalg.norm(_matrix_to_rotvec(R))))
+        within_tol = shape_err <= shape_tol and app_err <= approach_tol
+        candidates.append((within_tol, shape_err + app_err, rot_angle, shape_err, R.astype(np.float32)))
+
+    valid = [candidate for candidate in candidates if candidate[0]]
+    if valid:
+        return min(valid, key=lambda item: item[2])[4]
+    return min(candidates, key=lambda item: (item[1], item[2]))[4]
+
+
 def _rotvec_to_matrix(rotvec: np.ndarray) -> np.ndarray:
     r = np.asarray(rotvec, dtype=np.float64).reshape(3)
     theta = float(np.linalg.norm(r))
@@ -2480,6 +3006,54 @@ def _compute_dynamic_approach_plan(
     )
 
 
+def _compute_dynamic_approach_plan_legacy(
+    *,
+    area_type: str,
+    state_qpos: np.ndarray,
+    first_target_meta: np.ndarray,
+    T_wrist_meta: np.ndarray,
+    initial_qpos_sim: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+    horizon: int,
+    dim_mask12: np.ndarray | None = None,
+) -> _DynamicApproachPlan:
+    """Legacy approach solve: feature-space IK directly to the first target meta pose."""
+
+    if horizon <= 0:
+        aligned = np.asarray(state_qpos, dtype=np.float32).reshape(-1)[:14].copy()
+        return _DynamicApproachPlan(steps=0, aligned_qpos_real=aligned, converged=True, final_error=0.0)
+    if config.approach_joint_step_rad <= 0:
+        raise ValueError(f"approach_joint_step_rad must be positive, got {config.approach_joint_step_rad}")
+
+    alignment = _solve_right_arm_meta_ik_legacy(
+        template_qpos_real=np.asarray(state_qpos, dtype=np.float32).reshape(-1)[:14],
+        target_meta_pose=first_target_meta,
+        T_wrist_meta=T_wrist_meta,
+        area_type=area_type,
+        initial_qpos_sim=initial_qpos_sim,
+        config=config,
+        helpers=helpers,
+        dim_mask12=dim_mask12,
+    )
+    solved_sim = _wrap_near_seed(alignment["qpos_sim"], initial_qpos_sim)
+    solved_real = _sim_to_real_right_arm_qpos(solved_sim, helpers)
+    aligned_qpos_real = np.asarray(state_qpos, dtype=np.float32).reshape(-1)[:14].copy()
+    aligned_qpos_real[RIGHT_ARM_QPOS_SLICE] = solved_real
+    right_delta = np.asarray(solved_real, dtype=np.float32) - np.asarray(state_qpos[RIGHT_ARM_QPOS_SLICE], dtype=np.float32)
+    max_abs_delta = float(np.max(np.abs(right_delta)))
+    steps = int(np.ceil(max_abs_delta / float(config.approach_joint_step_rad)))
+    if config.max_approach_steps is not None:
+        steps = min(steps, int(config.max_approach_steps))
+    steps = min(max(steps, 0), int(horizon))
+    return _DynamicApproachPlan(
+        steps=steps,
+        aligned_qpos_real=aligned_qpos_real.astype(np.float32),
+        converged=bool(alignment["converged"]),
+        final_error=float(alignment["final_error"]),
+    )
+
+
 def _build_approach_qpos_sequence_from_wrist_keyframes(
     *,
     state_qpos: np.ndarray,
@@ -2578,6 +3152,57 @@ def _interpolate_meta_pose(
     return out
 
 
+def _interpolate_meta_pose_legacy(
+    area_type: str,
+    a: np.ndarray,
+    b: np.ndarray,
+    alpha: float,
+    dim_mask12: np.ndarray | None = None,
+    config: MetaRetargetGeneratorConfig | None = None,
+) -> np.ndarray:
+    a = np.asarray(a, dtype=np.float32).reshape(-1)
+    b = np.asarray(b, dtype=np.float32).reshape(-1)
+    if a.shape != b.shape:
+        raise ValueError(f"Cannot interpolate different meta pose shapes: {a.shape} vs {b.shape}")
+    if a.shape[0] == META12_DIM:
+        t = float(np.clip(alpha, 0.0, 1.0))
+        out = np.zeros(12, dtype=np.float32)
+        out[:3] = (1.0 - t) * a[:3] + t * b[:3]
+        if area_type == "point":
+            out[3:12] = 0.0
+            return out
+
+        has_approach = _pose12_has_approach(a, dim_mask12) or _pose12_has_approach(b, dim_mask12)
+        if has_approach:
+            R_delta = _legacy_rotation_between_pose12(
+                area_type,
+                a,
+                b,
+                dim_mask12=dim_mask12,
+                config=config,
+            )
+            R_alpha = _rotvec_to_matrix(_matrix_to_rotvec(R_delta) * t)
+            out[3:9] = _matrix_to_shape6(_project_psd_trace1(R_alpha @ _shape6_to_matrix(a[3:9]) @ R_alpha.T))
+            out[9:12] = _normalize(R_alpha @ a[9:12])
+        else:
+            axis_a = _shape_axis_from_pose12(area_type, a, dim_mask12)
+            axis_b = _shape_axis_from_pose12(area_type, b, dim_mask12)
+            if float(np.dot(axis_a, axis_b)) < 0.0:
+                axis_b = -axis_b
+            axis = _slerp_unit_vectors(axis_a, axis_b, t)
+            out[3:9] = _matrix_to_shape6(_shape_matrix_from_axis(area_type, axis))
+            out[9:12] = 0.0
+        return out.astype(np.float32)
+
+    a = a.reshape(6)
+    b = b.reshape(6)
+    out = np.zeros(6, dtype=np.float32)
+    out[:3] = (1.0 - alpha) * a[:3] + alpha * b[:3]
+    if area_type != "point":
+        out[3:6] = _slerp_unit_vectors(_normalize(a[3:6]), _normalize(b[3:6]), alpha)
+    return out
+
+
 def _slerp_unit_vectors(a: np.ndarray, b: np.ndarray, alpha: float) -> np.ndarray:
     """Interpolate directed unit vectors along the great-circle arc."""
 
@@ -2601,6 +3226,96 @@ def _slerp_unit_vectors(a: np.ndarray, b: np.ndarray, alpha: float) -> np.ndarra
         (np.sin((1.0 - t) * theta) / sin_theta) * start
         + (np.sin(t * theta) / sin_theta) * end
     )
+
+
+def _solve_right_arm_meta_ik_legacy(
+    *,
+    template_qpos_real: np.ndarray,
+    target_meta_pose: np.ndarray,
+    T_wrist_meta: np.ndarray,
+    area_type: str,
+    initial_qpos_sim: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+    dim_mask12: np.ndarray | None = None,
+) -> dict[str, Any]:
+    if config.ik_backend == "jax" and np.asarray(target_meta_pose).reshape(-1).shape[0] == META6_DIM:
+        return _solve_right_arm_meta_ik_jax(
+            target_meta_pose=target_meta_pose,
+            T_wrist_meta=T_wrist_meta,
+            area_type=area_type,
+            initial_qpos_sim=initial_qpos_sim,
+            config=config,
+        )
+    if config.ik_backend not in ("numpy", "jax"):
+        raise ValueError(f"Unsupported ik_backend={config.ik_backend!r}; expected 'numpy' or 'jax'")
+    return _solve_right_arm_meta_ik_numpy_legacy(
+        template_qpos_real=template_qpos_real,
+        target_meta_pose=target_meta_pose,
+        T_wrist_meta=T_wrist_meta,
+        area_type=area_type,
+        initial_qpos_sim=initial_qpos_sim,
+        config=config,
+        helpers=helpers,
+        dim_mask12=dim_mask12,
+    )
+
+
+def _solve_right_arm_meta_ik_numpy_legacy(
+    *,
+    template_qpos_real: np.ndarray,
+    target_meta_pose: np.ndarray,
+    T_wrist_meta: np.ndarray,
+    area_type: str,
+    initial_qpos_sim: np.ndarray,
+    config: MetaRetargetGeneratorConfig,
+    helpers: dict[str, Any],
+    dim_mask12: np.ndarray | None = None,
+) -> dict[str, Any]:
+    q = np.asarray(initial_qpos_sim, dtype=np.float64).reshape(6).copy()
+    target_feature = _weighted_meta_feature_from_pose(area_type, target_meta_pose, config, dim_mask12=dim_mask12)
+    converged = False
+    final_error = np.inf
+    iterations = 0
+
+    for iterations in range(1, config.ik_max_iters + 1):
+        feature = _weighted_meta_feature_from_sim_qpos(
+            q,
+            template_qpos_real=template_qpos_real,
+            T_wrist_meta=T_wrist_meta,
+            area_type=area_type,
+            config=config,
+            helpers=helpers,
+            dim_mask12=dim_mask12,
+        )
+        error = target_feature - feature
+        final_error = float(np.linalg.norm(error))
+        if final_error < config.ik_tolerance:
+            converged = True
+            break
+
+        J = _numerical_meta_feature_jacobian(
+            q,
+            template_qpos_real=template_qpos_real,
+            T_wrist_meta=T_wrist_meta,
+            area_type=area_type,
+            config=config,
+            helpers=helpers,
+            dim_mask12=dim_mask12,
+        )
+        JT = J.T
+        dq = JT @ np.linalg.solve(J @ JT + (config.ik_damping**2) * np.eye(J.shape[0]), error)
+        max_step = float(np.max(np.abs(dq)))
+        if max_step > config.ik_max_joint_step_rad > 0:
+            dq *= config.ik_max_joint_step_rad / max_step
+        q += config.ik_step_scale * dq
+
+    return {
+        "qpos_sim": q.astype(np.float32),
+        "converged": converged,
+        "iterations": iterations,
+        "final_error": final_error,
+    }
 
 
 def _solve_right_arm_meta_ik(
