@@ -85,6 +85,78 @@ def _valid_same_tool_pair(target_sample: dict[str, Any], source_sample: dict[str
     return _is_origin_sample(target_sample) and _is_imagine_sample(source_sample) and _same_tool_sample_pair(target_sample, source_sample)
 
 
+def _load_chunk_retarget_records_by_tool(
+    cache_dir: pathlib.Path,
+    *,
+    sampling_metadata: Any,
+) -> dict[int, list[dict[str, Any]]]:
+    manifest_path = cache_dir / "manifest.jsonl"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Chunk retarget cache manifest not found: {manifest_path}")
+    records_by_tool: dict[int, list[dict[str, Any]]] = {}
+    with manifest_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            record = json.loads(stripped)
+            if not bool(record.get("accepted", True)):
+                continue
+            try:
+                base_index = int(record["base_index"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not (0 <= base_index < len(sampling_metadata.tool_instance_hash)):
+                continue
+            tool = int(sampling_metadata.tool_instance_hash[base_index])
+            if tool < 0:
+                continue
+            records_by_tool.setdefault(tool, []).append(record)
+    return records_by_tool
+
+
+def _load_npz_payload(cache_dir: pathlib.Path, record: dict[str, Any]) -> dict[str, np.ndarray] | None:
+    try:
+        with np.load(cache_dir / str(record["path"])) as cached:
+            return {key: cached[key].copy() for key in cached.files}
+    except FileNotFoundError:
+        return None
+
+
+def _apply_retargeted_payload_to_canonical(
+    sample: dict[str, Any],
+    payload: dict[str, np.ndarray],
+) -> dict[str, Any]:
+    if "meta_area_pose12d" not in payload:
+        raise ValueError("Beta same-tool pair source reconstruction currently requires 12D chunk retarget payloads.")
+    out = dict(sample)
+    out["state"] = np.asarray(payload["state"], dtype=np.float32)
+    out["actions"] = np.asarray(payload["actions"], dtype=np.float32)
+    out["source_type_id"] = np.asarray([2], dtype=np.int32)
+
+    meta_areas = dict(out.get("meta_areas", {}))
+    meta_areas["pose12d"] = np.asarray(payload["meta_area_pose12d"], dtype=np.float32)
+    meta_areas.pop("pose6d", None)
+    if "meta_area_dim_mask12" in payload:
+        meta_areas["dim_mask12"] = np.asarray(payload["meta_area_dim_mask12"], dtype=bool)
+    meta_areas["type"] = np.asarray(payload["meta_area_type"], dtype=np.int32)
+    meta_areas["mask"] = np.asarray(payload["meta_area_mask"], dtype=bool)
+    out["meta_areas"] = meta_areas
+
+    if "meta_action_target_pose12d" in payload:
+        meta_targets = dict(out.get("meta_action_targets", {}))
+        meta_targets["pose12d"] = np.asarray(payload["meta_action_target_pose12d"], dtype=np.float32)
+        meta_targets.pop("pose6d", None)
+        if "meta_action_target_dim_mask12" in payload:
+            meta_targets["dim_mask12"] = np.asarray(payload["meta_action_target_dim_mask12"], dtype=bool)
+        if "meta_action_target_mask" in payload:
+            meta_targets["mask"] = np.asarray(payload["meta_action_target_mask"], dtype=bool)
+        else:
+            meta_targets["mask"] = np.ones(meta_targets["pose12d"].shape[:2], dtype=bool)
+        out["meta_action_targets"] = meta_targets
+    return out
+
+
 def _generate_pair_worker(
     *,
     target_index: int,
@@ -98,6 +170,7 @@ def _generate_pair_worker(
     delta_action_masks: list[list[bool]],
     max_attempts: int,
     retarget_mode: str,
+    source_retarget_path: str | None = None,
 ) -> dict[str, Any]:
     relpath = _pair_relpath(target_index, source_index, variant_id)
     base_record = {
@@ -107,6 +180,9 @@ def _generate_pair_worker(
         "path": str(relpath),
         "retarget_mode": retarget_mode,
     }
+    if source_retarget_path is not None:
+        base_record["source_retarget_path"] = str(source_retarget_path)
+        base_record["source_retarget_base_index"] = int(source_index)
     target_sample = _chunk_cache._with_retarget_mode(target_sample, retarget_mode)  # noqa: SLF001
     config = _retarget.MetaRetargetGeneratorConfig(**generator_config)
 
@@ -172,6 +248,7 @@ def main(
     accept_max_camera_rotvec_norm_rad: float = 3.143,
     retarget_algorithm: str | None = None,
     same_tool_only: bool = True,
+    source_retarget_cache_dir: str | None = None,
 ) -> None:
     """Build a reusable pair-retarget cache for one beta OpenPI training config."""
 
@@ -193,6 +270,7 @@ def main(
 
     train_config = _config.get_config(config_name)
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)
+    configured_retarget_cache_dir = data_config.meta_retarget_cache_dir
     data_config = dataclasses.replace(
         data_config,
         repo_id=str(pathlib.Path.cwd().resolve()) if data_config.repo_id == "." else data_config.repo_id,
@@ -217,6 +295,39 @@ def main(
     action_stride = _chunk_cache._infer_action_stride(data_config)  # noqa: SLF001
     delta_action_masks = _chunk_cache._infer_delta_action_masks(data_config)  # noqa: SLF001
     delta_action_masks_json = [mask.astype(bool).tolist() for mask in delta_action_masks]
+    chunk_retarget_cache_dir: pathlib.Path | None = None
+    chunk_records_by_tool: dict[int, list[dict[str, Any]]] = {}
+    if same_tool_only:
+        if sampling_metadata is None:
+            raise ValueError("Same-tool beta pair cache build requires lightweight sampling metadata.")
+        chunk_retarget_cache_candidates = [
+            source_retarget_cache_dir,
+            configured_retarget_cache_dir,
+            str(cache_dir.parent / "retarget_cache"),
+        ]
+        for candidate in chunk_retarget_cache_candidates:
+            if not candidate:
+                continue
+            candidate_path = pathlib.Path(candidate).expanduser().resolve()
+            if (candidate_path / "manifest.jsonl").exists():
+                chunk_retarget_cache_dir = candidate_path
+                break
+        if chunk_retarget_cache_dir is None:
+            raise FileNotFoundError(
+                "Same-tool beta pair cache build requires a chunk-level retarget cache. "
+                "Pass --source-retarget-cache-dir or set data.meta_retarget_cache_dir."
+            )
+        chunk_records_by_tool = _load_chunk_retarget_records_by_tool(
+            chunk_retarget_cache_dir,
+            sampling_metadata=sampling_metadata,
+        )
+        if not chunk_records_by_tool:
+            raise ValueError(f"No accepted same-tool chunk retarget records found in {chunk_retarget_cache_dir}")
+        _data_loader.RetargetCacheDataset._warn_if_metadata_mismatch(  # noqa: SLF001
+            chunk_retarget_cache_dir,
+            expected_action_space="delta" if delta_action_masks else "absolute",
+            expected_retarget_algorithm=effective_retarget_algorithm,
+        )
 
     generator_config = _retarget.MetaRetargetGeneratorConfig(
         retarget_algorithm=effective_retarget_algorithm,
@@ -260,6 +371,9 @@ def main(
         "same_tool_only": bool(same_tool_only),
         "metadata_source_sampling": sampling_metadata is not None,
         "target_traversal": "seeded_shuffle",
+        "source_retarget_cache_dir": str(chunk_retarget_cache_dir) if chunk_retarget_cache_dir is not None else None,
+        "source_retarget_cache_records": int(sum(len(records) for records in chunk_records_by_tool.values())),
+        "source_retarget_cache_tools": int(len(chunk_records_by_tool)),
         "generator_config": generator_config.to_json_dict(),
     }
     (cache_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -298,16 +412,14 @@ def main(
             if rng.random() > target_prob:
                 skipped_probability += variants_per_target
                 continue
-            if same_tool_only and sampling_metadata is not None:
-                source_probe = _data_loader._sample_beta_source_index_from_metadata(  # noqa: SLF001
-                    sampling_metadata,
-                    rng,
-                    len(dataset),
-                    target_index,
-                    3,
-                    same_tool_only=True,
-                )
-                if source_probe is None:
+            target_tool = -1
+            if same_tool_only:
+                assert sampling_metadata is not None
+                if sampling_metadata.source_type_id[target_index] != 0:
+                    skipped_no_same_tool_source += variants_per_target
+                    continue
+                target_tool = int(sampling_metadata.tool_instance_hash[target_index])
+                if target_tool < 0 or target_tool not in chunk_records_by_tool:
                     skipped_no_same_tool_source += variants_per_target
                     continue
             raw_target = dataset[target_index]
@@ -322,7 +434,26 @@ def main(
                     break
                 source_index = None
                 source = None
-                if sampling_metadata is not None:
+                source_retarget_path = None
+                if same_tool_only:
+                    assert chunk_retarget_cache_dir is not None
+                    records = chunk_records_by_tool.get(target_tool, [])
+                    if records:
+                        source_record = records[int(rng.integers(len(records)))]
+                        source_index = int(source_record["base_index"])
+                        if 0 <= source_index < len(dataset):
+                            payload = _load_npz_payload(chunk_retarget_cache_dir, source_record)
+                            if payload is not None:
+                                raw_source = dataset[source_index]
+                                source_base = _chunk_cache._canonicalize_sample(  # noqa: SLF001
+                                    raw_source,
+                                    data_config,
+                                    max_meta_areas=max_meta_areas,
+                                    action_stride=action_stride,
+                                )
+                                source = _apply_retargeted_payload_to_canonical(source_base, payload)
+                                source_retarget_path = str(source_record["path"])
+                elif sampling_metadata is not None:
                     source_index = _data_loader._sample_beta_source_index_from_metadata(  # noqa: SLF001
                         sampling_metadata,
                         rng,
@@ -360,6 +491,9 @@ def main(
                 if source_index is None or source is None:
                     skipped_no_same_tool_source += 1
                     continue
+                if same_tool_only and not _valid_same_tool_pair(target, source):
+                    skipped_no_same_tool_source += 1
+                    continue
                 pair = (target_index, source_index, variant_id)
                 if pair in existing_pairs:
                     skipped_existing += 1
@@ -379,6 +513,7 @@ def main(
                         delta_action_masks=delta_action_masks_json,
                         max_attempts=max_attempts_per_pair,
                         retarget_mode=retarget_mode,
+                        source_retarget_path=source_retarget_path,
                     )
                 ] = pair
                 submitted += 1

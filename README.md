@@ -436,6 +436,14 @@ retarget-conditioned and would corrupt the intended relation ratio. If the selec
 shortcut has no same-tool accepted record, training raises an error so the chunk cache can be rebuilt
 instead of silently changing the sample distribution.
 
+For same-tool beta pair caches, `source_index` is the base/origin row used by a chunk-level retarget
+record, not a raw imagine row in the LeRobot dataset. The manifest must also contain
+`source_retarget_path`, which points into `data.meta_retarget_cache_dir`; training reconstructs chunk1
+by loading that chunk retarget payload and applying it to the base source sample. Pair-cache records
+without `source_retarget_path` are treated as legacy same-tool origin-origin caches, skipped with a
+warning, and should be deleted/rebuilt. The current beta same-tool source reconstruction is supported
+for structured 12D caches only; legacy 6D `meta_action_targets` are not supported in this path.
+
 Cross-tool chunk1/chunk2 pair retargets are intentionally disabled by default because asymmetric IK
 success rates can bias the distribution toward tools that are easy to retarget into. Use
 `meta_beta_pair_retarget_same_tool_only=false` only for explicit cross-tool ablations. Any beta pair
@@ -447,8 +455,10 @@ keeps the older per-DataLoader-worker thread producer. `data.meta_beta_online_wo
 starts a separate multiprocessing retarget worker group from the main process and shares request/result
 queues with the DataLoader workers. Process mode is experimental: it can isolate IK from DataLoader work,
 but it pays IPC and dataset-copy overhead and should only be used after an A/B test shows higher online
-retarget throughput. Producer polling is demand-driven: it happens when a retarget-conditioned sample is
-requested, not at the start of every `__getitem__`.
+retarget throughput. Process mode is disabled automatically for default same-tool beta retarget because
+its index-only request protocol cannot reconstruct `source_retarget_path` imagine sources. Producer
+polling is demand-driven: it happens when a retarget-conditioned sample is requested, not at the start of
+every `__getitem__`.
 
 `data.meta_beta_online_num_workers` controls producer threads in dataloader mode or producer processes in
 process mode. `data.meta_beta_online_queue_size` bounds local ready results, `data.meta_beta_online_max_pending`
@@ -709,15 +719,19 @@ Optional beta pair cache generation:
 python scripts/build_xtrainer_beta_pair_retarget_cache.py \
     --config-name pi05_xtrainer_meta_aux_structured_12d_delta_beta \
     --output-dir /path/to/beta_pair_cache \
+    --source-retarget-cache-dir /path/to/chunk_retarget_cache_12d \
     --variants-per-target 2 \
     --num-workers 8 \
     --max-attempts-per-pair 4
 ```
 
 The beta pair-cache builder uses the same `data.meta_retarget_algorithm` default as training. In
-default same-tool mode it samples origin targets and same-tool imagine sources. Rebuild both the
-chunk-level retarget cache and beta pair cache when switching algorithms or after changing the same-tool
-origin/imagine pairing rule; any old same-tool origin-origin beta pair cache should be discarded.
+default same-tool mode it samples origin targets and same-tool imagine sources reconstructed from the
+chunk-level retarget cache. Pass `--source-retarget-cache-dir` explicitly, or let the builder use
+`data.meta_retarget_cache_dir`; as a local pipeline fallback it also checks
+`<beta_pair_cache_parent>/retarget_cache`. Rebuild both the chunk-level retarget cache and beta pair cache
+when switching algorithms or after changing the same-tool origin/imagine pairing rule; any old same-tool
+origin-origin beta pair cache should be discarded.
 
 Default same-tool beta training:
 

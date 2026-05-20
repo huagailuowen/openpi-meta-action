@@ -572,6 +572,34 @@ def _tiny_beta_sample(idx: int, *, tool: int, episode: int, source_type: int = 0
     }
 
 
+def _write_tiny_chunk_retarget_cache(cache_dir, base_index: int, sample: dict, *, relpath: str | None = None) -> str:
+    relpath = relpath or f"variants/{base_index:09d}_00.npz"
+    payload_path = cache_dir / relpath
+    payload_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        payload_path,
+        state=np.asarray(sample["state"], dtype=np.float32),
+        actions=np.asarray(sample["actions"], dtype=np.float32),
+        meta_area_pose12d=np.asarray(sample["meta_areas"]["pose12d"], dtype=np.float32),
+        meta_area_dim_mask12=np.asarray(sample["meta_areas"]["dim_mask12"], dtype=bool),
+        meta_area_type=np.asarray(sample["meta_areas"]["type"], dtype=np.int32),
+        meta_area_mask=np.asarray(sample["meta_areas"]["mask"], dtype=bool),
+        meta_action_target_pose12d=np.asarray(sample["meta_action_targets"]["pose12d"], dtype=np.float32),
+        meta_action_target_dim_mask12=np.asarray(sample["meta_action_targets"]["dim_mask12"], dtype=bool),
+        meta_action_target_mask=np.asarray(sample["meta_action_targets"]["mask"], dtype=bool),
+    )
+    (cache_dir / "metadata.json").write_text('{"cache_action_space": "absolute"}', encoding="utf-8")
+    (cache_dir / "manifest.jsonl").write_text(
+        (
+            f'{{"accepted": true, "base_index": {base_index}, "variant_id": 0, '
+            f'"path": "{relpath}", "retarget_mode": "future_near", '
+            '"trajectory_start_index": 0, "approach_steps": 0}\n'
+        ),
+        encoding="utf-8",
+    )
+    return relpath
+
+
 def test_beta_pair_dataset_retarget_condition_uses_source_and_retarget_target(monkeypatch):
     class TinyDataset:
         def __init__(self):
@@ -652,16 +680,16 @@ def test_beta_pair_dataset_retarget_condition_uses_source_and_retarget_target(mo
     assert float(sample["meta_control"]["imagination_alpha"]) == 0.0
 
 
-def test_beta_same_tool_pair_retarget_uses_origin_target_and_imagine_source(monkeypatch):
+def test_beta_same_tool_pair_retarget_uses_origin_target_and_imagine_source(monkeypatch, tmp_path):
     class TinyDataset:
         def __init__(self):
             self.samples = [
                 _tiny_beta_sample(0, tool=1, episode=0, source_type=0),
-                _tiny_beta_sample(1, tool=1, episode=1, source_type=2),
+                _tiny_beta_sample(1, tool=1, episode=1, source_type=0),
             ]
             self.hf_dataset = {
                 "observation.tool_instance_hash": [[1], [1]],
-                "observation.source_type_id": [[0], [2]],
+                "observation.source_type_id": [[0], [0]],
                 "episode_index": [0, 1],
             }
 
@@ -705,8 +733,11 @@ def test_beta_same_tool_pair_retarget_uses_origin_target_and_imagine_source(monk
         )
 
     monkeypatch.setattr(_data_loader._meta_retarget, "generate_pair_retargeted_chunk", fake_pair_retarget)  # noqa: SLF001
+    dataset = TinyDataset()
+    _write_tiny_chunk_retarget_cache(tmp_path, 1, dataset.samples[1])
     data_config = dataclasses.replace(
         _config.DataConfig(),
+        meta_retarget_cache_dir=str(tmp_path),
         meta_retarget_cache_prob=1.0,
         meta_beta_imagine_cache_condition_prob=0.0,
         meta_beta_seed=1,
@@ -720,7 +751,7 @@ def test_beta_same_tool_pair_retarget_uses_origin_target_and_imagine_source(monk
         meta_beta_pair_retarget_same_tool_only=True,
     )
     sample = _data_loader.BetaStructuredMetaPairDataset(
-        TinyDataset(),
+        dataset,
         data_config,
         expected_action_space="absolute",
         delta_action_masks=[],
@@ -938,6 +969,88 @@ def test_beta_pair_dataset_uses_pair_cache_when_online_queue_empty(tmp_path):
     assert float(sample["meta_control"]["imagination_alpha"]) == 0.0
 
 
+def test_beta_same_tool_pair_cache_reconstructs_imagine_source_from_chunk_cache(tmp_path):
+    class TinyDataset:
+        def __init__(self):
+            self.samples = [
+                _tiny_beta_sample(0, tool=1, episode=0, source_type=0),
+                _tiny_beta_sample(1, tool=1, episode=1, source_type=0),
+            ]
+            self.hf_dataset = {
+                "observation.tool_instance_hash": [[1], [1]],
+                "observation.source_type_id": [[0], [0]],
+                "episode_index": [0, 1],
+            }
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            return self.samples[int(idx)]
+
+    dataset = TinyDataset()
+    chunk_cache_dir = tmp_path / "retarget_cache"
+    source_retarget_path = _write_tiny_chunk_retarget_cache(chunk_cache_dir, 1, dataset.samples[1])
+
+    pair_cache_dir = tmp_path / "beta_pair_retarget_cache"
+    pair_relpath = "pairs/000000/000000000_000000001_00.npz"
+    pair_payload_path = pair_cache_dir / pair_relpath
+    pair_payload_path.parent.mkdir(parents=True)
+    np.savez(
+        pair_payload_path,
+        state=np.full((32,), 3.0, dtype=np.float32),
+        actions=np.full((4, 32), 7.0, dtype=np.float32),
+        meta_area_pose12d=np.full((1, 12), 9.0, dtype=np.float32),
+        meta_area_dim_mask12=np.ones((1, 12), dtype=bool),
+        meta_area_type=np.array([_meta_retarget.META_AREA_TYPE_TO_ID["line"]], dtype=np.int32),
+        meta_area_mask=np.array([True], dtype=bool),
+        meta_action_target_pose12d=np.full((4, 1, 12), 10.0, dtype=np.float32),
+        meta_action_target_dim_mask12=np.ones((4, 1, 12), dtype=bool),
+        meta_action_target_mask=np.ones((4, 1), dtype=bool),
+    )
+    (pair_cache_dir / "metadata.json").write_text('{"cache_action_space": "absolute"}', encoding="utf-8")
+    (pair_cache_dir / "manifest.jsonl").write_text(
+        (
+            '{"accepted": true, "target_index": 0, "source_index": 1, "variant_id": 0, '
+            f'"path": "{pair_relpath}", "source_retarget_path": "{source_retarget_path}", '
+            '"retarget_mode": "future_near", "trajectory_start_index": 2, "approach_steps": 3}\n'
+        ),
+        encoding="utf-8",
+    )
+
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        meta_retarget_cache_dir=str(chunk_cache_dir),
+        meta_retarget_cache_prob=1.0,
+        meta_beta_pair_cache_dir=str(pair_cache_dir),
+        meta_beta_seed=0,
+        meta_beta_self_same_chunk_prob=0.0,
+        meta_beta_same_episode_diff_chunk_prob=0.0,
+        meta_beta_same_tool_diff_episode_prob=0.0,
+        meta_beta_retarget_conditioned_prob=1.0,
+        meta_beta_meta_area_condition_prob=1.0,
+        meta_beta_reference_action_condition_prob=0.0,
+        meta_beta_obs_only_condition_prob=0.0,
+        meta_beta_imagine_cache_condition_prob=0.0,
+        meta_beta_online_async_enabled=True,
+        meta_beta_online_prefer_prob=0.0,
+        meta_beta_pair_retarget_same_tool_only=True,
+    )
+    sample = _data_loader.BetaStructuredMetaPairDataset(
+        dataset,
+        data_config,
+        expected_action_space="absolute",
+        delta_action_masks=[],
+    )[0]
+
+    assert bool(sample["_beta_debug"]["retarget_applied"])
+    assert int(sample["_beta_debug"]["retarget_source_id"]) == 1
+    np.testing.assert_array_equal(sample["actions"], np.full((4, 32), 7.0, dtype=np.float32))
+    np.testing.assert_array_equal(sample["execution_meta_areas"]["pose12d"], np.full((1, 12), 9.0, dtype=np.float32))
+    np.testing.assert_array_equal(sample["meta_areas"]["pose12d"][:, :3], np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32))
+    assert int(sample["source_type_id"][0]) == 2
+
+
 def test_beta_retarget_condition_uses_same_tool_chunk_cache_for_meta_condition(tmp_path):
     class TinyDataset:
         def __init__(self):
@@ -1018,16 +1131,16 @@ def test_beta_retarget_condition_uses_same_tool_chunk_cache_for_meta_condition(t
     assert float(sample["meta_control"]["imagination_alpha"]) == 0.0
 
 
-def test_beta_retarget_reference_condition_uses_same_tool_imagine_source_pair(monkeypatch):
+def test_beta_retarget_reference_condition_uses_same_tool_imagine_source_pair(monkeypatch, tmp_path):
     class TinyDataset:
         def __init__(self):
             self.samples = [
                 _tiny_beta_sample(0, tool=1, episode=0, source_type=0),
-                _tiny_beta_sample(1, tool=1, episode=1, source_type=2),
+                _tiny_beta_sample(1, tool=1, episode=1, source_type=0),
             ]
             self.hf_dataset = {
                 "observation.tool_instance_hash": [[1], [1]],
-                "observation.source_type_id": [[0], [2]],
+                "observation.source_type_id": [[0], [0]],
                 "episode_index": [0, 1],
             }
 
@@ -1069,8 +1182,11 @@ def test_beta_retarget_reference_condition_uses_same_tool_imagine_source_pair(mo
 
     monkeypatch.setattr(_data_loader._meta_retarget, "generate_pair_retargeted_chunk", fake_pair_retarget)  # noqa: SLF001
 
+    dataset = TinyDataset()
+    _write_tiny_chunk_retarget_cache(tmp_path, 1, dataset.samples[1])
     data_config = dataclasses.replace(
         _config.DataConfig(),
+        meta_retarget_cache_dir=str(tmp_path),
         meta_retarget_cache_prob=1.0,
         meta_beta_imagine_cache_condition_prob=0.0,
         meta_beta_seed=0,
@@ -1083,7 +1199,7 @@ def test_beta_retarget_reference_condition_uses_same_tool_imagine_source_pair(mo
         meta_beta_obs_only_condition_prob=0.0,
     )
     sample = _data_loader.BetaStructuredMetaPairDataset(
-        TinyDataset(),
+        dataset,
         data_config,
         expected_action_space="absolute",
         delta_action_masks=[],
