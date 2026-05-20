@@ -986,9 +986,19 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             dtype=np.float64,
         )
         self._relation_probs = relation_probs / max(float(np.sum(relation_probs)), 1e-8)
+        retarget_meta_prob = (
+            data_config.meta_beta_meta_area_condition_prob
+            if data_config.meta_beta_retarget_meta_area_condition_prob is None
+            else data_config.meta_beta_retarget_meta_area_condition_prob
+        )
+        retarget_reference_prob = (
+            data_config.meta_beta_reference_action_condition_prob
+            if data_config.meta_beta_retarget_reference_action_condition_prob is None
+            else data_config.meta_beta_retarget_reference_action_condition_prob
+        )
         self._retarget_condition_probs = _condition_probabilities(
-            data_config.meta_beta_meta_area_condition_prob,
-            data_config.meta_beta_reference_action_condition_prob,
+            retarget_meta_prob,
+            retarget_reference_prob,
             data_config.meta_beta_obs_only_condition_prob,
         )
         self._non_retarget_condition_probs = _condition_probabilities_with_obs_fraction(

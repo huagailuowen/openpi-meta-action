@@ -433,7 +433,9 @@ probability of drawing a random accepted record directly from the chunk-level re
 chunk becomes both chunk1 and chunk2: its cached meta-area start is used as the condition meta area, its
 cached state/actions are used for qpos supervision, and its cached `meta_action_targets` are used for
 meta-action supervision. The remaining probability continues through the beta pair cache / online queue
-path. This path requires rebuilding the chunk retarget cache with the current retarget planner; old chunk
+path. Current beta configs use `meta_beta_imagine_cache_condition_prob=0.90`, so most
+retarget-conditioned meta-area samples come from the prebuilt chunk-level imagine cache. This path
+requires rebuilding the chunk retarget cache with the current retarget planner; old chunk
 cache records will preserve old trajectory behavior.
 
 Current beta retarget-conditioned samples are restricted to original chunks from the same
@@ -476,7 +478,9 @@ handled by bounded retries and fallback logic.
 
 The default beta relation mix is now `self_same_chunk=0.12`,
 `same_episode_diff_chunk=0.08`, `same_tool_diff_episode=0.65`, and
-`retarget_conditioned=0.15`. For `self_same_chunk`, reference-action conditioning is capped at
+`retarget_conditioned=0.15`. Retarget-conditioned samples use a separate condition ratio:
+`meta_area=0.85`, `reference_action=0.15`, and `obs_only=0.0`; this does not change the
+non-retarget condition ratios. For `self_same_chunk`, reference-action conditioning is capped at
 `0.20`; the removed reference probability is assigned to obs-only conditioning, yielding the default
 self condition mix `meta_area=0.45`, `reference_action=0.20`, `obs_only=0.35`.
 

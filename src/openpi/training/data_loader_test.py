@@ -433,6 +433,33 @@ def test_beta_self_same_chunk_condition_distribution_uses_twenty_percent_referen
     np.testing.assert_allclose(np.sum(probs), 1.0, rtol=1e-6)
 
 
+def test_beta_retarget_condition_distribution_can_override_meta_reference_ratio():
+    class TinyDataset:
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, idx):
+            return _tiny_beta_sample(int(idx), tool=7, episode=0, source_type=0)
+
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        meta_beta_meta_area_condition_prob=0.45,
+        meta_beta_reference_action_condition_prob=0.50,
+        meta_beta_retarget_meta_area_condition_prob=0.85,
+        meta_beta_retarget_reference_action_condition_prob=0.15,
+        meta_beta_self_same_chunk_reference_action_condition_prob=0.20,
+    )
+    wrapped = _data_loader.BetaStructuredMetaPairDataset(
+        TinyDataset(),
+        data_config,
+        expected_action_space="absolute",
+        delta_action_masks=[],
+    )
+
+    np.testing.assert_allclose(wrapped._retarget_condition_probs, np.asarray([0.85, 0.15, 0.0]))  # noqa: SLF001
+    np.testing.assert_allclose(wrapped._self_same_chunk_condition_probs, np.asarray([0.45, 0.20, 0.35]))  # noqa: SLF001
+
+
 def test_beta_sampling_metadata_reads_hf_columns_without_getitem():
     class RawDataset:
         def __init__(self):
