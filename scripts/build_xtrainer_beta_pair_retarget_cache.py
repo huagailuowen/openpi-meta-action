@@ -259,6 +259,7 @@ def main(
         "max_meta_areas": max_meta_areas,
         "same_tool_only": bool(same_tool_only),
         "metadata_source_sampling": sampling_metadata is not None,
+        "target_traversal": "seeded_shuffle",
         "generator_config": generator_config.to_json_dict(),
     }
     (cache_dir / "metadata.json").write_text(json.dumps(metadata, ensure_ascii=True, indent=2), encoding="utf-8")
@@ -266,6 +267,8 @@ def main(
     existing_pairs = set() if overwrite else _load_existing_pairs(cache_dir)
     rng = np.random.default_rng(seed)
     total_targets = len(dataset) if max_targets is None else min(max_targets, len(dataset))
+    target_indices = np.arange(total_targets, dtype=np.int64)
+    rng.shuffle(target_indices)
     submitted = 0
     accepted = 0
     rejected = 0
@@ -290,7 +293,8 @@ def main(
         handle_record(done.result())
 
     with futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        for target_index in tqdm.trange(total_targets, desc="Submitting beta pair retargets"):
+        for target_index_raw in tqdm.tqdm(target_indices, desc="Submitting beta pair retargets"):
+            target_index = int(target_index_raw)
             if rng.random() > target_prob:
                 skipped_probability += variants_per_target
                 continue
