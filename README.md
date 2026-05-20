@@ -420,33 +420,29 @@ trajectory, subtracts the reference start-frame qpos for dims `0:6` and `7:13`, 
 and inference force this value to `0.0` and keep the field only as a compatibility/debug value.
 
 Pair retarget has two modes. In the default same-tool setting
-(`data.meta_beta_pair_retarget_same_tool_only=true`), retarget-conditioned training is cache-only:
-it samples a same-tool accepted record from the chunk-level imagine retarget cache at
-`data.meta_retarget_cache_dir`. It does not fall back to same-tool origin-origin pair retarget,
-because origin-origin pairs are not semantically retarget-conditioned and would corrupt the intended
-relation ratio. If no same-tool chunk-cache record exists, training raises an error so the cache can be
-rebuilt instead of silently changing the sample distribution. Pair cache / online / sync pair retarget
-is kept only for explicit cross-tool ablations with `meta_beta_pair_retarget_same_tool_only=false`.
+(`data.meta_beta_pair_retarget_same_tool_only=true`), retarget-conditioned training first samples the
+condition type: current configs use `meta_area=0.85`, `reference_action=0.15`, and `obs_only=0.0`.
+For meta-area conditioning, `data.meta_beta_imagine_cache_condition_prob` controls the direct
+chunk-cache shortcut. Current configs set it to `0.90`, so the direct shortcut probability inside
+relation-3 is `0.85 * 0.90`. The direct shortcut samples a same-tool accepted record from the
+chunk-level imagine retarget cache at `data.meta_retarget_cache_dir`; that cached retargeted chunk is
+used as both chunk1 and chunk2.
 
-In this same-tool mode the cached retargeted chunk becomes both chunk1 and chunk2: its cached
-meta-area start is used for meta-area conditioning, its cached actions are used for reference-action
-conditioning, its cached state/actions are used for qpos supervision, and its cached
-`meta_action_targets` are used for meta-action supervision. Current same-tool beta configs set
-`data.meta_beta_imagine_cache_condition_prob=1.0`; the field is kept for compatibility, but relation-3
-same-tool sampling is always chunk-cache backed. This path requires rebuilding the chunk retarget cache
-with the current retarget planner; old chunk cache records will preserve old trajectory behavior.
+The remaining retarget-conditioned samples use the pair retarget path: chunk2/target must be an origin
+sample, chunk1/source must be a non-origin imagine/retarget sample from the same `tool_instance_id`.
+This pair path can consume a beta pair cache, a ready online result, or the bounded sync generator. It
+does not allow same-tool origin-origin pair retarget, because origin-origin pairs are not semantically
+retarget-conditioned and would corrupt the intended relation ratio. If the selected direct chunk-cache
+shortcut has no same-tool accepted record, training raises an error so the chunk cache can be rebuilt
+instead of silently changing the sample distribution.
 
-Current beta retarget-conditioned same-tool samples are restricted to imagine chunks from the same
-`tool_instance_id` (`data.meta_beta_pair_retarget_same_tool_only=true`). Cross-tool chunk1/chunk2 pair
-retargets are intentionally skipped because asymmetric IK success rates can bias the distribution
-toward tools that are easy to retarget into. The offline beta pair-cache builder should be used only
-with `--no-same-tool-only` for explicit cross-tool ablations. Any same-tool origin-origin beta pair
-cache built before this rule must be discarded; it no longer represents the intended training
-distribution.
+Cross-tool chunk1/chunk2 pair retargets are intentionally disabled by default because asymmetric IK
+success rates can bias the distribution toward tools that are easy to retarget into. Use
+`meta_beta_pair_retarget_same_tool_only=false` only for explicit cross-tool ablations. Any beta pair
+cache built with same-tool origin-origin pairs must be discarded; it no longer represents the intended
+training distribution.
 
-The online producer is disabled in the default same-tool mode because relation-3 samples do not use
-pair retarget. For explicit cross-tool ablations (`meta_beta_pair_retarget_same_tool_only=false`), it
-can run in two worker groups. `data.meta_beta_online_worker_group="dataloader"`
+The online producer can run in two worker groups. `data.meta_beta_online_worker_group="dataloader"`
 keeps the older per-DataLoader-worker thread producer. `data.meta_beta_online_worker_group="process"`
 starts a separate multiprocessing retarget worker group from the main process and shares request/result
 queues with the DataLoader workers. Process mode is experimental: it can isolate IK from DataLoader work,
@@ -458,9 +454,8 @@ requested, not at the start of every `__getitem__`.
 process mode. `data.meta_beta_online_queue_size` bounds local ready results, `data.meta_beta_online_max_pending`
 caps expensive submissions per demand poll, and `data.meta_beta_online_request_queue_size` /
 `data.meta_beta_online_result_queue_size` bound the shared process-mode queues. The beta pair-cache
-fallback is built by `scripts/build_xtrainer_beta_pair_retarget_cache.py` only for cross-tool
-ablations; the script rejects its default same-tool mode to avoid generating invalid same-tool
-origin-origin retarget caches.
+fallback is built by `scripts/build_xtrainer_beta_pair_retarget_cache.py`; in same-tool mode it stores
+origin-target plus imagine-source records, never origin-origin pairs.
 
 The dataset-specific beta config
 `pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3`
@@ -472,9 +467,7 @@ and the token mask shapes no longer match.
 That config also sets `data.meta_retarget_cache_prob=1.0`. In the beta dataloader, relation sampling
 already controls how often retarget-conditioned pairs are attempted through
 `data.meta_beta_retarget_conditioned_prob=0.15`; leaving the old `0.2` value would add a second random
-gate and reduce the effective attempt rate to `0.15 * 0.20 = 0.03`. In the default same-tool path this
-probability gates accepted chunk-cache records, so a missing cache is treated as a setup error rather
-than an origin fallback.
+gate and reduce the effective attempt rate to `0.15 * 0.20 = 0.03`.
 
 The default beta relation mix is now `self_same_chunk=0.12`,
 `same_episode_diff_chunk=0.08`, `same_tool_diff_episode=0.65`, and
@@ -485,8 +478,8 @@ non-retarget condition ratios. For `self_same_chunk`, reference-action condition
 self condition mix `meta_area=0.45`, `reference_action=0.20`, `obs_only=0.35`.
 
 For throughput, `TrainConfig.data_loader_prefetch_factor` defaults to `4` when `num_workers > 0`.
-Increasing `num_workers` and using `train_data_prefetch_buffer` are the main same-tool beta levers.
-Beta pair caches and online producers are only for explicit cross-tool ablations.
+Increasing `num_workers`, building a beta pair cache, enabling the online producer, and using
+`train_data_prefetch_buffer` are the main levers for keeping GPU utilization high.
 
 For throughput diagnosis, set:
 
@@ -710,22 +703,21 @@ python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta \
     --overrides data.repo_id=/path/to/your/classified_structured_12d_lerobot_dataset
 ```
 
-Optional beta pair cache generation for cross-tool ablations only:
+Optional beta pair cache generation:
 
 ```bash
 python scripts/build_xtrainer_beta_pair_retarget_cache.py \
     --config-name pi05_xtrainer_meta_aux_structured_12d_delta_beta \
     --output-dir /path/to/beta_pair_cache \
-    --no-same-tool-only \
     --variants-per-target 2 \
     --num-workers 8 \
     --max-attempts-per-pair 4
 ```
 
-The beta pair-cache builder uses the same `data.meta_retarget_algorithm` default as training. For the
-default same-tool beta training, do not build this cache; build or rebuild the chunk-level retarget
-cache referenced by `data.meta_retarget_cache_dir` instead. Any old same-tool origin-origin beta pair
-cache should be discarded.
+The beta pair-cache builder uses the same `data.meta_retarget_algorithm` default as training. In
+default same-tool mode it samples origin targets and same-tool imagine sources. Rebuild both the
+chunk-level retarget cache and beta pair cache when switching algorithms or after changing the same-tool
+origin/imagine pairing rule; any old same-tool origin-origin beta pair cache should be discarded.
 
 Default same-tool beta training:
 
@@ -734,8 +726,9 @@ python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta \
     --exp-name my_beta_run_12d \
     --overrides data.repo_id=/path/to/your/classified_structured_12d_lerobot_dataset \
     --overrides data.meta_retarget_cache_dir=/path/to/chunk_retarget_cache_12d \
+    --overrides data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache \
     --overrides data.meta_beta_pair_retarget_same_tool_only=true \
-    --overrides data.meta_beta_online_async_enabled=false \
+    --overrides data.meta_beta_online_async_enabled=true \
     --overrides num_workers=12 \
     --overrides train_data_prefetch_buffer=8
 ```
@@ -748,19 +741,16 @@ default same-tool:
   data_loader_prefetch_factor=4
   train_data_prefetch_buffer=8
   data.meta_retarget_cache_dir=/path/to/chunk_retarget_cache_12d
+  data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
   data.meta_beta_pair_retarget_same_tool_only=true
-  data.meta_beta_online_async_enabled=false
-```
+  data.meta_beta_online_async_enabled=true
 
-Cross-tool ablation A/B matrix:
-
-```text
 cache-first:
   num_workers=12
   data_loader_prefetch_factor=4
   train_data_prefetch_buffer=8
   data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
-  data.meta_beta_pair_retarget_same_tool_only=false
+  data.meta_beta_pair_retarget_same_tool_only=true
   data.meta_beta_online_async_enabled=true
   data.meta_beta_online_prefer_prob=0.0
 
@@ -769,7 +759,7 @@ throttled-online:
   data_loader_prefetch_factor=4
   train_data_prefetch_buffer=8
   data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
-  data.meta_beta_pair_retarget_same_tool_only=false
+  data.meta_beta_pair_retarget_same_tool_only=true
   data.meta_beta_online_async_enabled=true
   data.meta_beta_online_worker_group=dataloader
   data.meta_beta_online_num_workers=1
@@ -782,7 +772,7 @@ experimental separate-online-workgroup:
   data_loader_prefetch_factor=4
   train_data_prefetch_buffer=8
   data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
-  data.meta_beta_pair_retarget_same_tool_only=false
+  data.meta_beta_pair_retarget_same_tool_only=true
   data.meta_beta_online_async_enabled=true
   data.meta_beta_online_worker_group=process
   data.meta_beta_online_num_workers=16

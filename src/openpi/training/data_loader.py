@@ -37,6 +37,7 @@ class _BetaSamplingMetadata(typing.NamedTuple):
     by_episode: dict[int, np.ndarray]
     by_tool: dict[int, np.ndarray]
     origin_by_tool: dict[int, np.ndarray]
+    imagine_by_tool: dict[int, np.ndarray]
 
 
 class Dataset(Protocol[T_co]):
@@ -246,6 +247,7 @@ def _apply_retargeted_payload(sample: dict[str, typing.Any], retargeted: dict[st
     out = _clone_sample(sample)
     out["state"] = retargeted["state"].astype(np.float32)
     out["actions"] = retargeted["actions"].astype(np.float32)
+    out["source_type_id"] = np.asarray([2], dtype=np.int32)
     meta_areas = dict(out.get("meta_areas", {}))
     if "meta_area_pose12d" in retargeted:
         meta_areas["pose12d"] = retargeted["meta_area_pose12d"].astype(np.float32)
@@ -533,6 +535,10 @@ def _is_origin_sample(sample: dict[str, typing.Any]) -> bool:
     return _scalar_int(sample.get("source_type_id"), default=0) == 0
 
 
+def _is_imagine_sample(sample: dict[str, typing.Any]) -> bool:
+    return _scalar_int(sample.get("source_type_id"), default=0) != 0
+
+
 def _same_tool_sample_pair(target_sample: dict[str, typing.Any], source_sample: dict[str, typing.Any]) -> bool:
     target_tool = _scalar_int(target_sample.get("tool_instance_hash"), default=-1)
     source_tool = _scalar_int(source_sample.get("tool_instance_hash"), default=-2)
@@ -543,7 +549,7 @@ def _valid_same_tool_pair_retarget_samples(
     target_sample: dict[str, typing.Any],
     source_sample: dict[str, typing.Any],
 ) -> bool:
-    return _is_origin_sample(target_sample) and _is_origin_sample(source_sample) and _same_tool_sample_pair(target_sample, source_sample)
+    return _is_origin_sample(target_sample) and _is_imagine_sample(source_sample) and _same_tool_sample_pair(target_sample, source_sample)
 
 
 def _unwrap_raw_dataset(dataset: Dataset) -> Dataset:
@@ -594,6 +600,7 @@ def _build_beta_sampling_metadata(dataset: Dataset) -> _BetaSamplingMetadata | N
     if np.all(tool_instance_hash < 0) or np.all(episode_index < 0):
         return None
     origin_mask = source_type_id == 0
+    imagine_mask = source_type_id != 0
     return _BetaSamplingMetadata(
         tool_instance_hash=tool_instance_hash,
         source_type_id=source_type_id,
@@ -601,6 +608,7 @@ def _build_beta_sampling_metadata(dataset: Dataset) -> _BetaSamplingMetadata | N
         by_episode=_index_pools(episode_index),
         by_tool=_index_pools(tool_instance_hash),
         origin_by_tool=_index_pools(tool_instance_hash, mask=origin_mask),
+        imagine_by_tool=_index_pools(tool_instance_hash, mask=imagine_mask),
     )
 
 
@@ -663,7 +671,7 @@ def _sample_beta_source_index_from_metadata(
         if int(metadata.source_type_id[base_index]) != 0 or target_tool < 0:
             return None
         return _sample_from_pool_excluding(
-            metadata.origin_by_tool.get(target_tool, np.asarray([], dtype=np.int64)),
+            metadata.imagine_by_tool.get(target_tool, np.asarray([], dtype=np.int64)),
             rng,
             excluded={base_index},
         )
@@ -916,12 +924,14 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         if (
             self._pair_retarget_same_tool_only
             and data_config.meta_beta_retarget_conditioned_prob > 0.0
+            and self._imagine_cache_condition_prob > 0.0
             and not self._chunk_cache_records_by_tool
         ):
             raise ValueError(
                 "Beta same-tool retarget-conditioned training requires a chunk-level retarget cache with "
-                "tool_instance_hash metadata. Build meta_retarget_cache_dir first, or set "
-                "meta_beta_retarget_conditioned_prob=0 for non-retarget beta training."
+                "tool_instance_hash metadata when meta_beta_imagine_cache_condition_prob > 0. Build "
+                "meta_retarget_cache_dir first, or set meta_beta_imagine_cache_condition_prob=0 for "
+                "pair/online-only beta retarget training."
             )
         if self._cache_dir is not None:
             RetargetCacheDataset._warn_if_metadata_mismatch(
@@ -944,9 +954,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 expected_retarget_algorithm=data_config.meta_retarget_algorithm,
             )
         self._pair_cache_rng = np.random.default_rng(data_config.meta_beta_pair_cache_seed)
-        # Default same-tool beta retarget no longer uses pair-retarget producers:
-        # relation-3 samples are drawn directly from the chunk-level imagine cache.
-        self._online_async_enabled = bool(data_config.meta_beta_online_async_enabled) and not self._pair_retarget_same_tool_only
+        self._online_async_enabled = bool(data_config.meta_beta_online_async_enabled)
         self._online_num_workers = max(1, int(data_config.meta_beta_online_num_workers))
         self._online_queue_size = max(0, int(data_config.meta_beta_online_queue_size))
         self._online_max_pending = (
@@ -1043,7 +1051,13 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         beta_debug: dict[str, typing.Any] = {"relation_id": relation_id, "retarget_applied": False}
         if relation_id == 3:
             requested_condition_id = int(self._rng.choice(3, p=self._retarget_condition_probs))
-            if self._pair_retarget_same_tool_only:
+            use_direct_chunk_cache = (
+                self._pair_retarget_same_tool_only
+                and requested_condition_id == 0
+                and self._imagine_cache_condition_prob > 0.0
+                and self._rng.random() < self._imagine_cache_condition_prob
+            )
+            if use_direct_chunk_cache:
                 chunk_cache_result = self._sample_same_tool_chunk_retarget_cache(base_index, target_sample)
                 if chunk_cache_result is None:
                     raise RuntimeError(
@@ -1409,8 +1423,6 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         return True
 
     def _sample_pair_retarget_indices(self) -> tuple[int, int] | None:
-        if self._pair_retarget_same_tool_only:
-            return None
         dataset_len = len(self._dataset)
         if dataset_len <= 1:
             return None

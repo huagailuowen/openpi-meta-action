@@ -71,6 +71,10 @@ def _is_origin_sample(sample: dict[str, Any]) -> bool:
     return _scalar_int(sample.get("source_type_id"), default=0) == 0
 
 
+def _is_imagine_sample(sample: dict[str, Any]) -> bool:
+    return _scalar_int(sample.get("source_type_id"), default=0) != 0
+
+
 def _same_tool_sample_pair(target_sample: dict[str, Any], source_sample: dict[str, Any]) -> bool:
     target_tool = _scalar_int(target_sample.get("tool_instance_hash"), default=-1)
     source_tool = _scalar_int(source_sample.get("tool_instance_hash"), default=-2)
@@ -78,7 +82,7 @@ def _same_tool_sample_pair(target_sample: dict[str, Any], source_sample: dict[st
 
 
 def _valid_same_tool_pair(target_sample: dict[str, Any], source_sample: dict[str, Any]) -> bool:
-    return _is_origin_sample(target_sample) and _is_origin_sample(source_sample) and _same_tool_sample_pair(target_sample, source_sample)
+    return _is_origin_sample(target_sample) and _is_imagine_sample(source_sample) and _same_tool_sample_pair(target_sample, source_sample)
 
 
 def _generate_pair_worker(
@@ -177,14 +181,6 @@ def main(
         raise ValueError("--variants-per-target must be >= 1")
     if num_workers < 1:
         raise ValueError("--num-workers must be >= 1")
-    if same_tool_only:
-        raise ValueError(
-            "Same-tool beta pair cache generation is disabled. Default same-tool beta retarget-conditioned "
-            "training samples same-tool imagine chunks from data.meta_retarget_cache_dir. Rebuild the "
-            "chunk-level retarget cache instead, or pass --no-same-tool-only only for explicit cross-tool "
-            "pair-retarget ablations."
-        )
-
     cache_dir = pathlib.Path(output_dir).expanduser().resolve()
     if overwrite and cache_dir.exists():
         shutil.rmtree(cache_dir)

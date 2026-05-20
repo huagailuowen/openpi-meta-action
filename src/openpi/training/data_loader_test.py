@@ -490,7 +490,7 @@ def test_beta_sampling_metadata_reads_hf_columns_without_getitem():
             3,
             same_tool_only=True,
         )
-        assert source_index == 3
+        assert source_index == 1
 
     relation2_source = _data_loader._sample_beta_source_index_from_metadata(  # noqa: SLF001
         metadata,
@@ -649,6 +649,88 @@ def test_beta_pair_dataset_retarget_condition_uses_source_and_retarget_target(mo
     assert not bool(sample["reference_action_mask"])
     assert bool(sample["meta_areas"]["mask"][0])
     np.testing.assert_array_equal(sample["execution_meta_areas"]["pose12d"][:, :3], np.full((1, 3), 77.0))
+    assert float(sample["meta_control"]["imagination_alpha"]) == 0.0
+
+
+def test_beta_same_tool_pair_retarget_uses_origin_target_and_imagine_source(monkeypatch):
+    class TinyDataset:
+        def __init__(self):
+            self.samples = [
+                _tiny_beta_sample(0, tool=1, episode=0, source_type=0),
+                _tiny_beta_sample(1, tool=1, episode=1, source_type=2),
+            ]
+            self.hf_dataset = {
+                "observation.tool_instance_hash": [[1], [1]],
+                "observation.source_type_id": [[0], [2]],
+                "episode_index": [0, 1],
+            }
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            return self.samples[int(idx)]
+
+    def fake_pair_retarget(target_data, source_data, *, rng, config):
+        del rng, config
+        assert int(np.asarray(target_data["source_type_id"]).reshape(-1)[0]) == 0
+        assert int(np.asarray(source_data["source_type_id"]).reshape(-1)[0]) == 2
+        assert int(np.asarray(target_data["tool_instance_hash"]).reshape(-1)[0]) == int(
+            np.asarray(source_data["tool_instance_hash"]).reshape(-1)[0]
+        )
+        actions = np.full_like(target_data["actions"], 12.0)
+        return _meta_retarget.MetaRetargetResult(
+            state=np.asarray(target_data["state"], dtype=np.float32),
+            actions=actions,
+            meta_area_pose6d=np.zeros((1, 6), dtype=np.float32),
+            meta_area_type=np.array([_meta_retarget.META_AREA_TYPE_TO_ID["line"]], dtype=np.int32),
+            meta_area_mask=np.array([True], dtype=bool),
+            meta_area_pose12d=np.asarray(source_data["meta_areas"]["pose12d"], dtype=np.float32),
+            meta_area_dim_mask12=np.asarray(source_data["meta_areas"]["dim_mask12"], dtype=bool),
+            meta_action_target_pose12d=np.asarray(target_data["meta_action_targets"]["pose12d"], dtype=np.float32),
+            meta_action_target_dim_mask12=np.asarray(target_data["meta_action_targets"]["dim_mask12"], dtype=bool),
+            meta_action_target_mask=np.asarray(target_data["meta_action_targets"]["mask"], dtype=bool),
+            diagnostics=_meta_retarget.MetaRetargetDiagnostics(
+                accepted=True,
+                area_type="line",
+                horizon=4,
+                approach_steps=0,
+                ik_nonconverged=0,
+                max_position_error_m=0.0,
+                max_direction_error_rad=0.0,
+                max_step_joint_delta_rad=0.0,
+                retarget_mode="future_near",
+                trajectory_start_index=0,
+            ),
+        )
+
+    monkeypatch.setattr(_data_loader._meta_retarget, "generate_pair_retargeted_chunk", fake_pair_retarget)  # noqa: SLF001
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        meta_retarget_cache_prob=1.0,
+        meta_beta_imagine_cache_condition_prob=0.0,
+        meta_beta_seed=1,
+        meta_beta_self_same_chunk_prob=0.0,
+        meta_beta_same_episode_diff_chunk_prob=0.0,
+        meta_beta_same_tool_diff_episode_prob=0.0,
+        meta_beta_retarget_conditioned_prob=1.0,
+        meta_beta_meta_area_condition_prob=1.0,
+        meta_beta_reference_action_condition_prob=0.0,
+        meta_beta_obs_only_condition_prob=0.0,
+        meta_beta_pair_retarget_same_tool_only=True,
+    )
+    sample = _data_loader.BetaStructuredMetaPairDataset(
+        TinyDataset(),
+        data_config,
+        expected_action_space="absolute",
+        delta_action_masks=[],
+    )[0]
+
+    assert bool(sample["_beta_debug"]["retarget_applied"])
+    assert int(sample["_beta_debug"]["retarget_source_id"]) == 2
+    np.testing.assert_array_equal(sample["actions"], np.full((4, 32), 12.0, dtype=np.float32))
+    np.testing.assert_array_equal(sample["condition_state"], np.zeros((32,), dtype=np.float32))
+    np.testing.assert_array_equal(sample["meta_areas"]["pose12d"][:, :3], np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32))
     assert float(sample["meta_control"]["imagination_alpha"]) == 0.0
 
 
@@ -931,20 +1013,21 @@ def test_beta_retarget_condition_uses_same_tool_chunk_cache_for_meta_condition(t
     np.testing.assert_array_equal(sample["execution_meta_areas"]["pose12d"], np.full((1, 12), 5.0, dtype=np.float32))
     np.testing.assert_array_equal(sample["meta_action_targets"]["pose12d"], np.full((4, 1, 12), 6.0, dtype=np.float32))
     np.testing.assert_array_equal(sample["condition_state"], np.full((32,), 3.0, dtype=np.float32))
+    np.testing.assert_array_equal(sample["source_type_id"], np.asarray([2], dtype=np.int32))
     assert not bool(sample["reference_action_mask"])
     assert float(sample["meta_control"]["imagination_alpha"]) == 0.0
 
 
-def test_beta_retarget_condition_uses_same_tool_chunk_cache_for_reference_condition(tmp_path):
+def test_beta_retarget_reference_condition_uses_same_tool_imagine_source_pair(monkeypatch):
     class TinyDataset:
         def __init__(self):
             self.samples = [
-                _tiny_beta_sample(0, tool=1, episode=0),
-                _tiny_beta_sample(1, tool=1, episode=1),
+                _tiny_beta_sample(0, tool=1, episode=0, source_type=0),
+                _tiny_beta_sample(1, tool=1, episode=1, source_type=2),
             ]
             self.hf_dataset = {
                 "observation.tool_instance_hash": [[1], [1]],
-                "observation.source_type_id": [[0], [0]],
+                "observation.source_type_id": [[0], [2]],
                 "episode_index": [0, 1],
             }
 
@@ -954,35 +1037,42 @@ def test_beta_retarget_condition_uses_same_tool_chunk_cache_for_reference_condit
         def __getitem__(self, idx):
             return self.samples[int(idx)]
 
-    relpath = "variants/000000001_00.npz"
-    payload_path = tmp_path / relpath
-    payload_path.parent.mkdir(parents=True)
-    np.savez(
-        payload_path,
-        state=np.full((32,), 4.0, dtype=np.float32),
-        actions=np.full((4, 32), 8.0, dtype=np.float32),
-        meta_area_pose12d=np.full((1, 12), 9.0, dtype=np.float32),
-        meta_area_dim_mask12=np.ones((1, 12), dtype=bool),
-        meta_area_type=np.array([_meta_retarget.META_AREA_TYPE_TO_ID["line"]], dtype=np.int32),
-        meta_area_mask=np.array([True], dtype=bool),
-        meta_action_target_pose12d=np.full((4, 1, 12), 10.0, dtype=np.float32),
-        meta_action_target_dim_mask12=np.ones((4, 1, 12), dtype=bool),
-        meta_action_target_mask=np.ones((4, 1), dtype=bool),
-    )
-    (tmp_path / "metadata.json").write_text('{"cache_action_space": "absolute"}', encoding="utf-8")
-    (tmp_path / "manifest.jsonl").write_text(
-        (
-            '{"accepted": true, "base_index": 1, "variant_id": 0, '
-            f'"path": "{relpath}", "retarget_mode": "future_near", "trajectory_start_index": 2, '
-            '"approach_steps": 3}\n'
-        ),
-        encoding="utf-8",
-    )
+    def fake_pair_retarget(target_data, source_data, *, rng, config):
+        del rng, config
+        assert int(np.asarray(target_data["source_type_id"]).reshape(-1)[0]) == 0
+        assert int(np.asarray(source_data["source_type_id"]).reshape(-1)[0]) == 2
+        actions = np.full_like(target_data["actions"], 8.0)
+        return _meta_retarget.MetaRetargetResult(
+            state=np.asarray(target_data["state"], dtype=np.float32),
+            actions=actions,
+            meta_area_pose6d=np.zeros((1, 6), dtype=np.float32),
+            meta_area_type=np.array([_meta_retarget.META_AREA_TYPE_TO_ID["line"]], dtype=np.int32),
+            meta_area_mask=np.array([True], dtype=bool),
+            meta_area_pose12d=np.asarray(source_data["meta_areas"]["pose12d"], dtype=np.float32),
+            meta_area_dim_mask12=np.asarray(source_data["meta_areas"]["dim_mask12"], dtype=bool),
+            meta_action_target_pose12d=np.asarray(target_data["meta_action_targets"]["pose12d"], dtype=np.float32),
+            meta_action_target_dim_mask12=np.asarray(target_data["meta_action_targets"]["dim_mask12"], dtype=bool),
+            meta_action_target_mask=np.asarray(target_data["meta_action_targets"]["mask"], dtype=bool),
+            diagnostics=_meta_retarget.MetaRetargetDiagnostics(
+                accepted=True,
+                area_type="line",
+                horizon=4,
+                approach_steps=0,
+                ik_nonconverged=0,
+                max_position_error_m=0.0,
+                max_direction_error_rad=0.0,
+                max_step_joint_delta_rad=0.0,
+                retarget_mode="future_near",
+                trajectory_start_index=0,
+            ),
+        )
+
+    monkeypatch.setattr(_data_loader._meta_retarget, "generate_pair_retargeted_chunk", fake_pair_retarget)  # noqa: SLF001
 
     data_config = dataclasses.replace(
         _config.DataConfig(),
-        meta_retarget_cache_dir=str(tmp_path),
         meta_retarget_cache_prob=1.0,
+        meta_beta_imagine_cache_condition_prob=0.0,
         meta_beta_seed=0,
         meta_beta_self_same_chunk_prob=0.0,
         meta_beta_same_episode_diff_chunk_prob=0.0,
@@ -1001,12 +1091,13 @@ def test_beta_retarget_condition_uses_same_tool_chunk_cache_for_reference_condit
 
     assert bool(sample["_beta_debug"]["retarget_applied"])
     assert int(sample["_beta_debug"]["condition_id"]) == 1
-    assert int(sample["_beta_debug"]["retarget_source_id"]) == 5
+    assert int(sample["_beta_debug"]["retarget_source_id"]) == 2
     np.testing.assert_array_equal(sample["actions"], np.full((4, 32), 8.0, dtype=np.float32))
-    np.testing.assert_array_equal(sample["reference_actions"], np.full((4, 14), 8.0, dtype=np.float32))
+    np.testing.assert_array_equal(sample["reference_actions"], np.full((4, 14), 2.0, dtype=np.float32))
     assert bool(sample["reference_action_mask"])
     assert not bool(sample["meta_areas"]["mask"][0])
-    np.testing.assert_array_equal(sample["execution_meta_areas"]["pose12d"], np.full((1, 12), 9.0, dtype=np.float32))
+    np.testing.assert_array_equal(sample["execution_meta_areas"]["pose12d"][:, :3], np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32))
+    np.testing.assert_array_equal(sample["source_type_id"], np.asarray([2], dtype=np.int32))
 
 
 def test_beta_same_tool_retarget_requires_chunk_cache():
