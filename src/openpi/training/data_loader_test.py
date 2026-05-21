@@ -1321,6 +1321,128 @@ def test_beta_pair_dataset_consumes_ready_online_retarget(monkeypatch):
         wrapped._online_executor.shutdown(wait=False, cancel_futures=True)  # noqa: SLF001
 
 
+def test_beta_same_tool_process_request_carries_source_retarget_path(tmp_path):
+    class TinyDataset:
+        def __init__(self):
+            self.samples = [
+                _tiny_beta_sample(0, tool=1, episode=0),
+                _tiny_beta_sample(1, tool=1, episode=1),
+                _tiny_beta_sample(2, tool=1, episode=2),
+            ]
+            self.hf_dataset = {
+                "observation.tool_instance_hash": [[1], [1], [1]],
+                "observation.source_type_id": [[0], [0], [0]],
+                "episode_index": [0, 1, 2],
+            }
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            return self.samples[int(idx)]
+
+    class FakeQueue:
+        def __init__(self):
+            self.item = None
+
+        def put_nowait(self, item):
+            self.item = item
+
+    dataset = TinyDataset()
+    relpath = _write_tiny_chunk_retarget_cache(tmp_path, 1, dataset.samples[1])
+    data_config = dataclasses.replace(
+        _config.DataConfig(),
+        meta_retarget_cache_dir=str(tmp_path),
+        meta_retarget_cache_prob=1.0,
+        meta_beta_seed=0,
+        meta_beta_pair_retarget_same_tool_only=True,
+        meta_beta_online_async_enabled=False,
+        meta_beta_online_worker_group="process",
+    )
+    wrapped = _data_loader.BetaStructuredMetaPairDataset(
+        dataset,
+        data_config,
+        expected_action_space="absolute",
+        delta_action_masks=[],
+    )
+    queue = FakeQueue()
+    wrapped._online_request_queue = queue  # noqa: SLF001
+
+    assert wrapped._submit_online_process_pair_retarget()  # noqa: SLF001
+    assert isinstance(queue.item, dict)
+    assert queue.item["same_tool_only"] is True
+    assert queue.item["source_retarget_path"] == relpath
+    assert queue.item["source_index"] == 1
+
+
+def test_beta_process_worker_reconstructs_same_tool_imagine_source(monkeypatch, tmp_path):
+    class TinyDataset:
+        def __init__(self):
+            self.samples = [
+                _tiny_beta_sample(0, tool=1, episode=0),
+                _tiny_beta_sample(1, tool=1, episode=1),
+            ]
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            return self.samples[int(idx)]
+
+    def fake_pair_retarget(target_data, source_data, *, rng, config):
+        del rng, config
+        assert int(target_data["source_type_id"][0]) == 0
+        assert int(source_data["source_type_id"][0]) == 2
+        assert int(target_data["tool_instance_hash"][0]) == int(source_data["tool_instance_hash"][0])
+        return _meta_retarget.MetaRetargetResult(
+            state=np.asarray(target_data["state"], dtype=np.float32),
+            actions=np.full_like(target_data["actions"], 12.0),
+            meta_area_pose6d=np.zeros((1, 6), dtype=np.float32),
+            meta_area_type=np.array([_meta_retarget.META_AREA_TYPE_TO_ID["line"]], dtype=np.int32),
+            meta_area_mask=np.array([True], dtype=bool),
+            meta_area_pose12d=np.asarray(target_data["meta_areas"]["pose12d"], dtype=np.float32),
+            meta_area_dim_mask12=np.asarray(target_data["meta_areas"]["dim_mask12"], dtype=bool),
+            meta_action_target_pose12d=np.asarray(target_data["meta_action_targets"]["pose12d"], dtype=np.float32),
+            meta_action_target_dim_mask12=np.asarray(target_data["meta_action_targets"]["dim_mask12"], dtype=bool),
+            meta_action_target_mask=np.asarray(target_data["meta_action_targets"]["mask"], dtype=bool),
+            diagnostics=_meta_retarget.MetaRetargetDiagnostics(
+                accepted=True,
+                area_type="line",
+                horizon=4,
+                approach_steps=0,
+                ik_nonconverged=0,
+                max_position_error_m=0.0,
+                max_direction_error_rad=0.0,
+                max_step_joint_delta_rad=0.0,
+                retarget_mode="future_near",
+                trajectory_start_index=0,
+            ),
+        )
+
+    monkeypatch.setattr(_data_loader._meta_retarget, "generate_pair_retargeted_chunk", fake_pair_retarget)  # noqa: SLF001
+    dataset = TinyDataset()
+    relpath = _write_tiny_chunk_retarget_cache(tmp_path, 1, dataset.samples[1])
+
+    result = _data_loader._generate_beta_pair_retarget_from_dataset(  # noqa: SLF001
+        dataset,
+        target_index=0,
+        source_index=1,
+        seed=0,
+        delta_action_masks=[],
+        retarget_config=_meta_retarget.MetaRetargetGeneratorConfig(),
+        chunk_retarget_cache_dir=tmp_path,
+        source_retarget_path=relpath,
+        same_tool_only=True,
+    )
+
+    assert result is not None
+    _, source_index, payload, debug = result
+    assert source_index == 1
+    assert debug["source_retarget_path"] == relpath
+    assert debug["source_retarget_base_index"] == 1
+    np.testing.assert_array_equal(payload["actions"], np.full((4, 32), 12.0, dtype=np.float32))
+
+
 def test_normalize_applies_action_stats_to_reference_actions():
     stats = {
         "actions": _transforms.NormStats(

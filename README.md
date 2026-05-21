@@ -468,10 +468,11 @@ keeps the older per-DataLoader-worker thread producer. `data.meta_beta_online_wo
 starts a separate multiprocessing retarget worker group from the main process and shares request/result
 queues with the DataLoader workers. Process mode is experimental: it can isolate IK from DataLoader work,
 but it pays IPC and dataset-copy overhead and should only be used after an A/B test shows higher online
-retarget throughput. Process mode is disabled automatically for default same-tool beta retarget because
-its index-only request protocol cannot reconstruct `source_retarget_path` imagine sources. Producer
-polling is demand-driven: it happens when a retarget-conditioned sample is requested, not at the start of
-every `__getitem__`.
+retarget throughput. In default same-tool beta retarget, process-mode requests include
+`source_retarget_path`; the process worker reconstructs chunk1/source from `data.meta_retarget_cache_dir`
+before running pair retarget, so it does not fall back to origin-origin pairs. Producer polling is
+demand-driven: it happens when a retarget-conditioned sample is requested, not at the start of every
+`__getitem__`.
 
 `data.meta_beta_online_num_workers` controls producer threads in dataloader mode or producer processes in
 process mode. `data.meta_beta_online_queue_size` bounds local ready results, `data.meta_beta_online_max_pending`
@@ -483,9 +484,9 @@ origin-target plus imagine-source records, never origin-origin pairs.
 The dataset-specific beta config
 `pi05_xtrainer_meta_aux_structured_12d_delta_beta_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3`
 sets both `model.max_meta_areas=1` and `data.max_meta_areas=1`. This is required because the beta
-prefix contains two meta-area segments, `condition_meta` and `execution_meta`; if the model keeps the
-default `max_meta_areas=3` while the data emits one slot, the model creates four extra prefix tokens
-and the token mask shapes no longer match.
+refined meta-token slot count is `max_meta_areas`; if the model keeps the default `max_meta_areas=3`
+while the data emits one slot, the model creates extra prefix tokens and the token mask shapes no
+longer match.
 
 That config also sets `data.meta_retarget_cache_prob=1.0`. In the beta dataloader, relation sampling
 already controls how often retarget-conditioned pairs are attempted through

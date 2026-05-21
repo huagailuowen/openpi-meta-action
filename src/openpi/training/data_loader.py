@@ -724,12 +724,30 @@ def _generate_beta_pair_retarget_from_dataset(
     seed: int,
     delta_action_masks: Sequence[np.ndarray],
     retarget_config: _meta_retarget.MetaRetargetGeneratorConfig,
+    chunk_retarget_cache_dir: pathlib.Path | None = None,
+    source_retarget_path: str | None = None,
     same_tool_only: bool = True,
 ) -> tuple[int, int, dict[str, np.ndarray], dict[str, typing.Any]] | None:
     target_sample = typing.cast(dict[str, typing.Any], dataset[target_index])
     source_sample = typing.cast(dict[str, typing.Any], dataset[source_index])
     if target_index == source_index:
         return None
+    source_debug: dict[str, typing.Any] = {}
+    if source_retarget_path:
+        if chunk_retarget_cache_dir is None:
+            return None
+        payload = _npz_cache_payload(
+            chunk_retarget_cache_dir,
+            {"path": str(source_retarget_path)},
+            cache_name="Chunk retarget",
+        )
+        if payload is None:
+            return None
+        source_sample = _apply_retargeted_payload(source_sample, payload)
+        source_debug = {
+            "source_retarget_path": str(source_retarget_path),
+            "source_retarget_base_index": int(source_index),
+        }
     if same_tool_only and not _valid_same_tool_pair_retarget_samples(target_sample, source_sample):
         return None
     target_for_ik = _clone_sample(target_sample)
@@ -757,6 +775,7 @@ def _generate_beta_pair_retarget_from_dataset(
         "target_index": int(target_index),
         "source_index": int(source_index),
         **diagnostics,
+        **source_debug,
     }
     return int(target_index), int(source_index), payload, debug
 
@@ -767,6 +786,7 @@ def _beta_online_retarget_process_loop(
     dataset: Dataset,
     delta_action_masks: Sequence[np.ndarray],
     retarget_config_dict: dict[str, typing.Any],
+    chunk_retarget_cache_dir: str | None,
     worker_id: int,
 ) -> None:
     """Generate beta pair-retarget payloads in a dedicated CPU worker process."""
@@ -777,7 +797,17 @@ def _beta_online_retarget_process_loop(
         job = request_queue.get()
         if job is None:
             return
-        target_index, source_index, seed = typing.cast(tuple[int, int, int], job)
+        source_retarget_path: str | None = None
+        if isinstance(job, dict):
+            target_index = int(job["target_index"])
+            source_index = int(job["source_index"])
+            seed = int(job["seed"])
+            if job.get("source_retarget_path"):
+                source_retarget_path = str(job["source_retarget_path"])
+            same_tool_only = bool(job.get("same_tool_only", bool(source_retarget_path)))
+        else:
+            target_index, source_index, seed = typing.cast(tuple[int, int, int], job)
+            same_tool_only = False
         start = time.perf_counter()
         try:
             result = _generate_beta_pair_retarget_from_dataset(
@@ -787,6 +817,11 @@ def _beta_online_retarget_process_loop(
                 seed=seed,
                 delta_action_masks=delta_action_masks,
                 retarget_config=retarget_config,
+                chunk_retarget_cache_dir=(
+                    pathlib.Path(chunk_retarget_cache_dir).expanduser() if chunk_retarget_cache_dir else None
+                ),
+                source_retarget_path=source_retarget_path,
+                same_tool_only=same_tool_only,
             )
             elapsed_s = float(time.perf_counter() - start)
             if result is None:
@@ -970,12 +1005,6 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         self._online_prefer_prob = float(np.clip(data_config.meta_beta_online_prefer_prob, 0.0, 1.0))
         self._online_submit_prob = float(np.clip(data_config.meta_beta_online_submit_prob, 0.0, 1.0))
         self._online_worker_group = str(data_config.meta_beta_online_worker_group)
-        if self._online_async_enabled and self._online_worker_group == "process" and self._pair_retarget_same_tool_only:
-            logging.warning(
-                "Disabling beta online process producer for same-tool retarget: process mode is index-only "
-                "and cannot reconstruct chunk-cache imagine sources. Use dataloader worker group or pair cache."
-            )
-            self._online_async_enabled = False
         self._online_request_queue_size = max(1, int(data_config.meta_beta_online_request_queue_size))
         self._online_result_queue_size = max(1, int(data_config.meta_beta_online_result_queue_size))
         self._online_executor: futures.ThreadPoolExecutor | None = None
@@ -1161,6 +1190,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                     self._dataset,
                     delta_action_masks,
                     self._retarget_config.to_json_dict(),
+                    str(self._cache_dir) if self._cache_dir is not None else None,
                     worker_id,
                 ),
                 daemon=True,
@@ -1430,7 +1460,14 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         if self._online_request_queue is None:
             return False
         if self._pair_retarget_same_tool_only:
-            return False
+            request = self._sample_same_tool_process_pair_retarget_request()
+            if request is None:
+                return False
+            try:
+                self._online_request_queue.put_nowait(request)
+            except queue.Full:
+                return False
+            return True
         sampled = self._sample_pair_retarget_indices()
         if sampled is None:
             return False
@@ -1441,6 +1478,41 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
         except queue.Full:
             return False
         return True
+
+    def _sample_same_tool_process_pair_retarget_request(self) -> dict[str, typing.Any] | None:
+        if self._cache_dir is None or not self._chunk_cache_records_by_tool:
+            return None
+        dataset_len = len(self._dataset)
+        if dataset_len <= 1:
+            return None
+        if self._sampling_metadata is None:
+            return None
+        for _ in range(128):
+            target_index = int(self._rng.integers(dataset_len))
+            if not (0 <= target_index < len(self._sampling_metadata.tool_instance_hash)):
+                continue
+            if int(self._sampling_metadata.source_type_id[target_index]) != self._ORIGIN_SOURCE_TYPE:
+                continue
+            target_tool = int(self._sampling_metadata.tool_instance_hash[target_index])
+            if target_tool < 0:
+                continue
+            records = self._chunk_cache_records_by_tool.get(target_tool, [])
+            if not records:
+                continue
+            for _ in range(16):
+                record = records[int(self._rng.integers(len(records)))]
+                source_index = int(record["base_index"])
+                if source_index == target_index or not (0 <= source_index < dataset_len):
+                    continue
+                return {
+                    "target_index": int(target_index),
+                    "source_index": int(source_index),
+                    "seed": int(self._rng.integers(2**31 - 1)),
+                    "same_tool_only": True,
+                    "source_retarget_path": str(record["path"]),
+                    "source_retarget_base_index": int(source_index),
+                }
+        return None
 
     def _sample_pair_retarget_indices(self) -> tuple[int, int] | None:
         if self._pair_retarget_same_tool_only:
