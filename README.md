@@ -127,54 +127,67 @@ dims  26–31  reserved / padding
 The 12D config is `pi05_xtrainer_meta_aux_structured_12d_delta`. It sets
 `meta_area_pose_dim=12`, `meta_action_dim=12`, and `action_dim=32`.
 
-The beta latent config is `pi05_xtrainer_meta_aux_structured_12d_delta_beta`.
-It keeps the same raw 12D fields but interprets them through a chunk-pair latent interface:
+The beta config is `pi05_xtrainer_meta_aux_structured_12d_delta_beta`.
+It keeps the same raw 12D fields but interprets them through a chunk-pair meta-token interface:
 
 ```text
 chunk1 condition path:
-  observation tokens + condition meta tokens or reference-action tokens -> latent tokens
+  condition observation tokens + condition meta/query tokens (+ optional reference-action tokens)
+      -> refined chunk1 meta tokens
 
 chunk2 execution path:
-  observation tokens + latent tokens + special tokens -> action suffix
+  current observation tokens + refined chunk1 meta tokens + special tokens -> action suffix
 
 meta-action head:
-  action tokens + execution_meta_areas tokens + latent/special memory -> meta_actions
+  action tokens + refined chunk1 meta tokens + special tokens -> meta_actions
 ```
 
-`execution_meta_areas` is not a stored LeRobot field. It is created by the beta dataloader from the
-chunk2 original or pair-retargeted meta area before the chunk1 condition is applied. Therefore:
+`execution_meta_areas` is still produced by the beta dataloader for target construction and masks,
+but the beta2 model no longer builds a separate chunk2 execution-meta token segment from it.
+Therefore:
 
 - `meta_areas` means the chunk1 condition when meta-area conditioning is selected.
 - `reference_actions` means the chunk1 demonstration action condition when reference conditioning is selected.
-- `execution_meta_areas` means the chunk2 execution-frame meta token used by the meta-action head.
-- Runtime inference may pass only `meta_areas`; the beta model falls back to using it as `execution_meta_areas`.
-- Beta runtime reference-action conditioning should pass `reference_actions` plus explicit
-  `execution_meta_areas`, because the condition `meta_areas` slot is intentionally masked out.
+- Reference-action and obs-only conditioning use learnable/default meta query slots instead of explicit
+  condition meta-area input.
+- The refined chunk1 meta tokens are injected into chunk2 execution directly. Runtime meta-area inference
+  uses the current observation as both chunk1 condition observation and chunk2 execution observation.
+- `execution_meta_areas` still defines the semantic target frame for supervised `meta_action_targets`, but
+  those fields are not visible to the action suffix as an independent token segment.
 
 The beta prefix token order is:
 
 ```text
-obs -> condition_meta -> reference_action -> latent -> special -> execution_meta
+chunk1 condition encoder:
+  condition_obs -> condition_meta/query -> reference_action
+
+chunk2 execution encoder:
+  current_obs -> refined_chunk1_meta -> special
 ```
 
 Attention is intentionally restricted:
 
-- condition meta attends only to observation and itself;
-- reference action attends only to observation and itself;
-- the selected latent path attends to observation plus the selected condition tokens; meta-area and
-  reference-action conditions are not mixed unless a sample incorrectly enables both selected masks;
-- special attends only to observation, latent, and special;
-- action suffix attends only to observation, latent, and special;
-- execution meta is used for the meta-action head and is not visible to the action suffix.
+- In the chunk1 encoder, refined meta/query tokens can read condition observation and the selected
+  condition source. Meta-area and reference-action contrastive views are encoded as two independent
+  passes, so their condition tokens do not directly attend each other.
+- Reference-action tokens attend to condition observation and themselves.
+- In the chunk2 encoder, refined chunk1 meta tokens stay as the tool-operation representation; special
+  tokens read current observation plus refined meta tokens.
+- The action suffix reads current observation, refined meta tokens, and special tokens.
+- The meta-action head reads action tokens, refined meta tokens, and special tokens.
 
 Beta training can additionally compute a small cosine contrastive loss between the two chunk1
 condition views. For non-obs-only samples, the dataloader keeps `contrastive_meta_areas` and
 `contrastive_reference_actions` from the same chunk1/source sample, including pair-cache and
 imagine chunk-cache samples. The model encodes these as two independent condition passes,
-`condition obs + meta_area -> latent_meta` and `condition obs + reference_actions -> latent_ref`,
-then applies `1 - cosine(mean(latent_meta), mean(latent_ref))`. Only the sampled selected latent is
-injected into chunk2 execution; the contrastive branch is training-only. The weight is controlled by
-`model.meta_contrastive_loss_weight` and defaults to `0.0`; the current beta configs set it to `0.4`.
+`condition obs + meta_area -> refined_meta_tokens` and
+`condition obs + reference_actions + meta queries -> refined_meta_tokens`, then applies token-wise
+normalized squared L2 alignment over the refined meta tokens from every LLM layer. Layer weights grow
+quadratically with depth, `w_l=((l+1)/L)^2`, and are normalized to mean 1, so later layers dominate
+without changing the overall loss scale when model depth changes. Only the sampled selected condition
+path is injected into chunk2 execution; the contrastive branch is training-only. The weight is
+controlled by `model.meta_contrastive_loss_weight` and defaults to `0.0`; the current beta configs set
+it to `0.4`.
 Obs-only samples carry zero contrastive masks and do not contribute to this loss. When tuning this
 weight, inspect the unweighted/raw action, meta-action, and contrastive loss magnitudes together; if
 raw contrastive loss is around `0.7-1.2`, `0.4` contributes roughly `0.28-0.48` before any task-loss
@@ -840,6 +853,6 @@ The server returns both `actions` (shape `[action_horizon, 32]`) and `meta_actio
 | `meta_action_dim` | `6` | Dimensionality of each meta target; set to `12` for structured 12D |
 | `meta_area_pose_dim` | `6` | Dimensionality of input meta-area pose; set to `12` for `pose12d` |
 | `meta_dropout_prob` | `0.0` | Probability of masking a meta slot during training |
-| `meta_beta_model` | `False` | Switch PI0.5 meta creation to the beta latent chunk-pair model |
-| `num_meta_latent_tokens` | `4` | Number of latent tool-operation tokens in the beta model |
+| `meta_beta_model` | `False` | Switch PI0.5 meta creation to the beta chunk-pair meta-token model |
+| `num_meta_latent_tokens` | `4` | Deprecated beta2 no-op retained for old config compatibility; refined meta-token count is `max_meta_areas` |
 | `reference_action_group_size` | `5` | Number of action steps compressed into one reference-action token |

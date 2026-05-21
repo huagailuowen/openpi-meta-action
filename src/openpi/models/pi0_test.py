@@ -1,3 +1,5 @@
+import dataclasses
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
@@ -280,6 +282,97 @@ def test_pi05_meta_beta_condition_prefix_uses_condition_pi05_obs_tokens():
     )
     execution_tokens, _ = model._build_observation_tokens(obs)
     prefix = model._build_condition_prefix(obs)
-    expected_latent_start = obs_tokens.shape[1] + config.max_meta_areas + model.num_reference_action_tokens
-    assert prefix.latent_start == expected_latent_start
+    assert prefix.meta_start == obs_tokens.shape[1]
+    assert prefix.meta_end == obs_tokens.shape[1] + config.max_meta_areas
     assert not jnp.allclose(obs_tokens[:, -config.max_token_len :], execution_tokens[:, -config.max_token_len :])
+
+
+def test_pi05_meta_beta_condition_tokens_ignore_num_meta_latent_tokens():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        meta_model=True,
+        meta_beta_model=True,
+        meta_area_pose_dim=12,
+        meta_action_dim=12,
+        action_dim=32,
+        action_horizon=10,
+        max_token_len=8,
+        max_meta_areas=1,
+        num_meta_latent_tokens=7,
+        reference_action_group_size=5,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(
+        config,
+        condition_state=jnp.ones((1, config.action_dim), dtype=jnp.float32),
+        condition_tokenized_prompt=jnp.ones((1, config.max_token_len), dtype=jnp.int32),
+        condition_tokenized_prompt_mask=jnp.ones((1, config.max_token_len), dtype=jnp.bool_),
+    )
+
+    meta_tokens = model._encode_condition_meta_tokens(obs)
+
+    assert meta_tokens.shape[1] == config.max_meta_areas
+
+
+def test_pi05_meta_beta_execution_prefix_uses_refined_condition_meta_tokens():
+    config = _make_dummy_beta_config()
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(
+        config,
+        condition_state=jnp.ones((1, config.action_dim), dtype=jnp.float32),
+        condition_tokenized_prompt=jnp.ones((1, config.max_token_len), dtype=jnp.int32),
+        condition_tokenized_prompt_mask=jnp.ones((1, config.max_token_len), dtype=jnp.bool_),
+    )
+
+    obs_tokens, _ = model._build_observation_tokens(obs)
+    condition_meta_tokens = model._encode_condition_meta_tokens(obs)
+    prefix = model._build_execution_prefix(obs, condition_meta_tokens)
+
+    expected_len = obs_tokens.shape[1] + config.max_meta_areas + model.num_meta_special_tokens
+    assert prefix.tokens.shape[1] == expected_len
+    assert prefix.action_visible_mask.shape[1] == expected_len
+
+
+def test_pi05_meta_beta_contrastive_layer_weights_are_quadratic():
+    config = _make_dummy_beta_config()
+    model = config.create(jax.random.key(0))
+
+    weights = model._contrastive_layer_weights(4, jnp.float32)
+    expected = jnp.square(jnp.arange(1, 5, dtype=jnp.float32) / 4.0)
+    expected = expected / jnp.mean(expected)
+
+    assert jnp.allclose(weights, expected)
+    assert jnp.allclose(jnp.mean(weights), 1.0)
+
+
+def test_pi05_meta_beta_layerwise_contrastive_loss_is_finite():
+    config = dataclasses.replace(_make_dummy_beta_config(), meta_contrastive_loss_weight=0.4)
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(
+        config,
+        condition_state=jnp.ones((1, config.action_dim), dtype=jnp.float32),
+        condition_tokenized_prompt=jnp.ones((1, config.max_token_len), dtype=jnp.int32),
+        condition_tokenized_prompt_mask=jnp.ones((1, config.max_token_len), dtype=jnp.bool_),
+    )
+    obs = dataclasses.replace(
+        obs,
+        contrastive_meta_area_poses=jnp.ones(
+            (1, config.max_meta_areas, config.meta_area_pose_dim), dtype=jnp.float32
+        ),
+        contrastive_meta_area_dim_masks=jnp.ones(
+            (1, config.max_meta_areas, config.meta_area_pose_dim), dtype=jnp.bool_
+        ),
+        contrastive_meta_area_types=jnp.zeros((1, config.max_meta_areas), dtype=jnp.int32),
+        contrastive_meta_area_masks=jnp.ones((1, config.max_meta_areas), dtype=jnp.bool_),
+        contrastive_reference_actions=jnp.ones(
+            (1, config.action_horizon, config.reference_action_dim), dtype=jnp.float32
+        ),
+        contrastive_reference_action_mask=jnp.ones((1,), dtype=jnp.bool_),
+    )
+
+    loss = model._contrastive_meta_token_loss(obs)
+
+    assert loss.shape == (1,)
+    assert jnp.all(jnp.isfinite(loss))

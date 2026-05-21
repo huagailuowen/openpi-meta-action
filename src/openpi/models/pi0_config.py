@@ -52,16 +52,19 @@ class Pi0Config(_model.BaseModelConfig):
     # per sample by alpha ** meta_loss_alpha_power.
     use_meta_control_alpha: bool = False
     meta_loss_alpha_power: float = 0.0
-    # Beta latent path. This keeps the old structured meta model intact and
+    # Beta chunk-pair path. This keeps the old structured meta model intact and
     # switches creation to Pi0MetaBeta only for explicit beta configs.
     meta_beta_model: bool = False
+    # Deprecated in beta2: refined meta-token slots are controlled by
+    # max_meta_areas. Kept only so older configs still parse.
     num_meta_latent_tokens: int = 4
     reference_action_group_size: int = 5
     # Reference-action conditioning only uses the bimanual qpos action prefix.
     # Camera/meta/padding channels are deliberately excluded from the latent path.
     reference_action_dim: int = 14
-    # Optional beta-only alignment between the meta-area-conditioned latent and
-    # reference-action-conditioned latent for the same chunk1/source observation.
+    # Optional beta-only layerwise normalized-L2 alignment between
+    # meta-area-conditioned refined meta tokens and reference-action-conditioned
+    # refined meta tokens for the same chunk1/source observation.
     meta_contrastive_loss_weight: float = 0.0
     # When True, stop gradients from the meta loss from flowing back into the shared
     # backbone (prefix_out / suffix_out). The meta head still receives full gradients
