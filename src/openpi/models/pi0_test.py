@@ -109,6 +109,7 @@ def test_pi05_meta_beta_inputs_spec_contains_execution_meta_and_reference():
     assert observation_spec.condition_images is not None
     assert observation_spec.condition_image_masks is not None
     assert observation_spec.condition_state is not None
+    assert observation_spec.condition_state.shape[-1] == 32
     assert observation_spec.condition_tokenized_prompt is not None
     assert observation_spec.condition_tokenized_prompt_mask is not None
     assert observation_spec.execution_meta_area_poses is not None
@@ -137,7 +138,7 @@ def test_pi05_meta_reference_student_inputs_spec_and_builds():
     observation_spec, _ = config.inputs_spec()
     assert observation_spec.condition_images is not None
     assert observation_spec.condition_state is not None
-    assert observation_spec.condition_state.shape[-1] == 14
+    assert observation_spec.condition_state.shape[-1] == 32
     assert observation_spec.execution_meta_area_poses is not None
     assert observation_spec.reference_actions is not None
     assert observation_spec.reference_actions.shape[1:] == (50, 14)
@@ -160,6 +161,57 @@ def test_pi05_meta_reference_student_freezes_only_old_executor():
     state = _get_frozen_state(config)
     assert len(state) > 0
     assert all("reference_" not in "/".join(str(part) for part in path) for path in state)
+
+
+def _make_dummy_reference_student_config() -> _pi0_config.Pi0Config:
+    return _pi0_config.Pi0Config(
+        pi05=True,
+        meta_model=True,
+        meta_reference_student_model=True,
+        meta_area_pose_dim=12,
+        meta_action_dim=12,
+        action_dim=32,
+        action_horizon=10,
+        max_token_len=8,
+        max_meta_areas=1,
+        reference_action_group_size=5,
+        reference_action_dim=14,
+        reference_current_state_dim=14,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+
+
+def test_pi05_meta_reference_student_compute_loss_terms_smoke():
+    config = _make_dummy_reference_student_config()
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(
+        config,
+        condition_state=jnp.ones((1, config.action_dim), dtype=jnp.float32),
+        condition_tokenized_prompt=jnp.ones((1, config.max_token_len), dtype=jnp.int32),
+        condition_tokenized_prompt_mask=jnp.ones((1, config.max_token_len), dtype=jnp.bool_),
+    )
+    actions = jnp.zeros((1, config.action_horizon, config.action_dim), dtype=jnp.float32)
+
+    terms = model.compute_loss_terms(jax.random.key(1), obs, actions, train=False)
+
+    assert set(terms) == {"loss", "action_loss", "meta_loss", "contrastive_loss"}
+    assert terms["loss"].shape == (1, config.action_horizon)
+    assert jnp.all(jnp.isfinite(terms["loss"]))
+
+
+def test_pi05_meta_reference_student_requires_32d_condition_state():
+    config = _make_dummy_reference_student_config()
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(
+        config,
+        condition_state=jnp.ones((1, 14), dtype=jnp.float32),
+        condition_tokenized_prompt=jnp.ones((1, config.max_token_len), dtype=jnp.int32),
+        condition_tokenized_prompt_mask=jnp.ones((1, config.max_token_len), dtype=jnp.bool_),
+    )
+
+    with pytest.raises(ValueError, match="condition_state"):
+        model._encode_reference_meta_tokens(obs)
 
 
 def test_preprocess_observation_preserves_beta_fields():

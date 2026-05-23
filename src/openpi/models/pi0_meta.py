@@ -172,7 +172,7 @@ class Pi0Meta(_model.BaseModel):
         self.deterministic = True
 
     def _mask_backbone_channels(self, values: at.Float[at.Array, "... ad"]) -> at.Float[at.Array, "... ad"]:
-        mask = jnp.asarray(self.backbone_action_mask_values, dtype=values.dtype)
+        mask = jnp.asarray(self.backbone_action_mask_values, dtype=values.dtype)[..., : values.shape[-1]]
         return values * mask
 
     def _prepare_observation(self, observation: _model.Observation) -> _model.Observation:

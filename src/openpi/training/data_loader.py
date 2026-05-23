@@ -243,11 +243,21 @@ def _copy_image_dict(images: dict[str, typing.Any]) -> dict[str, np.ndarray]:
     return {key: np.asarray(value).copy() for key, value in images.items()}
 
 
+def _scalar_int_array(value: typing.Any, *, default: int = 0) -> np.ndarray:
+    array = np.asarray(value if value is not None else default, dtype=np.int32)
+    if array.size == 0:
+        return np.asarray(default, dtype=np.int32)
+    if array.shape == ():
+        return array.astype(np.int32, copy=True)
+    return np.asarray(array.reshape(-1)[0], dtype=np.int32)
+
+
 def _apply_retargeted_payload(sample: dict[str, typing.Any], retargeted: dict[str, np.ndarray]) -> dict[str, typing.Any]:
     out = _clone_sample(sample)
     out["state"] = retargeted["state"].astype(np.float32)
     out["actions"] = retargeted["actions"].astype(np.float32)
-    out["source_type_id"] = np.asarray([2], dtype=np.int32)
+    source_type_shape = np.asarray(sample.get("source_type_id", np.asarray(0, dtype=np.int32))).shape
+    out["source_type_id"] = np.full(source_type_shape, 2, dtype=np.int32)
     meta_areas = dict(out.get("meta_areas", {}))
     if "meta_area_pose12d" in retargeted:
         meta_areas["pose12d"] = retargeted["meta_area_pose12d"].astype(np.float32)
@@ -1897,7 +1907,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             if "image_mask" in source_sample:
                 out["condition_image_mask"] = _copy_image_dict(dict(source_sample["image_mask"]))
         if "state" in source_sample:
-            out["condition_state"] = np.asarray(source_sample["state"], dtype=np.float32)[..., :_BETA_REFERENCE_ACTION_DIM].copy()
+            out["condition_state"] = np.asarray(source_sample["state"], dtype=np.float32).copy()
         if "prompt" in source_sample:
             out["condition_prompt"] = source_sample["prompt"]
 
@@ -1916,6 +1926,9 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
 
     @staticmethod
     def _ensure_optional_beta_fields(out: dict[str, typing.Any]) -> None:
+        out["tool_instance_hash"] = _scalar_int_array(out.get("tool_instance_hash"), default=0)
+        out["source_type_id"] = _scalar_int_array(out.get("source_type_id"), default=0)
+        out["episode_index"] = _scalar_int_array(out.get("episode_index"), default=0)
         if "reference_actions" not in out:
             actions = np.asarray(out["actions"], dtype=np.float32)
             out["reference_actions"] = np.zeros((*actions.shape[:-1], _BETA_REFERENCE_ACTION_DIM), dtype=np.float32)

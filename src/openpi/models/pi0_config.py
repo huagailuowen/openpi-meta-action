@@ -168,15 +168,7 @@ class Pi0Config(_model.BaseModelConfig):
                     else None
                 ),
                 condition_state=(
-                    jax.ShapeDtypeStruct(
-                        [
-                            batch_size,
-                            self.reference_current_state_dim
-                            if self.meta_reference_student_model
-                            else self.action_dim,
-                        ],
-                        jnp.float32,
-                    )
+                    jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32)
                     if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),

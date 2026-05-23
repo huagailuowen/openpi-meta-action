@@ -85,6 +85,13 @@ def _valid_same_tool_pair(target_sample: dict[str, Any], source_sample: dict[str
     return _is_origin_sample(target_sample) and _is_imagine_sample(source_sample) and _same_tool_sample_pair(target_sample, source_sample)
 
 
+def _with_beta_metadata(sample: dict[str, Any], *, tool_instance_hash: int, source_type_id: int) -> dict[str, Any]:
+    out = dict(sample)
+    out["tool_instance_hash"] = np.asarray(tool_instance_hash, dtype=np.int32)
+    out["source_type_id"] = np.asarray(source_type_id, dtype=np.int32)
+    return out
+
+
 def _load_chunk_retarget_records_by_tool(
     cache_dir: pathlib.Path,
     *,
@@ -132,7 +139,8 @@ def _apply_retargeted_payload_to_canonical(
     out = dict(sample)
     out["state"] = np.asarray(payload["state"], dtype=np.float32)
     out["actions"] = np.asarray(payload["actions"], dtype=np.float32)
-    out["source_type_id"] = np.asarray([2], dtype=np.int32)
+    source_type_shape = np.asarray(sample.get("source_type_id", np.asarray(0, dtype=np.int32))).shape
+    out["source_type_id"] = np.full(source_type_shape, 2, dtype=np.int32)
 
     meta_areas = dict(out.get("meta_areas", {}))
     meta_areas["pose12d"] = np.asarray(payload["meta_area_pose12d"], dtype=np.float32)
@@ -429,6 +437,8 @@ def main(
                 max_meta_areas=max_meta_areas,
                 action_stride=action_stride,
             )
+            if same_tool_only:
+                target = _with_beta_metadata(target, tool_instance_hash=target_tool, source_type_id=0)
             for variant_id in range(variants_per_target):
                 if max_pairs is not None and submitted >= max_pairs:
                     break
@@ -444,12 +454,18 @@ def main(
                         if 0 <= source_index < len(dataset):
                             payload = _load_npz_payload(chunk_retarget_cache_dir, source_record)
                             if payload is not None:
+                                source_tool = int(sampling_metadata.tool_instance_hash[source_index])
                                 raw_source = dataset[source_index]
                                 source_base = _chunk_cache._canonicalize_sample(  # noqa: SLF001
                                     raw_source,
                                     data_config,
                                     max_meta_areas=max_meta_areas,
                                     action_stride=action_stride,
+                                )
+                                source_base = _with_beta_metadata(
+                                    source_base,
+                                    tool_instance_hash=source_tool,
+                                    source_type_id=0,
                                 )
                                 source = _apply_retargeted_payload_to_canonical(source_base, payload)
                                 source_retarget_path = str(source_record["path"])

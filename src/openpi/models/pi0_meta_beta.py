@@ -375,10 +375,9 @@ class Pi0MetaBeta(Pi0Meta):
         action_tokens = suffix_out[:, -self.action_horizon :]
         return self.meta_head(action_tokens, meta_tokens, special_tokens)
 
-    @override
-    def compute_loss(
+    def compute_loss_terms(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+    ) -> dict[str, at.Array]:
         preprocess_rng, noise_rng, time_rng, meta_dropout_rng = jax.random.split(rng, 4)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
         observation = self._prepare_observation(observation)
@@ -519,11 +518,21 @@ class Pi0MetaBeta(Pi0Meta):
         meta_loss = jnp.sum(jnp.square(meta_pred - meta_target) * meta_dim_weights, axis=-1) / meta_dim_denom
         denom = jnp.maximum(jnp.sum(meta_loss_mask, axis=-1), 1)
         meta_loss = jnp.sum(meta_loss * meta_loss_mask, axis=-1) / denom
-        return (
-            self.action_loss_weight * base_loss
-            + self.meta_loss_weight * meta_loss
-            + self.meta_contrastive_loss_weight * contrastive_loss[:, None]
-        )
+        action_component = self.action_loss_weight * base_loss
+        meta_component = self.meta_loss_weight * meta_loss
+        contrastive_component = self.meta_contrastive_loss_weight * contrastive_loss[:, None]
+        return {
+            "loss": action_component + meta_component + contrastive_component,
+            "action_loss": action_component,
+            "meta_loss": meta_component,
+            "contrastive_loss": contrastive_component,
+        }
+
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        return self.compute_loss_terms(rng, observation, actions, train=train)["loss"]
 
     @override
     def sample_actions_with_aux(

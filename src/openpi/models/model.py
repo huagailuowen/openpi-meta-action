@@ -97,7 +97,7 @@ class Observation(Generic[ArrayT]):
     # images/state remain the chunk2/current execution observation.
     condition_images: dict[str, at.Float[ArrayT, "*b h w c"]] | None = None
     condition_image_masks: dict[str, at.Bool[ArrayT, "*b"]] | None = None
-    condition_state: at.Float[ArrayT, "*b s"] | None = None
+    condition_state: at.Float[ArrayT, "*b cs"] | None = None
     condition_tokenized_prompt: at.Int[ArrayT, "*b l"] | None = None
     condition_tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
 

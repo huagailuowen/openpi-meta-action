@@ -90,6 +90,8 @@ class Pi0MetaReferenceStudent(Pi0Meta):
             features=width,
             rngs=rngs,
         )
+        self.reference_state_in = nnx.Linear(config.action_dim, width, rngs=rngs)
+        self.reference_state_out = nnx.Linear(width, width, rngs=rngs)
         self.reference_current_state_in = nnx.Linear(self.reference_current_state_dim, width, rngs=rngs)
         self.reference_current_state_out = nnx.Linear(width, width, rngs=rngs)
         self.reference_meta_query_embedding = nnx.Embed(
@@ -148,6 +150,23 @@ class Pi0MetaReferenceStudent(Pi0Meta):
         ref_tokens = ref_tokens + self.reference_position_embedding(pos_ids)[None, :, :]
         return ref_tokens, einops.repeat(ref_mask, "b -> b r", r=self.num_reference_action_tokens)
 
+    def _build_reference_state_token(
+        self, observation: _model.Observation
+    ) -> tuple[at.Float[at.Array, "b one emb"], at.Bool[at.Array, "b one"]]:
+        if observation.condition_state is None:
+            raise ValueError("Reference-student encoding requires 32D condition_state.")
+        condition_state = self._mask_backbone_channels(observation.condition_state)
+        if condition_state.shape[-1] != self.action_dim:
+            raise ValueError(
+                "Reference-student condition_state must match the executor state/action dimension; "
+                f"got {condition_state.shape[-1]}, expected {self.action_dim}."
+            )
+        token = self.reference_state_in(condition_state)
+        token = nnx.swish(token)
+        token = self.reference_state_out(token)[:, None, :]
+        mask = jnp.ones((observation.state.shape[0], 1), dtype=jnp.bool_)
+        return token, mask
+
     def _build_current_state_token(
         self, observation: _model.Observation
     ) -> tuple[at.Float[at.Array, "b one emb"], at.Bool[at.Array, "b one"]]:
@@ -160,6 +179,7 @@ class Pi0MetaReferenceStudent(Pi0Meta):
 
     def _encode_reference_meta_tokens(self, observation: _model.Observation) -> at.Float[at.Array, "b m emb"]:
         obs_tokens, obs_mask = self._build_reference_observation_tokens(observation)
+        reference_state_token, reference_state_mask = self._build_reference_state_token(observation)
         ref_tokens, ref_mask = self._build_reference_action_tokens(observation)
         current_state_token, current_state_mask = self._build_current_state_token(observation)
         query_ids = jnp.arange(self.max_meta_areas, dtype=jnp.int32)
@@ -170,8 +190,14 @@ class Pi0MetaReferenceStudent(Pi0Meta):
         )
         query_mask = jnp.ones(query_tokens.shape[:2], dtype=jnp.bool_)
 
-        tokens = jnp.concatenate([obs_tokens, ref_tokens, current_state_token, query_tokens], axis=1)
-        input_mask = jnp.concatenate([obs_mask, ref_mask, current_state_mask, query_mask], axis=1)
+        tokens = jnp.concatenate(
+            [obs_tokens, reference_state_token, ref_tokens, current_state_token, query_tokens],
+            axis=1,
+        )
+        input_mask = jnp.concatenate(
+            [obs_mask, reference_state_mask, ref_mask, current_state_mask, query_mask],
+            axis=1,
+        )
         attn_mask = jnp.logical_and(input_mask[:, :, None], input_mask[:, None, :])
         positions = jnp.cumsum(input_mask, axis=1) - 1
         outputs, _ = self.reference_PaliGemma.llm([tokens, None], mask=attn_mask, positions=positions)
@@ -310,10 +336,9 @@ class Pi0MetaReferenceStudent(Pi0Meta):
         denom = jnp.maximum(jnp.sum(meta_loss_mask, axis=-1), 1)
         return jnp.sum(meta_loss * meta_loss_mask, axis=-1) / denom
 
-    @override
-    def compute_loss(
+    def compute_loss_terms(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
-    ) -> at.Float[at.Array, "*b ah"]:
+    ) -> dict[str, at.Array]:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
         observation = self._prepare_observation(observation)
@@ -359,11 +384,21 @@ class Pi0MetaReferenceStudent(Pi0Meta):
         suffix_for_meta = jax.lax.stop_gradient(suffix_out) if self.meta_stop_backbone_grad else suffix_out
         meta_pred = self._decode_meta_actions(prefix_for_meta, suffix_for_meta)
         meta_loss = self._meta_loss(observation, meta_pred)
-        return (
-            self.action_loss_weight * base_loss
-            + self.meta_loss_weight * meta_loss
-            + self.meta_contrastive_loss_weight * contrastive_loss[:, None]
-        )
+        action_component = self.action_loss_weight * base_loss
+        meta_component = self.meta_loss_weight * meta_loss
+        contrastive_component = self.meta_contrastive_loss_weight * contrastive_loss[:, None]
+        return {
+            "loss": action_component + meta_component + contrastive_component,
+            "action_loss": action_component,
+            "meta_loss": meta_component,
+            "contrastive_loss": contrastive_component,
+        }
+
+    @override
+    def compute_loss(
+        self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
+    ) -> at.Float[at.Array, "*b ah"]:
+        return self.compute_loss_terms(rng, observation, actions, train=train)["loss"]
 
     @override
     def sample_actions_with_aux(
