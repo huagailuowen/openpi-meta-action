@@ -130,6 +130,25 @@ def _load_npz_payload(cache_dir: pathlib.Path, record: dict[str, Any]) -> dict[s
         return None
 
 
+def _fit_payload_to_reference(
+    payload: Any,
+    reference: Any | None,
+    *,
+    dtype: np.dtype | type,
+    fill_value: Any,
+) -> np.ndarray:
+    payload_arr = np.asarray(payload, dtype=dtype)
+    if reference is None:
+        return payload_arr.copy()
+    reference_arr = np.asarray(reference)
+    if payload_arr.ndim != reference_arr.ndim:
+        return payload_arr.copy()
+    out = np.full(reference_arr.shape, fill_value, dtype=dtype)
+    slices = tuple(slice(0, min(dst, src)) for dst, src in zip(out.shape, payload_arr.shape, strict=True))
+    out[slices] = payload_arr[slices]
+    return out
+
+
 def _apply_retargeted_payload_to_canonical(
     sample: dict[str, Any],
     payload: dict[str, np.ndarray],
@@ -143,24 +162,65 @@ def _apply_retargeted_payload_to_canonical(
     out["source_type_id"] = np.full(source_type_shape, 2, dtype=np.int32)
 
     meta_areas = dict(out.get("meta_areas", {}))
-    meta_areas["pose12d"] = np.asarray(payload["meta_area_pose12d"], dtype=np.float32)
+    meta_areas["pose12d"] = _fit_payload_to_reference(
+        payload["meta_area_pose12d"],
+        meta_areas.get("pose12d"),
+        dtype=np.float32,
+        fill_value=0.0,
+    )
     meta_areas.pop("pose6d", None)
     if "meta_area_dim_mask12" in payload:
-        meta_areas["dim_mask12"] = np.asarray(payload["meta_area_dim_mask12"], dtype=bool)
-    meta_areas["type"] = np.asarray(payload["meta_area_type"], dtype=np.int32)
-    meta_areas["mask"] = np.asarray(payload["meta_area_mask"], dtype=bool)
+        meta_areas["dim_mask12"] = _fit_payload_to_reference(
+            payload["meta_area_dim_mask12"],
+            meta_areas.get("dim_mask12"),
+            dtype=bool,
+            fill_value=False,
+        )
+    meta_areas["type"] = _fit_payload_to_reference(
+        payload["meta_area_type"],
+        meta_areas.get("type"),
+        dtype=np.int32,
+        fill_value=0,
+    )
+    meta_areas["mask"] = _fit_payload_to_reference(
+        payload["meta_area_mask"],
+        meta_areas.get("mask"),
+        dtype=bool,
+        fill_value=False,
+    )
     out["meta_areas"] = meta_areas
 
     if "meta_action_target_pose12d" in payload:
         meta_targets = dict(out.get("meta_action_targets", {}))
-        meta_targets["pose12d"] = np.asarray(payload["meta_action_target_pose12d"], dtype=np.float32)
+        meta_targets["pose12d"] = _fit_payload_to_reference(
+            payload["meta_action_target_pose12d"],
+            meta_targets.get("pose12d"),
+            dtype=np.float32,
+            fill_value=0.0,
+        )
         meta_targets.pop("pose6d", None)
         if "meta_action_target_dim_mask12" in payload:
-            meta_targets["dim_mask12"] = np.asarray(payload["meta_action_target_dim_mask12"], dtype=bool)
+            meta_targets["dim_mask12"] = _fit_payload_to_reference(
+                payload["meta_action_target_dim_mask12"],
+                meta_targets.get("dim_mask12"),
+                dtype=bool,
+                fill_value=False,
+            )
         if "meta_action_target_mask" in payload:
-            meta_targets["mask"] = np.asarray(payload["meta_action_target_mask"], dtype=bool)
+            meta_targets["mask"] = _fit_payload_to_reference(
+                payload["meta_action_target_mask"],
+                meta_targets.get("mask"),
+                dtype=bool,
+                fill_value=False,
+            )
         else:
-            meta_targets["mask"] = np.ones(meta_targets["pose12d"].shape[:2], dtype=bool)
+            meta_targets["mask"] = np.ones(np.asarray(payload["meta_action_target_pose12d"]).shape[:2], dtype=bool)
+            meta_targets["mask"] = _fit_payload_to_reference(
+                meta_targets["mask"],
+                dict(out.get("meta_action_targets", {})).get("mask"),
+                dtype=bool,
+                fill_value=False,
+            )
         out["meta_action_targets"] = meta_targets
     return out
 

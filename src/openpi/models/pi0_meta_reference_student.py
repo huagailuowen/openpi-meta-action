@@ -43,6 +43,7 @@ class Pi0MetaReferenceStudent(Pi0Meta):
         self.reference_action_group_size = int(config.reference_action_group_size)
         self.reference_action_dim = int(config.reference_action_dim)
         self.reference_current_state_dim = int(config.reference_current_state_dim)
+        self.reference_meta_output_slots = int(config.reference_meta_output_slots)
         self.meta_contrastive_loss_weight = float(config.meta_contrastive_loss_weight)
         if self.reference_action_dim <= 0 or self.reference_action_dim > config.action_dim:
             raise ValueError(
@@ -54,6 +55,12 @@ class Pi0MetaReferenceStudent(Pi0Meta):
                 "Pi0MetaReferenceStudent requires 0 < reference_current_state_dim <= action_dim; "
                 f"got reference_current_state_dim={self.reference_current_state_dim}, action_dim={config.action_dim}"
             )
+        if self.reference_meta_output_slots < 1:
+            raise ValueError(
+                "Pi0MetaReferenceStudent requires reference_meta_output_slots >= 1; "
+                f"got {self.reference_meta_output_slots}"
+            )
+        self.reference_meta_replace_slots = min(self.reference_meta_output_slots, self.max_meta_areas)
         self.num_reference_action_tokens = config.action_horizon // self.reference_action_group_size
 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
@@ -90,12 +97,10 @@ class Pi0MetaReferenceStudent(Pi0Meta):
             features=width,
             rngs=rngs,
         )
-        self.reference_state_in = nnx.Linear(config.action_dim, width, rngs=rngs)
-        self.reference_state_out = nnx.Linear(width, width, rngs=rngs)
         self.reference_current_state_in = nnx.Linear(self.reference_current_state_dim, width, rngs=rngs)
         self.reference_current_state_out = nnx.Linear(width, width, rngs=rngs)
         self.reference_meta_query_embedding = nnx.Embed(
-            num_embeddings=self.max_meta_areas,
+            num_embeddings=self.reference_meta_replace_slots,
             features=width,
             rngs=rngs,
         )
@@ -107,6 +112,8 @@ class Pi0MetaReferenceStudent(Pi0Meta):
     ) -> tuple[at.Float[at.Array, "b o emb"], at.Bool[at.Array, "b o"]]:
         if obs.condition_images is None or obs.condition_image_masks is None:
             raise ValueError("Reference-student encoding requires condition images and masks.")
+        if obs.condition_tokenized_prompt is None or obs.condition_tokenized_prompt_mask is None:
+            raise ValueError("Reference-student encoding requires condition tokenized prompt/state tokens.")
         tokens = []
         input_mask = []
         for name in obs.condition_images:
@@ -114,10 +121,9 @@ class Pi0MetaReferenceStudent(Pi0Meta):
             tokens.append(image_tokens)
             input_mask.append(einops.repeat(obs.condition_image_masks[name], "b -> b s", s=image_tokens.shape[1]))
 
-        if obs.condition_tokenized_prompt is not None:
-            tokenized_inputs = self.reference_PaliGemma.llm(obs.condition_tokenized_prompt, method="embed")
-            tokens.append(tokenized_inputs)
-            input_mask.append(obs.condition_tokenized_prompt_mask)
+        tokenized_inputs = self.reference_PaliGemma.llm(obs.condition_tokenized_prompt, method="embed")
+        tokens.append(tokenized_inputs)
+        input_mask.append(obs.condition_tokenized_prompt_mask)
 
         return jnp.concatenate(tokens, axis=1), jnp.concatenate(input_mask, axis=1)
 
@@ -150,23 +156,6 @@ class Pi0MetaReferenceStudent(Pi0Meta):
         ref_tokens = ref_tokens + self.reference_position_embedding(pos_ids)[None, :, :]
         return ref_tokens, einops.repeat(ref_mask, "b -> b r", r=self.num_reference_action_tokens)
 
-    def _build_reference_state_token(
-        self, observation: _model.Observation
-    ) -> tuple[at.Float[at.Array, "b one emb"], at.Bool[at.Array, "b one"]]:
-        if observation.condition_state is None:
-            raise ValueError("Reference-student encoding requires 32D condition_state.")
-        condition_state = self._mask_backbone_channels(observation.condition_state)
-        if condition_state.shape[-1] != self.action_dim:
-            raise ValueError(
-                "Reference-student condition_state must match the executor state/action dimension; "
-                f"got {condition_state.shape[-1]}, expected {self.action_dim}."
-            )
-        token = self.reference_state_in(condition_state)
-        token = nnx.swish(token)
-        token = self.reference_state_out(token)[:, None, :]
-        mask = jnp.ones((observation.state.shape[0], 1), dtype=jnp.bool_)
-        return token, mask
-
     def _build_current_state_token(
         self, observation: _model.Observation
     ) -> tuple[at.Float[at.Array, "b one emb"], at.Bool[at.Array, "b one"]]:
@@ -179,40 +168,35 @@ class Pi0MetaReferenceStudent(Pi0Meta):
 
     def _encode_reference_meta_tokens(self, observation: _model.Observation) -> at.Float[at.Array, "b m emb"]:
         obs_tokens, obs_mask = self._build_reference_observation_tokens(observation)
-        reference_state_token, reference_state_mask = self._build_reference_state_token(observation)
         ref_tokens, ref_mask = self._build_reference_action_tokens(observation)
         current_state_token, current_state_mask = self._build_current_state_token(observation)
-        query_ids = jnp.arange(self.max_meta_areas, dtype=jnp.int32)
+        query_ids = jnp.arange(self.reference_meta_replace_slots, dtype=jnp.int32)
         query_tokens = self.reference_meta_query_embedding(query_ids)[None, :, :]
         query_tokens = jnp.broadcast_to(
             query_tokens,
-            (observation.state.shape[0], self.max_meta_areas, query_tokens.shape[-1]),
+            (observation.state.shape[0], self.reference_meta_replace_slots, query_tokens.shape[-1]),
         )
         query_mask = jnp.ones(query_tokens.shape[:2], dtype=jnp.bool_)
 
-        tokens = jnp.concatenate(
-            [obs_tokens, reference_state_token, ref_tokens, current_state_token, query_tokens],
-            axis=1,
-        )
-        input_mask = jnp.concatenate(
-            [obs_mask, reference_state_mask, ref_mask, current_state_mask, query_mask],
-            axis=1,
-        )
+        tokens = jnp.concatenate([obs_tokens, ref_tokens, current_state_token, query_tokens], axis=1)
+        input_mask = jnp.concatenate([obs_mask, ref_mask, current_state_mask, query_mask], axis=1)
         attn_mask = jnp.logical_and(input_mask[:, :, None], input_mask[:, None, :])
         positions = jnp.cumsum(input_mask, axis=1) - 1
         outputs, _ = self.reference_PaliGemma.llm([tokens, None], mask=attn_mask, positions=positions)
         out = outputs[0] if isinstance(outputs, tuple | list) else outputs
         assert out is not None
-        return self.reference_query_norm(out[:, -self.max_meta_areas :])
+        return self.reference_query_norm(out[:, -self.reference_meta_replace_slots :])
 
     def _condition_meta_tokens(self, observation: _model.Observation) -> at.Float[at.Array, "b m emb"]:
         if observation.condition_images is None:
             old_meta_tokens, _ = self._build_meta_context_tokens(observation)
             return old_meta_tokens
-        # Reference-action and obs-only paths both use the query output from the
-        # reference encoder. For obs-only samples the reference-action tokens are
-        # present but fully masked inside _build_reference_action_tokens.
-        return self._encode_reference_meta_tokens(observation)
+        # Reference-action and obs-only paths replace only the leading executor
+        # slots. Remaining slots keep the frozen structured model's default
+        # layout, which is required for old checkpoints trained with M > K.
+        old_meta_tokens, _ = self._build_meta_context_tokens(observation)
+        encoded_meta_tokens = self._encode_reference_meta_tokens(observation)
+        return old_meta_tokens.at[:, : self.reference_meta_replace_slots, :].set(encoded_meta_tokens)
 
     def _contrastive_meta_token_loss(
         self,

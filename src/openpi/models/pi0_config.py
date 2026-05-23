@@ -66,6 +66,9 @@ class Pi0Config(_model.BaseModelConfig):
     # Camera/meta/padding channels are deliberately excluded from the latent path.
     reference_action_dim: int = 14
     reference_current_state_dim: int = 14
+    # Beta3/reference-student requests this many leading old-executor meta
+    # slots to replace. The frozen executor capacity is still max_meta_areas.
+    reference_meta_output_slots: int = 1
     # Optional beta-only layerwise normalized-L2 alignment between
     # meta-area-conditioned refined meta tokens and reference-action-conditioned
     # refined meta tokens for the same chunk1/source observation.

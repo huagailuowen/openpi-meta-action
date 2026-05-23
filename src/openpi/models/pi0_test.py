@@ -3,6 +3,7 @@ import dataclasses
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 import openpi.models.model as _model
@@ -131,7 +132,8 @@ def test_pi05_meta_reference_student_inputs_spec_and_builds():
         meta_reference_student_model=True,
         meta_area_pose_dim=12,
         meta_action_dim=12,
-        max_meta_areas=1,
+        max_meta_areas=3,
+        reference_meta_output_slots=1,
         paligemma_variant="dummy",
         action_expert_variant="dummy",
     )
@@ -143,7 +145,8 @@ def test_pi05_meta_reference_student_inputs_spec_and_builds():
     assert observation_spec.reference_actions is not None
     assert observation_spec.reference_actions.shape[1:] == (50, 14)
     model = nnx.eval_shape(config.create, jax.random.key(0))
-    assert model.max_meta_areas == 1
+    assert model.max_meta_areas == 3
+    assert model.reference_meta_replace_slots == 1
     assert hasattr(model, "reference_PaliGemma")
 
 
@@ -154,7 +157,8 @@ def test_pi05_meta_reference_student_freezes_only_old_executor():
         meta_reference_student_model=True,
         meta_area_pose_dim=12,
         meta_action_dim=12,
-        max_meta_areas=1,
+        max_meta_areas=3,
+        reference_meta_output_slots=1,
         paligemma_variant="dummy",
         action_expert_variant="dummy",
     )
@@ -163,7 +167,11 @@ def test_pi05_meta_reference_student_freezes_only_old_executor():
     assert all("reference_" not in "/".join(str(part) for part in path) for path in state)
 
 
-def _make_dummy_reference_student_config() -> _pi0_config.Pi0Config:
+def _make_dummy_reference_student_config(
+    *,
+    max_meta_areas: int = 3,
+    reference_meta_output_slots: int = 1,
+) -> _pi0_config.Pi0Config:
     return _pi0_config.Pi0Config(
         pi05=True,
         meta_model=True,
@@ -173,7 +181,8 @@ def _make_dummy_reference_student_config() -> _pi0_config.Pi0Config:
         action_dim=32,
         action_horizon=10,
         max_token_len=8,
-        max_meta_areas=1,
+        max_meta_areas=max_meta_areas,
+        reference_meta_output_slots=reference_meta_output_slots,
         reference_action_group_size=5,
         reference_action_dim=14,
         reference_current_state_dim=14,
@@ -200,18 +209,57 @@ def test_pi05_meta_reference_student_compute_loss_terms_smoke():
     assert jnp.all(jnp.isfinite(terms["loss"]))
 
 
-def test_pi05_meta_reference_student_requires_32d_condition_state():
+def test_pi05_meta_reference_student_requires_tokenized_condition_prompt_state():
     config = _make_dummy_reference_student_config()
     model = config.create(jax.random.key(0))
     obs = _make_dummy_beta_observation(
         config,
-        condition_state=jnp.ones((1, 14), dtype=jnp.float32),
+        condition_state=jnp.ones((1, config.action_dim), dtype=jnp.float32),
+        condition_tokenized_prompt=None,
+        condition_tokenized_prompt_mask=None,
+    )
+
+    with pytest.raises(ValueError, match="tokenized prompt"):
+        model._encode_reference_meta_tokens(obs)
+
+
+def test_pi05_meta_reference_student_replaces_only_leading_meta_slot():
+    config = _make_dummy_reference_student_config(max_meta_areas=3, reference_meta_output_slots=1)
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(
+        config,
+        condition_state=jnp.ones((1, config.action_dim), dtype=jnp.float32),
         condition_tokenized_prompt=jnp.ones((1, config.max_token_len), dtype=jnp.int32),
         condition_tokenized_prompt_mask=jnp.ones((1, config.max_token_len), dtype=jnp.bool_),
     )
 
-    with pytest.raises(ValueError, match="condition_state"):
-        model._encode_reference_meta_tokens(obs)
+    old_meta_tokens, _ = model._build_meta_context_tokens(obs)
+    encoded_meta_tokens = model._encode_reference_meta_tokens(obs)
+    conditioned_meta_tokens = model._condition_meta_tokens(obs)
+
+    assert encoded_meta_tokens.shape[1] == 1
+    assert conditioned_meta_tokens.shape == old_meta_tokens.shape
+    np.testing.assert_allclose(np.asarray(conditioned_meta_tokens[:, :1]), np.asarray(encoded_meta_tokens), rtol=1e-5)
+    np.testing.assert_allclose(np.asarray(conditioned_meta_tokens[:, 1:]), np.asarray(old_meta_tokens[:, 1:]), rtol=1e-5)
+
+
+def test_pi05_meta_reference_student_clips_requested_replacement_slots():
+    config = _make_dummy_reference_student_config(max_meta_areas=2, reference_meta_output_slots=5)
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(
+        config,
+        condition_state=jnp.ones((1, config.action_dim), dtype=jnp.float32),
+        condition_tokenized_prompt=jnp.ones((1, config.max_token_len), dtype=jnp.int32),
+        condition_tokenized_prompt_mask=jnp.ones((1, config.max_token_len), dtype=jnp.bool_),
+    )
+
+    encoded_meta_tokens = model._encode_reference_meta_tokens(obs)
+    conditioned_meta_tokens = model._condition_meta_tokens(obs)
+
+    assert model.reference_meta_replace_slots == 2
+    assert encoded_meta_tokens.shape[1] == 2
+    assert conditioned_meta_tokens.shape[1] == 2
+    np.testing.assert_allclose(np.asarray(conditioned_meta_tokens), np.asarray(encoded_meta_tokens), rtol=1e-5)
 
 
 def test_preprocess_observation_preserves_beta_fields():

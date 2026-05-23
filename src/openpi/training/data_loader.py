@@ -252,6 +252,25 @@ def _scalar_int_array(value: typing.Any, *, default: int = 0) -> np.ndarray:
     return np.asarray(array.reshape(-1)[0], dtype=np.int32)
 
 
+def _fit_payload_to_reference(
+    payload: typing.Any,
+    reference: typing.Any | None,
+    *,
+    dtype: np.dtype | type,
+    fill_value: typing.Any,
+) -> np.ndarray:
+    payload_arr = np.asarray(payload, dtype=dtype)
+    if reference is None:
+        return payload_arr.copy()
+    reference_arr = np.asarray(reference)
+    if payload_arr.ndim != reference_arr.ndim:
+        return payload_arr.copy()
+    out = np.full(reference_arr.shape, fill_value, dtype=dtype)
+    slices = tuple(slice(0, min(dst, src)) for dst, src in zip(out.shape, payload_arr.shape, strict=True))
+    out[slices] = payload_arr[slices]
+    return out
+
+
 def _apply_retargeted_payload(sample: dict[str, typing.Any], retargeted: dict[str, np.ndarray]) -> dict[str, typing.Any]:
     out = _clone_sample(sample)
     out["state"] = retargeted["state"].astype(np.float32)
@@ -260,27 +279,68 @@ def _apply_retargeted_payload(sample: dict[str, typing.Any], retargeted: dict[st
     out["source_type_id"] = np.full(source_type_shape, 2, dtype=np.int32)
     meta_areas = dict(out.get("meta_areas", {}))
     if "meta_area_pose12d" in retargeted:
-        meta_areas["pose12d"] = retargeted["meta_area_pose12d"].astype(np.float32)
+        meta_areas["pose12d"] = _fit_payload_to_reference(
+            retargeted["meta_area_pose12d"],
+            meta_areas.get("pose12d"),
+            dtype=np.float32,
+            fill_value=0.0,
+        )
         meta_areas.pop("pose6d", None)
         if "meta_area_dim_mask12" in retargeted:
-            meta_areas["dim_mask12"] = retargeted["meta_area_dim_mask12"].astype(bool)
+            meta_areas["dim_mask12"] = _fit_payload_to_reference(
+                retargeted["meta_area_dim_mask12"],
+                meta_areas.get("dim_mask12"),
+                dtype=bool,
+                fill_value=False,
+            )
     else:
         meta_areas["pose6d"] = retargeted["meta_area_pose6d"].astype(np.float32)
         meta_areas.pop("pose12d", None)
         meta_areas.pop("dim_mask12", None)
-    meta_areas["type"] = retargeted["meta_area_type"].astype(np.int32)
-    meta_areas["mask"] = retargeted["meta_area_mask"].astype(bool)
+    meta_areas["type"] = _fit_payload_to_reference(
+        retargeted["meta_area_type"],
+        meta_areas.get("type"),
+        dtype=np.int32,
+        fill_value=0,
+    )
+    meta_areas["mask"] = _fit_payload_to_reference(
+        retargeted["meta_area_mask"],
+        meta_areas.get("mask"),
+        dtype=bool,
+        fill_value=False,
+    )
     out["meta_areas"] = meta_areas
     if "meta_action_target_pose12d" in retargeted:
         meta_targets = dict(out.get("meta_action_targets", {}))
-        meta_targets["pose12d"] = retargeted["meta_action_target_pose12d"].astype(np.float32)
+        meta_targets["pose12d"] = _fit_payload_to_reference(
+            retargeted["meta_action_target_pose12d"],
+            meta_targets.get("pose12d"),
+            dtype=np.float32,
+            fill_value=0.0,
+        )
         meta_targets.pop("pose6d", None)
         if "meta_action_target_dim_mask12" in retargeted:
-            meta_targets["dim_mask12"] = retargeted["meta_action_target_dim_mask12"].astype(bool)
+            meta_targets["dim_mask12"] = _fit_payload_to_reference(
+                retargeted["meta_action_target_dim_mask12"],
+                meta_targets.get("dim_mask12"),
+                dtype=bool,
+                fill_value=False,
+            )
         if "meta_action_target_mask" in retargeted:
-            meta_targets["mask"] = retargeted["meta_action_target_mask"].astype(bool)
+            meta_targets["mask"] = _fit_payload_to_reference(
+                retargeted["meta_action_target_mask"],
+                meta_targets.get("mask"),
+                dtype=bool,
+                fill_value=False,
+            )
         else:
-            meta_targets["mask"] = np.ones(meta_targets["pose12d"].shape[:2], dtype=bool)
+            meta_targets["mask"] = np.ones(np.asarray(retargeted["meta_action_target_pose12d"]).shape[:2], dtype=bool)
+            meta_targets["mask"] = _fit_payload_to_reference(
+                meta_targets["mask"],
+                dict(out.get("meta_action_targets", {})).get("mask"),
+                dtype=bool,
+                fill_value=False,
+            )
         out["meta_action_targets"] = meta_targets
     return out
 

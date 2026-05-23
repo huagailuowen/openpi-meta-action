@@ -198,8 +198,8 @@ The beta3 reference-student config is
 the old structured 12D executor is loaded from a pre-alpha/beta checkpoint and frozen, while only the
 new `reference_*` encoder branch is trainable. In meta-area mode, beta3 falls back to the old
 structured 12D meta-area token path. In reference-action mode, the encoder reads chunk1 reference
-images, prompt, a 32D reference `condition_state` token, 14D delta reference actions, plus the current
-chunk2 14D qpos anchor from `state[:14]`, and produces replacement meta tokens for the frozen structured executor. This makes reference
+images, prompt+32D `condition_state` after the normal OpenPI tokenizer path, 14D delta reference actions,
+plus the current chunk2 14D qpos anchor from `state[:14]`, and produces replacement meta tokens for the frozen structured executor. This makes reference
 conditioning a teacher/student adapter on top of the known-good structured policy instead of changing
 the executor itself. The optional beta3 contrastive token-alignment loss is available through
 `model.meta_contrastive_loss_weight`, but the current beta3 configs keep it at `0.0`.
@@ -438,9 +438,9 @@ source `actions` have already passed through the normal delta-action transform, 
 `7:13` are relative to the same source state copied into `condition_state`; gripper dims `6` and `13`
 remain absolute. The runtime HDF5 reference loader follows the same rule: it samples the reference
 trajectory, subtracts the reference start-frame qpos for dims `0:6` and `7:13`, returns 14D
-`reference_actions`, and supplies the source start-frame state as a 32D `condition_state`. Beta3's
-extra current-state MLP token is built inside the model from the live current `state[:14]`; it is not
-carried through `condition_state`.
+`reference_actions`, and supplies the source start-frame state as a 32D `condition_state` for the
+normal prompt+state tokenizer. Beta3's extra current-state MLP token is built inside the model from the
+live current `state[:14]`; it is not carried through `condition_state`.
 
 `meta_control.imagination_alpha` is no longer injected into beta special tokens. Current beta training
 and inference force this value to `0.0` and keep the field only as a compatibility/debug value.
@@ -756,6 +756,12 @@ uses the same pair/cache semantics as beta, but sets condition probabilities to
 `meta_area=0.0`, `reference_action=0.80`, and non-retarget `obs_only=0.20`; obs-only remains disabled
 for imagined/retargeted source chunks. It initializes the frozen executor from the old structured
 checkpoint path and copies that checkpoint's `PaliGemma` weights into the trainable reference encoder.
+Beta3 preserves the frozen structured executor slot layout: `model.max_meta_areas` and
+`data.max_meta_areas` are the old executor capacity `M` (currently `3`), while
+`model.reference_meta_output_slots` is the requested leading-slot replacement count `K` (currently `1`).
+Reference conditioning replaces only the first `min(K, M)` meta tokens; remaining executor slots stay
+as the old structured model's default/empty slots. Retarget cache payloads are therefore padded into
+the leading slots instead of shrinking `M`-slot arrays.
 The analogous upper45/18type config is
 `pi05_xtrainer_meta_aux_structured_12d_delta_beta3_reference_black_ring_hookNewUpper45_60_stick10_18type_12D_classified_stride3`;
 override its `weight_loader` checkpoint path if a later structured backbone checkpoint is selected.
@@ -890,3 +896,4 @@ The server returns both `actions` (shape `[action_horizon, 32]`) and `meta_actio
 | `meta_beta_model` | `False` | Switch PI0.5 meta creation to the beta chunk-pair meta-token model |
 | `num_meta_latent_tokens` | `4` | Deprecated beta2 no-op retained for old config compatibility; refined meta-token count is `max_meta_areas` |
 | `reference_action_group_size` | `5` | Number of action steps compressed into one reference-action token |
+| `reference_meta_output_slots` | `1` | Beta3 requested number of leading frozen-executor meta slots replaced by the reference encoder |

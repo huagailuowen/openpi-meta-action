@@ -600,6 +600,47 @@ def _write_tiny_chunk_retarget_cache(cache_dir, base_index: int, sample: dict, *
     return relpath
 
 
+def test_apply_retargeted_payload_pads_into_existing_meta_slots():
+    sample = _tiny_beta_sample(0, tool=1, episode=0)
+    sample["meta_areas"] = {
+        "pose12d": np.zeros((3, 12), dtype=np.float32),
+        "dim_mask12": np.zeros((3, 12), dtype=bool),
+        "type": np.zeros((3,), dtype=np.int32),
+        "mask": np.zeros((3,), dtype=bool),
+    }
+    sample["meta_action_targets"] = {
+        "pose12d": np.zeros((4, 3, 12), dtype=np.float32),
+        "dim_mask12": np.zeros((4, 3, 12), dtype=bool),
+        "mask": np.zeros((4, 3), dtype=bool),
+    }
+    payload = {
+        "state": np.full((32,), 3.0, dtype=np.float32),
+        "actions": np.full((4, 32), 7.0, dtype=np.float32),
+        "meta_area_pose12d": np.full((1, 12), 5.0, dtype=np.float32),
+        "meta_area_dim_mask12": np.ones((1, 12), dtype=bool),
+        "meta_area_type": np.asarray([2], dtype=np.int32),
+        "meta_area_mask": np.asarray([True], dtype=bool),
+        "meta_action_target_pose12d": np.full((4, 1, 12), 6.0, dtype=np.float32),
+        "meta_action_target_dim_mask12": np.ones((4, 1, 12), dtype=bool),
+        "meta_action_target_mask": np.ones((4, 1), dtype=bool),
+    }
+
+    out = _data_loader._apply_retargeted_payload(sample, payload)  # noqa: SLF001
+
+    assert out["meta_areas"]["pose12d"].shape == (3, 12)
+    assert out["meta_areas"]["dim_mask12"].shape == (3, 12)
+    assert out["meta_areas"]["type"].shape == (3,)
+    assert out["meta_areas"]["mask"].shape == (3,)
+    np.testing.assert_array_equal(out["meta_areas"]["pose12d"][0], np.full((12,), 5.0, dtype=np.float32))
+    np.testing.assert_array_equal(out["meta_areas"]["pose12d"][1:], np.zeros((2, 12), dtype=np.float32))
+    np.testing.assert_array_equal(out["meta_areas"]["mask"], np.asarray([True, False, False], dtype=bool))
+    assert out["meta_action_targets"]["pose12d"].shape == (4, 3, 12)
+    assert out["meta_action_targets"]["mask"].shape == (4, 3)
+    np.testing.assert_array_equal(out["meta_action_targets"]["pose12d"][:, 0], np.full((4, 12), 6.0, dtype=np.float32))
+    np.testing.assert_array_equal(out["meta_action_targets"]["pose12d"][:, 1:], np.zeros((4, 2, 12), dtype=np.float32))
+    np.testing.assert_array_equal(out["meta_action_targets"]["mask"], np.pad(np.ones((4, 1), dtype=bool), ((0, 0), (0, 2))))
+
+
 def test_beta_pair_dataset_retarget_condition_uses_source_and_retarget_target(monkeypatch):
     class TinyDataset:
         def __init__(self):
@@ -1048,7 +1089,7 @@ def test_beta_same_tool_pair_cache_reconstructs_imagine_source_from_chunk_cache(
     np.testing.assert_array_equal(sample["actions"], np.full((4, 32), 7.0, dtype=np.float32))
     np.testing.assert_array_equal(sample["execution_meta_areas"]["pose12d"], np.full((1, 12), 9.0, dtype=np.float32))
     np.testing.assert_array_equal(sample["meta_areas"]["pose12d"][:, :3], np.asarray([[1.0, 0.0, 0.0]], dtype=np.float32))
-    assert int(sample["source_type_id"][0]) == 2
+    assert int(np.asarray(sample["source_type_id"]).reshape(-1)[0]) == 2
 
 
 def test_beta_retarget_condition_uses_same_tool_chunk_cache_for_meta_condition(tmp_path):
