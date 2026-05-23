@@ -123,6 +123,45 @@ def test_pi05_meta_beta_inputs_spec_contains_execution_meta_and_reference():
     assert observation_spec.meta_imagination_alpha is not None
 
 
+def test_pi05_meta_reference_student_inputs_spec_and_builds():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        meta_model=True,
+        meta_reference_student_model=True,
+        meta_area_pose_dim=12,
+        meta_action_dim=12,
+        max_meta_areas=1,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    observation_spec, _ = config.inputs_spec()
+    assert observation_spec.condition_images is not None
+    assert observation_spec.condition_state is not None
+    assert observation_spec.condition_state.shape[-1] == 14
+    assert observation_spec.execution_meta_area_poses is not None
+    assert observation_spec.reference_actions is not None
+    assert observation_spec.reference_actions.shape[1:] == (50, 14)
+    model = nnx.eval_shape(config.create, jax.random.key(0))
+    assert model.max_meta_areas == 1
+    assert hasattr(model, "reference_PaliGemma")
+
+
+def test_pi05_meta_reference_student_freezes_only_old_executor():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        meta_model=True,
+        meta_reference_student_model=True,
+        meta_area_pose_dim=12,
+        meta_action_dim=12,
+        max_meta_areas=1,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    state = _get_frozen_state(config)
+    assert len(state) > 0
+    assert all("reference_" not in "/".join(str(part) for part in path) for path in state)
+
+
 def test_preprocess_observation_preserves_beta_fields():
     obs = _model.Observation(
         images={
@@ -249,6 +288,40 @@ def test_pi05_meta_beta_condition_prefix_requires_condition_state():
     obs = _make_dummy_beta_observation(config, condition_state=None)
     with pytest.raises(ValueError, match="condition_state"):
         model._build_condition_prefix(obs)
+
+
+def test_pi05_meta_beta_prepare_observation_preserves_contrastive_fields():
+    config = _make_dummy_beta_config()
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(config)
+    obs = dataclasses.replace(
+        obs,
+        contrastive_meta_area_poses=jnp.ones(
+            (1, config.max_meta_areas, config.meta_area_pose_dim), dtype=jnp.float32
+        )
+        * 2.0,
+        contrastive_meta_area_dim_masks=jnp.ones(
+            (1, config.max_meta_areas, config.meta_area_pose_dim), dtype=jnp.bool_
+        ),
+        contrastive_meta_area_types=jnp.ones((1, config.max_meta_areas), dtype=jnp.int32),
+        contrastive_meta_area_masks=jnp.ones((1, config.max_meta_areas), dtype=jnp.bool_),
+        contrastive_reference_actions=jnp.ones(
+            (1, config.action_horizon, config.reference_action_dim), dtype=jnp.float32
+        )
+        * 3.0,
+        contrastive_reference_action_mask=jnp.ones((1,), dtype=jnp.bool_),
+    )
+
+    prepared = model._prepare_observation(obs)
+
+    assert prepared.contrastive_meta_area_poses is not None
+    assert jnp.all(prepared.contrastive_meta_area_poses == 2.0)
+    assert prepared.contrastive_meta_area_dim_masks is not None
+    assert prepared.contrastive_meta_area_types is not None
+    assert prepared.contrastive_meta_area_masks is not None
+    assert prepared.contrastive_reference_actions is not None
+    assert jnp.all(prepared.contrastive_reference_actions == 3.0)
+    assert prepared.contrastive_reference_action_mask is not None
 
 
 def test_pi05_meta_beta_condition_prefix_requires_condition_tokenized_prompt():

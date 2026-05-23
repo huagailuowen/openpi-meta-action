@@ -1094,7 +1094,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             requested_condition_id = int(self._rng.choice(3, p=self._retarget_condition_probs))
             use_direct_chunk_cache = (
                 self._pair_retarget_same_tool_only
-                and requested_condition_id == 0
+                and requested_condition_id in (0, 1)
                 and self._imagine_cache_condition_prob > 0.0
                 and self._rng.random() < self._imagine_cache_condition_prob
             )
@@ -1897,7 +1897,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             if "image_mask" in source_sample:
                 out["condition_image_mask"] = _copy_image_dict(dict(source_sample["image_mask"]))
         if "state" in source_sample:
-            out["condition_state"] = np.asarray(source_sample["state"], dtype=np.float32).copy()
+            out["condition_state"] = np.asarray(source_sample["state"], dtype=np.float32)[..., :_BETA_REFERENCE_ACTION_DIM].copy()
         if "prompt" in source_sample:
             out["condition_prompt"] = source_sample["prompt"]
 

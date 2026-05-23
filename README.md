@@ -193,6 +193,17 @@ weight, inspect the unweighted/raw action, meta-action, and contrastive loss mag
 raw contrastive loss is around `0.7-1.2`, `0.4` contributes roughly `0.28-0.48` before any task-loss
 scaling, so reduce it if action or meta-action loss regresses.
 
+The beta3 reference-student config is
+`pi05_xtrainer_meta_aux_structured_12d_delta_beta3_reference`. It is deliberately more conservative:
+the old structured 12D executor is loaded from a pre-alpha/beta checkpoint and frozen, while only the
+new `reference_*` encoder branch is trainable. In meta-area mode, beta3 falls back to the old
+structured 12D meta-area token path. In reference-action mode, the encoder reads chunk1 reference
+images, prompt, 14D reference state, 14D delta reference actions, plus the current chunk2 14D qpos
+anchor, and produces replacement meta tokens for the frozen structured executor. This makes reference
+conditioning a teacher/student adapter on top of the known-good structured policy instead of changing
+the executor itself. The optional beta3 contrastive token-alignment loss is available through
+`model.meta_contrastive_loss_weight`, but the current beta3 configs keep it at `0.0`.
+
 Retarget cache supports the same structured fields. For 12D line/surface tools, if `approach3` is
 active, retargeting aligns the shape matrix and approach direction together instead of only
 interpolating a single direction vector along a great circle. The first 12D implementation uses the
@@ -397,8 +408,8 @@ relationship before normalization:
 ```text
 self same chunk:             0.12
 same episode different chunk:0.08
-same tool different episode: 0.50
-retarget conditioned:        0.30
+same tool different episode: 0.65
+retarget conditioned:        0.15
 ```
 
 Condition type is sampled separately. Non-retarget samples reserve 10% for obs-only conditioning.
@@ -726,6 +737,23 @@ python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta \
     --exp-name my_beta_run_12d \
     --overrides data.repo_id=/path/to/your/classified_structured_12d_lerobot_dataset
 ```
+
+Beta3 reference-student 12D training:
+
+```bash
+python scripts/train.py pi05_xtrainer_meta_aux_structured_12d_delta_beta3_reference \
+    --exp-name my_beta3_reference_student \
+    --overrides data.repo_id=/path/to/your/classified_structured_12d_lerobot_dataset \
+    --overrides data.meta_retarget_cache_dir=/path/to/chunk_retarget_cache_12d \
+    --overrides data.meta_beta_pair_cache_dir=/path/to/beta_pair_cache
+```
+
+The dataset-specific beta3 config
+`pi05_xtrainer_meta_aux_structured_12d_delta_beta3_reference_black_ring_hookNewUpper30_60_stick10_9type_12D_classified_stride3`
+uses the same pair/cache semantics as beta, but sets condition probabilities to
+`meta_area=0.0`, `reference_action=0.80`, and non-retarget `obs_only=0.20`; obs-only remains disabled
+for imagined/retargeted source chunks. It initializes the frozen executor from the old structured
+checkpoint path and copies that checkpoint's `PaliGemma` weights into the trainable reference encoder.
 
 Optional beta pair cache generation:
 

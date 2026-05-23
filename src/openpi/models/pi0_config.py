@@ -55,6 +55,9 @@ class Pi0Config(_model.BaseModelConfig):
     # Beta chunk-pair path. This keeps the old structured meta model intact and
     # switches creation to Pi0MetaBeta only for explicit beta configs.
     meta_beta_model: bool = False
+    # Beta3/reference-student path. A trainable reference encoder predicts meta
+    # tokens that are consumed by the frozen old structured execution model.
+    meta_reference_student_model: bool = False
     # Deprecated in beta2: refined meta-token slots are controlled by
     # max_meta_areas. Kept only so older configs still parse.
     num_meta_latent_tokens: int = 4
@@ -62,6 +65,7 @@ class Pi0Config(_model.BaseModelConfig):
     # Reference-action conditioning only uses the bimanual qpos action prefix.
     # Camera/meta/padding channels are deliberately excluded from the latent path.
     reference_action_dim: int = 14
+    reference_current_state_dim: int = 14
     # Optional beta-only layerwise normalized-L2 alignment between
     # meta-area-conditioned refined meta tokens and reference-action-conditioned
     # refined meta tokens for the same chunk1/source observation.
@@ -112,6 +116,10 @@ class Pi0Config(_model.BaseModelConfig):
         if self.meta_model:
             if not self.pi05:
                 raise ValueError("The meta model path is only implemented for PI0.5.")
+            if self.meta_reference_student_model:
+                from openpi.models.pi0_meta_reference_student import Pi0MetaReferenceStudent
+
+                return Pi0MetaReferenceStudent(self, rngs=nnx.Rngs(rng))
             if self.meta_beta_model:
                 from openpi.models.pi0_meta_beta import Pi0MetaBeta
 
@@ -147,7 +155,7 @@ class Pi0Config(_model.BaseModelConfig):
                         "left_wrist_0_rgb": image_spec,
                         "right_wrist_0_rgb": image_spec,
                     }
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 condition_image_masks=(
@@ -156,22 +164,30 @@ class Pi0Config(_model.BaseModelConfig):
                         "left_wrist_0_rgb": image_mask_spec,
                         "right_wrist_0_rgb": image_mask_spec,
                     }
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 condition_state=(
-                    jax.ShapeDtypeStruct([batch_size, self.action_dim], jnp.float32)
-                    if self.meta_model and self.meta_beta_model
+                    jax.ShapeDtypeStruct(
+                        [
+                            batch_size,
+                            self.reference_current_state_dim
+                            if self.meta_reference_student_model
+                            else self.action_dim,
+                        ],
+                        jnp.float32,
+                    )
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 condition_tokenized_prompt=(
                     jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 condition_tokenized_prompt_mask=(
                     jax.ShapeDtypeStruct([batch_size, self.max_token_len], bool)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 tokenized_prompt=jax.ShapeDtypeStruct([batch_size, self.max_token_len], jnp.int32),
@@ -194,22 +210,22 @@ class Pi0Config(_model.BaseModelConfig):
                 ),
                 execution_meta_area_poses=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, self.meta_area_pose_dim], jnp.float32)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 execution_meta_area_dim_masks=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, self.meta_area_pose_dim], jnp.bool_)
-                    if self.meta_model and self.meta_beta_model and self.meta_area_pose_dim == 12
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model) and self.meta_area_pose_dim == 12
                     else None
                 ),
                 execution_meta_area_types=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.int32)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 execution_meta_area_masks=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.bool_)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 meta_action_target_poses=(
@@ -240,47 +256,47 @@ class Pi0Config(_model.BaseModelConfig):
                 ),
                 reference_actions=(
                     jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.reference_action_dim], jnp.float32)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 reference_action_mask=(
                     jax.ShapeDtypeStruct([batch_size], jnp.bool_)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 contrastive_meta_area_poses=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, self.meta_area_pose_dim], jnp.float32)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 contrastive_meta_area_dim_masks=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas, self.meta_area_pose_dim], jnp.bool_)
-                    if self.meta_model and self.meta_beta_model and self.meta_area_pose_dim == 12
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model) and self.meta_area_pose_dim == 12
                     else None
                 ),
                 contrastive_meta_area_types=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.int32)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 contrastive_meta_area_masks=(
                     jax.ShapeDtypeStruct([batch_size, self.max_meta_areas], jnp.bool_)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 contrastive_reference_actions=(
                     jax.ShapeDtypeStruct([batch_size, self.action_horizon, self.reference_action_dim], jnp.float32)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 contrastive_reference_action_mask=(
                     jax.ShapeDtypeStruct([batch_size], jnp.bool_)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
                 meta_imagination_alpha=(
                     jax.ShapeDtypeStruct([batch_size], jnp.float32)
-                    if self.meta_model and self.meta_beta_model
+                    if self.meta_model and (self.meta_beta_model or self.meta_reference_student_model)
                     else None
                 ),
             )
@@ -319,6 +335,11 @@ class Pi0Config(_model.BaseModelConfig):
         lora_filter = nnx.All(*filters) if filters else None
 
         extra_filters = []
+        if self.meta_reference_student_model:
+            # Freeze the old structured execution model. The trainable
+            # reference encoder branch is deliberately named with the
+            # "reference_" prefix.
+            extra_filters.append(nnx.Not(nnx_utils.PathRegex(".*reference_.*")))
         if self.freeze_vlm_backbone:
             # PaliGemma image encoder + first LLM expert (the action expert lives in the
             # second LLM module whose params include `_1` in their path).

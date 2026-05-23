@@ -207,6 +207,12 @@ class Pi0Meta(_model.BaseModel):
             meta_control_alpha=observation.meta_control_alpha,
             reference_actions=observation.reference_actions,
             reference_action_mask=observation.reference_action_mask,
+            contrastive_meta_area_poses=observation.contrastive_meta_area_poses,
+            contrastive_meta_area_dim_masks=observation.contrastive_meta_area_dim_masks,
+            contrastive_meta_area_types=observation.contrastive_meta_area_types,
+            contrastive_meta_area_masks=observation.contrastive_meta_area_masks,
+            contrastive_reference_actions=observation.contrastive_reference_actions,
+            contrastive_reference_action_mask=observation.contrastive_reference_action_mask,
             meta_imagination_alpha=observation.meta_imagination_alpha,
         )
 

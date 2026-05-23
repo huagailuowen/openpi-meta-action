@@ -65,6 +65,29 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class ReferenceStudentCheckpointWeightLoader(WeightLoader):
+    """Load an old structured checkpoint and seed the beta3 reference encoder.
+
+    The old execution model keeps the original parameter names. The trainable
+    reference encoder has a separate ``reference_PaliGemma`` backbone, which is
+    initialized by copying the old ``PaliGemma`` weights. New reference action,
+    current-state, and query heads stay randomly initialized.
+    """
+
+    params_path: str
+    missing_regex: str = ".*"
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
+        for key, value in list(flat_loaded.items()):
+            if key.startswith("PaliGemma/"):
+                flat_loaded[f"reference_{key}"] = value
+        loaded_params = flax.traverse_util.unflatten_dict(flat_loaded, sep="/")
+        return _merge_params(loaded_params, params, missing_regex=self.missing_regex)
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 
