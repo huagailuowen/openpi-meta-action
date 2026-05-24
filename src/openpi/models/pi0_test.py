@@ -63,6 +63,19 @@ def test_pi05_meta_model_builds():
     assert model.max_meta_areas == 3
 
 
+def test_pi05_raw14_action_loss_masks_padded_dims():
+    config = _pi0_config.Pi0Config(
+        pi05=True,
+        action_dim=32,
+        action_loss_dim=14,
+        paligemma_variant="dummy",
+        action_expert_variant="dummy",
+    )
+    model = nnx.eval_shape(config.create, jax.random.key(0))
+    assert model.action_loss_mask_values[:14] == (1.0,) * 14
+    assert model.action_loss_mask_values[14:] == (0.0,) * 18
+
+
 def test_pi05_meta_inputs_spec_contains_meta_areas():
     config = _pi0_config.Pi0Config(pi05=True, meta_model=True, paligemma_variant="dummy", action_expert_variant="dummy")
     observation_spec, _ = config.inputs_spec()

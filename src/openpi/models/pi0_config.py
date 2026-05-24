@@ -24,6 +24,10 @@ class Pi0Config(_model.BaseModelConfig):
     # Set the model specific defaults.
     action_dim: int = 32
     action_horizon: int = 50
+    # Optional action-loss prefix. This is useful for configs that keep a wider
+    # action head for checkpoint/runtime compatibility but only supervise raw
+    # joint dimensions, e.g. raw14 data padded to 32D.
+    action_loss_dim: int | None = None
     max_token_len: int = None  # type: ignore
     # Pi05 has two differences from Pi0:
     # - the state input is part of the discrete language tokens rather than a continuous input that is part of the suffix

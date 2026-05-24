@@ -362,7 +362,7 @@ class LeRobotXTrainerRaw14DataConfig(DataConfigFactory):
 
     State and action arrays are sliced to dims 0..13 then zero-padded back up to the
     model's full ``action_dim`` (so ``Pi0Config.action_dim=32`` stays unchanged). The
-    18 padded dims are trained against zero targets — harmless for a baseline. The
+    model config should set ``action_loss_dim=14`` so padded dims are not supervised. The
     output transform truncates predictions to ``output_action_dim`` (14) again so
     downstream consumers only see the joint channels.
     """
@@ -1927,6 +1927,7 @@ _CONFIGS = [
             pi05=True,
             meta_model=False,
             action_dim=32,
+            action_loss_dim=14,
             action_horizon=50,
         ),
         data=LeRobotXTrainerRaw14DataConfig(
