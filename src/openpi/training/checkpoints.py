@@ -7,6 +7,7 @@ import logging
 from typing import Protocol
 
 from etils import epath
+import flax.nnx as nnx
 import jax
 import orbax.checkpoint as ocp
 import orbax.checkpoint.future as future
@@ -67,6 +68,8 @@ def save_state(
     state: training_utils.TrainState,
     data_loader: _data_loader.DataLoader,
     step: int,
+    *,
+    trainable_filter: nnx.filterlib.Filter | None = None,
 ):
     def save_assets(directory: epath.Path):
         # Save the normalization stats.
@@ -77,7 +80,7 @@ def save_state(
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
-        train_state, params = _split_params(state)
+        train_state, params = _split_params(state, trainable_filter=trainable_filter)
     items = {
         "assets": save_assets,
         "train_state": train_state,
@@ -142,14 +145,42 @@ class CallbackSave(ocp.args.CheckpointArgs):
 class CallbackRestore(ocp.args.CheckpointArgs): ...
 
 
-def _split_params(state: training_utils.TrainState) -> tuple[training_utils.TrainState, at.Params]:
+def _split_params(
+    state: training_utils.TrainState,
+    *,
+    trainable_filter: nnx.filterlib.Filter | None = None,
+) -> tuple[training_utils.TrainState, at.Params]:
     if state.ema_params is not None:
-        params = state.ema_params
+        params = (
+            state.ema_params
+            if trainable_filter is None
+            else _ema_inference_params(state.params, state.ema_params, trainable_filter)
+        )
         train_state = dataclasses.replace(state, ema_params=None)
     else:
         params = state.params
         train_state = dataclasses.replace(state, params={})
     return train_state, params
+
+
+def _ema_inference_params(
+    params: nnx.State,
+    ema_params: nnx.State,
+    trainable_filter: nnx.filterlib.Filter,
+) -> nnx.State:
+    """Build inference params with EMA only for trainable leaves.
+
+    Frozen leaves must come from ``params`` exactly. This matters for
+    reference-student runs, where the old structured executor is frozen and
+    must remain bitwise-equivalent to the initialized checkpoint. Applying EMA
+    to bf16 frozen leaves can drift even when optimizer updates never touch
+    those leaves.
+    """
+
+    merged = nnx.State.from_flat_path(params.flat_state())
+    trainable_ema = ema_params.filter(trainable_filter)
+    merged.replace_by_pure_dict(trainable_ema.to_pure_dict())
+    return merged
 
 
 def _merge_params(train_state: training_utils.TrainState, params: dict[str, at.Params]) -> training_utils.TrainState:

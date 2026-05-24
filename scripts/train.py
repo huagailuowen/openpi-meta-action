@@ -357,7 +357,16 @@ def main(config: _config.TrainConfig):
 
             if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
                 save_start = time.perf_counter()
-                _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
+                save_trainable_filter = (
+                    config.trainable_filter if getattr(config.model, "meta_reference_student_model", False) else None
+                )
+                _checkpoints.save_state(
+                    checkpoint_manager,
+                    train_state,
+                    data_loader,
+                    step,
+                    trainable_filter=save_trainable_filter,
+                )
                 timing["save_s"] += time.perf_counter() - save_start
 
             if next_batch is not None:
