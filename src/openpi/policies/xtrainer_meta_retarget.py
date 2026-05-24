@@ -50,6 +50,9 @@ SUPPORTED_RETARGET_ALGORITHMS = frozenset(
         RETARGET_ALGORITHM_LEGACY_STRUCTURED_MIN_ROTATION,
     }
 )
+RETARGET_ROBOT_XTRAINER = "xtrainer"
+RETARGET_ROBOT_ALOHA = "aloha"
+SUPPORTED_RETARGET_ROBOT_TYPES = frozenset({RETARGET_ROBOT_XTRAINER, RETARGET_ROBOT_ALOHA})
 
 
 def _meta_slice_for_dim(meta_dim: int) -> slice:
@@ -66,6 +69,7 @@ class MetaRetargetGeneratorConfig:
     """Configuration for one canonical chunk retarget attempt."""
 
     retarget_algorithm: str = RETARGET_ALGORITHM_DEFAULT
+    robot_type: str = RETARGET_ROBOT_XTRAINER
     legacy_min_rotation_shape_tolerance_deg: float = 5.0
     legacy_min_rotation_approach_tolerance_deg: float = 5.0
     legacy_min_rotation_min_pair_angle_deg: float = 15.0
@@ -347,6 +351,11 @@ def _validate_retarget_algorithm(config: MetaRetargetGeneratorConfig) -> None:
             f"Unsupported retarget_algorithm={config.retarget_algorithm!r}; "
             f"expected one of {sorted(SUPPORTED_RETARGET_ALGORITHMS)}"
         )
+    if config.robot_type not in SUPPORTED_RETARGET_ROBOT_TYPES:
+        raise ValueError(
+            f"Unsupported robot_type={config.robot_type!r}; "
+            f"expected one of {sorted(SUPPORTED_RETARGET_ROBOT_TYPES)}"
+        )
 
 
 def _uses_legacy_retarget_algorithm(config: MetaRetargetGeneratorConfig) -> bool:
@@ -359,7 +368,9 @@ def _generate_retargeted_chunk_wrist_pose_v2(
     rng: np.random.Generator,
     config: MetaRetargetGeneratorConfig,
 ) -> MetaRetargetResult | None:
-    helpers = _load_xtrainer_helpers()
+    helpers = _load_robot_helpers(config.robot_type)
+    if config.robot_type != RETARGET_ROBOT_XTRAINER and config.ik_backend == "jax":
+        config = dataclasses.replace(config, ik_backend="numpy")
     item = _prepare_retarget_chunk(data, rng=rng, config=config, helpers=helpers)
     if item is None:
         return None
@@ -417,7 +428,9 @@ def _generate_pair_retargeted_chunk_wrist_pose_v2(
     rng: np.random.Generator,
     config: MetaRetargetGeneratorConfig,
 ) -> MetaRetargetResult | None:
-    helpers = _load_xtrainer_helpers()
+    helpers = _load_robot_helpers(config.robot_type)
+    if config.robot_type != RETARGET_ROBOT_XTRAINER and config.ik_backend == "jax":
+        config = dataclasses.replace(config, ik_backend="numpy")
     fixed = _pair_source_affordance_as_target_input_pose(source_data, target_data, helpers=helpers)
     if fixed is None:
         return None
@@ -456,7 +469,9 @@ def _generate_retargeted_chunk_legacy(
     rng: np.random.Generator,
     config: MetaRetargetGeneratorConfig,
 ) -> MetaRetargetResult | None:
-    helpers = _load_xtrainer_helpers()
+    helpers = _load_robot_helpers(config.robot_type)
+    if config.robot_type != RETARGET_ROBOT_XTRAINER and config.ik_backend == "jax":
+        config = dataclasses.replace(config, ik_backend="numpy")
     item = _prepare_retarget_chunk(data, rng=rng, config=config, helpers=helpers)
     if item is None:
         return None
@@ -488,7 +503,9 @@ def _generate_pair_retargeted_chunk_legacy(
     rng: np.random.Generator,
     config: MetaRetargetGeneratorConfig,
 ) -> MetaRetargetResult | None:
-    helpers = _load_xtrainer_helpers()
+    helpers = _load_robot_helpers(config.robot_type)
+    if config.robot_type != RETARGET_ROBOT_XTRAINER and config.ik_backend == "jax":
+        config = dataclasses.replace(config, ik_backend="numpy")
     fixed = _pair_source_affordance_as_target_input_pose(source_data, target_data, helpers=helpers)
     if fixed is None:
         return None
@@ -946,7 +963,7 @@ def generate_retargeted_chunks_batch(
             generate_retargeted_chunk(data, rng=rng, config=config)
             for data, rng in zip(data_batch, rngs, strict=True)
         ]
-    if config.ik_backend != "jax":
+    if config.robot_type != RETARGET_ROBOT_XTRAINER or config.ik_backend != "jax":
         return [
             generate_retargeted_chunk(data, rng=rng, config=config)
             for data, rng in zip(data_batch, rngs, strict=True)
@@ -954,7 +971,7 @@ def generate_retargeted_chunks_batch(
     if config.approach_joint_step_rad <= 0:
         raise ValueError(f"approach_joint_step_rad must be positive, got {config.approach_joint_step_rad}")
 
-    helpers = _load_xtrainer_helpers()
+    helpers = _load_robot_helpers(config.robot_type)
     prepared: list[dict[str, Any] | None] = [
         _prepare_retarget_chunk(data, rng=rng, config=config, helpers=helpers)
         for data, rng in zip(data_batch, rngs, strict=True)
@@ -1119,6 +1136,16 @@ def _get_first(data: dict[str, Any], *keys: str):
     raise KeyError(f"Expected one of {keys}, got {tuple(data)}")
 
 
+def _load_robot_helpers(robot_type: str) -> dict[str, Any]:
+    if robot_type == RETARGET_ROBOT_XTRAINER:
+        return _load_xtrainer_helpers()
+    if robot_type == RETARGET_ROBOT_ALOHA:
+        return _load_aloha_helpers()
+    raise ValueError(
+        f"Unsupported robot_type={robot_type!r}; expected one of {sorted(SUPPORTED_RETARGET_ROBOT_TYPES)}"
+    )
+
+
 def _load_xtrainer_helpers() -> dict[str, Any]:
     funcpoint_root = Path(__file__).resolve().parents[4]
     if str(funcpoint_root) not in sys.path:
@@ -1136,6 +1163,29 @@ def _load_xtrainer_helpers() -> dict[str, Any]:
         "right_real_zero_arm": RIGHT_REAL_ZERO_ARM,
         "real_to_sim_arm": real_to_sim_xtrainer_arm_qpos,
         "fk": xtrainer_forward_kinematics,
+    }
+
+
+def _load_aloha_helpers() -> dict[str, Any]:
+    funcpoint_root = Path(__file__).resolve().parents[4]
+    if str(funcpoint_root) not in sys.path:
+        sys.path.insert(0, str(funcpoint_root))
+
+    from src.calibration.aloha_fk import aloha_forward_kinematics  # type: ignore
+
+    def real_to_sim_aloha_arm_qpos(qpos: np.ndarray, side: str) -> np.ndarray:
+        if side not in ("left", "right"):
+            raise KeyError(f"Unsupported ALOHA side for arm qpos conversion: {side}")
+        arm_qpos = np.asarray(qpos, dtype=np.float32).reshape(-1).copy()
+        if arm_qpos.shape[0] != 6:
+            raise ValueError(f"Expected 6-DoF ALOHA arm qpos, got shape {arm_qpos.shape}")
+        return arm_qpos
+
+    return {
+        "right_real_to_sim_sign": np.ones(6, dtype=np.float32),
+        "right_real_zero_arm": np.zeros(6, dtype=np.float32),
+        "real_to_sim_arm": real_to_sim_aloha_arm_qpos,
+        "fk": aloha_forward_kinematics,
     }
 
 

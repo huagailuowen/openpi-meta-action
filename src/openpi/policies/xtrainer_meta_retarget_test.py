@@ -3,6 +3,34 @@ import numpy as np
 from openpi.policies import xtrainer_meta_retarget as retarget
 
 
+def test_retarget_robot_type_defaults_to_xtrainer():
+    config = retarget.MetaRetargetGeneratorConfig()
+
+    assert config.robot_type == retarget.RETARGET_ROBOT_XTRAINER
+    helpers = retarget._load_robot_helpers(config.robot_type)  # noqa: SLF001
+    assert callable(helpers["fk"])
+
+
+def test_aloha_robot_helpers_load_robotwin_world_fk():
+    helpers = retarget._load_robot_helpers(retarget.RETARGET_ROBOT_ALOHA)  # noqa: SLF001
+    T_right = helpers["fk"](np.zeros(14, dtype=np.float32), "right_wrist")
+
+    assert T_right.shape == (4, 4)
+    assert np.all(np.isfinite(T_right))
+    np.testing.assert_allclose(helpers["right_real_to_sim_sign"], np.ones(6, dtype=np.float32))
+
+
+def test_invalid_retarget_robot_type_is_rejected():
+    config = retarget.MetaRetargetGeneratorConfig(robot_type="unsupported_robot")
+
+    try:
+        retarget._validate_retarget_algorithm(config)  # noqa: SLF001
+    except ValueError as exc:
+        assert "Unsupported robot_type" in str(exc)
+    else:
+        raise AssertionError("Unsupported robot_type should raise ValueError")
+
+
 def test_canonicalize_structured_meta_chunk_fills_legacy_action_slice():
     state = np.arange(32, dtype=np.float32)
     actions = np.zeros((4, 32), dtype=np.float32)

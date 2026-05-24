@@ -100,6 +100,7 @@ class RetargetCacheDataset(Dataset[T_co]):
         seed: int,
         expected_action_space: str,
         expected_retarget_algorithm: str,
+        expected_robot_type: str,
     ):
         self._dataset = dataset
         self._cache_dir = pathlib.Path(cache_dir).expanduser()
@@ -110,6 +111,7 @@ class RetargetCacheDataset(Dataset[T_co]):
             self._cache_dir,
             expected_action_space=expected_action_space,
             expected_retarget_algorithm=expected_retarget_algorithm,
+            expected_robot_type=expected_robot_type,
         )
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
@@ -168,6 +170,7 @@ class RetargetCacheDataset(Dataset[T_co]):
         *,
         expected_action_space: str,
         expected_retarget_algorithm: str | None = None,
+        expected_robot_type: str | None = None,
     ) -> None:
         metadata_path = cache_dir / "metadata.json"
         if not metadata_path.exists():
@@ -186,6 +189,15 @@ class RetargetCacheDataset(Dataset[T_co]):
             generator_config = metadata.get("generator_config")
             if isinstance(generator_config, dict) and generator_config.get("retarget_algorithm") is not None:
                 return str(generator_config["retarget_algorithm"])
+            return None
+
+        def _metadata_robot_type(metadata: dict[str, typing.Any]) -> str | None:
+            value = metadata.get("robot_type") or metadata.get("retarget_robot_type")
+            if value is not None:
+                return str(value)
+            generator_config = metadata.get("generator_config")
+            if isinstance(generator_config, dict) and generator_config.get("robot_type") is not None:
+                return str(generator_config["robot_type"])
             return None
 
         try:
@@ -217,6 +229,15 @@ class RetargetCacheDataset(Dataset[T_co]):
                 actual_algorithm,
                 expected_retarget_algorithm,
             )
+        actual_robot_type = _metadata_robot_type(metadata)
+        if expected_robot_type is not None and actual_robot_type is not None and actual_robot_type != expected_robot_type:
+            logging.warning(
+                "Retarget cache robot type mismatch for %s: cache has %s but this data config expects %s. "
+                "The cache will still be used; rebuild it if strict robot kinematics consistency is required.",
+                cache_dir,
+                actual_robot_type,
+                expected_robot_type,
+            )
 
     @staticmethod
     def _warn_if_action_space_mismatch(cache_dir: pathlib.Path, expected_action_space: str) -> None:
@@ -224,6 +245,7 @@ class RetargetCacheDataset(Dataset[T_co]):
             cache_dir,
             expected_action_space=expected_action_space,
             expected_retarget_algorithm=None,
+            expected_robot_type=None,
         )
 
 
@@ -371,6 +393,7 @@ class AlphaMetaRetargetDataset(Dataset[T_co]):
                 self._cache_dir,
                 expected_action_space=expected_action_space,
                 expected_retarget_algorithm=data_config.meta_retarget_algorithm,
+                expected_robot_type=data_config.meta_retarget_robot_type,
             )
         self._delta_action_masks = [np.asarray(mask, dtype=bool) for mask in delta_action_masks]
         self._original_prob = float(np.clip(data_config.meta_alpha_original_prob, 0.0, 1.0))
@@ -385,6 +408,7 @@ class AlphaMetaRetargetDataset(Dataset[T_co]):
         self._near_pos_m = float(data_config.meta_alpha_near_target_pos_max_m)
         self._near_shape_deg = float(data_config.meta_alpha_near_target_shape_max_deg)
         self._near_approach_deg = float(data_config.meta_alpha_near_target_approach_max_deg)
+        self._robot_type = str(data_config.meta_retarget_robot_type)
         self._helpers: dict[str, typing.Any] | None = None
 
     def __getitem__(self, index: SupportsIndex) -> T_co:
@@ -470,7 +494,7 @@ class AlphaMetaRetargetDataset(Dataset[T_co]):
 
     def _helpers_once(self) -> dict[str, typing.Any]:
         if self._helpers is None:
-            self._helpers = _meta_retarget._load_xtrainer_helpers()
+            self._helpers = _meta_retarget._load_robot_helpers(self._robot_type)
         return self._helpers
 
     def _with_near_original_meta_targets(
@@ -1022,6 +1046,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
             logging.warning("Beta same-tool sampling metadata unavailable; falling back to dataset probing.")
         self._retarget_config = _meta_retarget.MetaRetargetGeneratorConfig(
             retarget_algorithm=data_config.meta_retarget_algorithm,
+            robot_type=data_config.meta_retarget_robot_type,
         )
         self._records_by_index = (
             RetargetCacheDataset._load_manifest(self._cache_dir) if self._cache_dir is not None else {}
@@ -1048,6 +1073,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 self._cache_dir,
                 expected_action_space=expected_action_space,
                 expected_retarget_algorithm=data_config.meta_retarget_algorithm,
+                expected_robot_type=data_config.meta_retarget_robot_type,
             )
         self._pair_cache_dir = (
             pathlib.Path(data_config.meta_beta_pair_cache_dir).expanduser()
@@ -1062,6 +1088,7 @@ class BetaStructuredMetaPairDataset(Dataset[T_co]):
                 self._pair_cache_dir,
                 expected_action_space=expected_action_space,
                 expected_retarget_algorithm=data_config.meta_retarget_algorithm,
+                expected_robot_type=data_config.meta_retarget_robot_type,
             )
         self._pair_cache_rng = np.random.default_rng(data_config.meta_beta_pair_cache_seed)
         self._online_async_enabled = bool(data_config.meta_beta_online_async_enabled)
@@ -2138,6 +2165,7 @@ def maybe_wrap_retarget_cache_dataset(dataset: Dataset, data_config: _config.Dat
         seed=data_config.meta_retarget_cache_seed,
         expected_action_space=_expected_retarget_cache_action_space(data_config),
         expected_retarget_algorithm=data_config.meta_retarget_algorithm,
+        expected_robot_type=data_config.meta_retarget_robot_type,
     )
 
 

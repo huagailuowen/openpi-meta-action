@@ -653,6 +653,7 @@ Useful flags:
 | `--accept-max-camera-rotvec-norm-rad` | `3.143` | Reject cached variants whose recomputed camera rotvec is outside the canonical near-π range |
 | `--accept-max-abs-action-value` | `1e4` | Reject catastrophic non-camera action values before cache write |
 | `--retarget-algorithm` | config `data.meta_retarget_algorithm` | Retarget planner: `legacy_structured_min_rotation` or `wrist_pose_v2` |
+| `--retarget-robot-type` | config `data.meta_retarget_robot_type` | FK/IK robot helper, currently `xtrainer` or `aloha`; existing configs default to `xtrainer` |
 
 The builder writes accepted retargeted chunks to `variants/` and records them in `manifest.jsonl`.
 If IK or validation fails, it retries random perturbations up to `--max-attempts-per-variant`; failed
@@ -673,6 +674,13 @@ only for explicit new-planner ablations. Cache metadata records the algorithm; t
 does not reject, if a configured algorithm differs from an existing cache. Caches generated before
 this switch do not contain a `retarget_algorithm` field; they are treated as backward-compatible and
 will also emit only this warning, not a hard error.
+
+`data.meta_retarget_robot_type` selects the robot kinematics used by chunk-cache generation, beta
+pair-cache generation, and training-time online/sync beta pair retargeting. The default is `xtrainer`,
+so existing configs are unchanged. Use `--retarget-robot-type aloha` or
+`--overrides data.meta_retarget_robot_type=aloha` only for datasets whose 14D qpos follows the
+Robotwin ALOHA layout. Cache metadata records `robot_type`; training warns, but does not reject, when
+an existing cache was built with a different robot helper.
 
 Training-time sampling is independent from cache generation. The base `DataConfig` keeps retarget
 disabled by default, so old/non-meta training configs do not use this path. The x-trainer
@@ -778,7 +786,8 @@ python scripts/build_xtrainer_beta_pair_retarget_cache.py \
     --max-attempts-per-pair 4
 ```
 
-The beta pair-cache builder uses the same `data.meta_retarget_algorithm` default as training. In
+The beta pair-cache builder uses the same `data.meta_retarget_algorithm` and
+`data.meta_retarget_robot_type` defaults as training. In
 default same-tool mode it samples origin targets and same-tool imagine sources reconstructed from the
 chunk-level retarget cache. Pass `--source-retarget-cache-dir` explicitly, or let the builder use
 `data.meta_retarget_cache_dir`; as a local pipeline fallback it also checks

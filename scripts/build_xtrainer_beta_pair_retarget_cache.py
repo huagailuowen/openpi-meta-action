@@ -315,6 +315,7 @@ def main(
     accept_max_abs_action_value: float = 1e4,
     accept_max_camera_rotvec_norm_rad: float = 3.143,
     retarget_algorithm: str | None = None,
+    retarget_robot_type: str | None = None,
     same_tool_only: bool = True,
     source_retarget_cache_dir: str | None = None,
 ) -> None:
@@ -354,6 +355,12 @@ def main(
         raise ValueError(
             f"--retarget-algorithm must be one of {sorted(_retarget.SUPPORTED_RETARGET_ALGORITHMS)}, "
             f"got {effective_retarget_algorithm!r}"
+        )
+    effective_robot_type = retarget_robot_type or data_config.meta_retarget_robot_type
+    if effective_robot_type not in _retarget.SUPPORTED_RETARGET_ROBOT_TYPES:
+        raise ValueError(
+            f"--retarget-robot-type must be one of {sorted(_retarget.SUPPORTED_RETARGET_ROBOT_TYPES)}, "
+            f"got {effective_robot_type!r}"
         )
 
     action_horizon = data_config.data_action_horizon_override or train_config.model.action_horizon
@@ -395,10 +402,12 @@ def main(
             chunk_retarget_cache_dir,
             expected_action_space="delta" if delta_action_masks else "absolute",
             expected_retarget_algorithm=effective_retarget_algorithm,
+            expected_robot_type=effective_robot_type,
         )
 
     generator_config = _retarget.MetaRetargetGeneratorConfig(
         retarget_algorithm=effective_retarget_algorithm,
+        robot_type=effective_robot_type,
         future_near_mode_prob=future_near_mode_prob,
         future_near_window_frames=future_near_window_frames,
         future_near_transition_steps=future_near_transition_steps,
@@ -434,6 +443,7 @@ def main(
         "action_stride": action_stride,
         "cache_action_space": "delta" if delta_action_masks else "absolute",
         "retarget_algorithm": effective_retarget_algorithm,
+        "robot_type": effective_robot_type,
         "delta_action_masks": delta_action_masks_json,
         "max_meta_areas": max_meta_areas,
         "same_tool_only": bool(same_tool_only),
