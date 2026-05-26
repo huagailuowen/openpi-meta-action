@@ -184,6 +184,7 @@ def _make_dummy_reference_student_config(
     *,
     max_meta_areas: int = 3,
     reference_meta_output_slots: int = 1,
+    meta_reference_teacher_student_learning: bool = False,
 ) -> _pi0_config.Pi0Config:
     return _pi0_config.Pi0Config(
         pi05=True,
@@ -199,6 +200,7 @@ def _make_dummy_reference_student_config(
         reference_action_group_size=5,
         reference_action_dim=14,
         reference_current_state_dim=14,
+        meta_reference_teacher_student_learning=meta_reference_teacher_student_learning,
         paligemma_variant="dummy",
         action_expert_variant="dummy",
     )
@@ -206,6 +208,24 @@ def _make_dummy_reference_student_config(
 
 def test_pi05_meta_reference_student_compute_loss_terms_smoke():
     config = _make_dummy_reference_student_config()
+    model = config.create(jax.random.key(0))
+    obs = _make_dummy_beta_observation(
+        config,
+        condition_state=jnp.ones((1, config.action_dim), dtype=jnp.float32),
+        condition_tokenized_prompt=jnp.ones((1, config.max_token_len), dtype=jnp.int32),
+        condition_tokenized_prompt_mask=jnp.ones((1, config.max_token_len), dtype=jnp.bool_),
+    )
+    actions = jnp.zeros((1, config.action_horizon, config.action_dim), dtype=jnp.float32)
+
+    terms = model.compute_loss_terms(jax.random.key(1), obs, actions, train=False)
+
+    assert set(terms) == {"loss", "action_loss", "meta_loss", "contrastive_loss"}
+    assert terms["loss"].shape == (1, config.action_horizon)
+    assert jnp.all(jnp.isfinite(terms["loss"]))
+
+
+def test_pi05_meta_reference_student_teacher_student_loss_smoke():
+    config = _make_dummy_reference_student_config(meta_reference_teacher_student_learning=True)
     model = config.create(jax.random.key(0))
     obs = _make_dummy_beta_observation(
         config,

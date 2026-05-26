@@ -7,12 +7,12 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from openpi.models import gemma as _gemma
 from openpi.models import model as _model
-import openpi.models.gemma as _gemma
 from openpi.models import pi0_config
+from openpi.models import siglip as _siglip
 from openpi.models.pi0 import make_attn_mask
 from openpi.models.pi0_meta import Pi0Meta
-import openpi.models.siglip as _siglip
 from openpi.shared import array_typing as at
 
 
@@ -45,6 +45,7 @@ class Pi0MetaReferenceStudent(Pi0Meta):
         self.reference_current_state_dim = int(config.reference_current_state_dim)
         self.reference_meta_output_slots = int(config.reference_meta_output_slots)
         self.meta_contrastive_loss_weight = float(config.meta_contrastive_loss_weight)
+        self.reference_teacher_student_learning = bool(config.meta_reference_teacher_student_learning)
         if self.reference_action_dim <= 0 or self.reference_action_dim > config.action_dim:
             raise ValueError(
                 "Pi0MetaReferenceStudent requires 0 < reference_action_dim <= action_dim; "
@@ -198,6 +199,17 @@ class Pi0MetaReferenceStudent(Pi0Meta):
         encoded_meta_tokens = self._encode_reference_meta_tokens(observation)
         return old_meta_tokens.at[:, : self.reference_meta_replace_slots, :].set(encoded_meta_tokens)
 
+    def _execution_meta_observation(self, observation: _model.Observation) -> _model.Observation:
+        if observation.execution_meta_area_poses is None:
+            return observation
+        return dataclasses.replace(
+            observation,
+            meta_area_poses=observation.execution_meta_area_poses,
+            meta_area_dim_masks=observation.execution_meta_area_dim_masks,
+            meta_area_types=observation.execution_meta_area_types,
+            meta_area_masks=observation.execution_meta_area_masks,
+        )
+
     def _contrastive_meta_token_loss(
         self,
         observation: _model.Observation,
@@ -205,24 +217,14 @@ class Pi0MetaReferenceStudent(Pi0Meta):
     ) -> at.Array:
         if self.meta_contrastive_loss_weight <= 0.0:
             return jnp.zeros((observation.state.shape[0],), dtype=observation.state.dtype)
-        if observation.execution_meta_area_poses is not None:
-            teacher_obs = dataclasses.replace(
-                observation,
-                meta_area_poses=observation.execution_meta_area_poses,
-                meta_area_dim_masks=observation.execution_meta_area_dim_masks,
-                meta_area_types=observation.execution_meta_area_types,
-                meta_area_masks=observation.execution_meta_area_masks,
-            )
-        else:
-            teacher_obs = observation
+        teacher_obs = self._execution_meta_observation(observation)
         teacher_tokens, teacher_masks = self._build_meta_context_tokens(teacher_obs)
         teacher_tokens = jax.lax.stop_gradient(teacher_tokens)
         student_norm = student_tokens / jnp.maximum(jnp.linalg.norm(student_tokens, axis=-1, keepdims=True), 1e-6)
         teacher_norm = teacher_tokens / jnp.maximum(jnp.linalg.norm(teacher_tokens, axis=-1, keepdims=True), 1e-6)
         cosine_loss = 1.0 - jnp.sum(student_norm * teacher_norm, axis=-1)
         valid = teacher_masks.astype(jnp.bool_)
-        loss = jnp.sum(jnp.where(valid, cosine_loss, 0.0), axis=-1) / jnp.maximum(jnp.sum(valid, axis=-1), 1)
-        return loss
+        return jnp.sum(jnp.where(valid, cosine_loss, 0.0), axis=-1) / jnp.maximum(jnp.sum(valid, axis=-1), 1)
 
     def _build_external_meta_prefix(
         self,
@@ -323,16 +325,37 @@ class Pi0MetaReferenceStudent(Pi0Meta):
     def compute_loss_terms(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> dict[str, at.Array]:
-        preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        if self.reference_teacher_student_learning:
+            preprocess_rng, noise_rng, time_rng, teacher_rng = jax.random.split(rng, 4)
+        else:
+            preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+            teacher_rng = None
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
         observation = self._prepare_observation(observation)
 
-        batch_shape = actions.shape[:-2]
-        noise = self._mask_backbone_channels(jax.random.normal(noise_rng, actions.shape))
+        target_actions = actions
+        target_observation = observation
+        if self.reference_teacher_student_learning:
+            teacher_obs = self._execution_meta_observation(observation)
+            teacher_meta_tokens, _ = self._build_meta_context_tokens(teacher_obs)
+            teacher_outputs = self._sample_actions_with_aux_prepared(
+                teacher_rng,
+                teacher_obs,
+                teacher_meta_tokens,
+            )
+            target_actions = jax.lax.stop_gradient(teacher_outputs["actions"])
+            if observation.meta_action_target_poses is not None:
+                target_observation = dataclasses.replace(
+                    observation,
+                    meta_action_target_poses=jax.lax.stop_gradient(teacher_outputs["meta_actions"]),
+                )
+
+        batch_shape = target_actions.shape[:-2]
+        noise = self._mask_backbone_channels(jax.random.normal(noise_rng, target_actions.shape))
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
         time_expanded = time[..., None, None]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
+        x_t = time_expanded * noise + (1 - time_expanded) * target_actions
+        u_t = noise - target_actions
 
         meta_tokens = self._condition_meta_tokens(observation)
         contrastive_loss = self._contrastive_meta_token_loss(observation, meta_tokens)
@@ -367,7 +390,7 @@ class Pi0MetaReferenceStudent(Pi0Meta):
         prefix_for_meta = jax.lax.stop_gradient(prefix_out) if self.meta_stop_backbone_grad else prefix_out
         suffix_for_meta = jax.lax.stop_gradient(suffix_out) if self.meta_stop_backbone_grad else suffix_out
         meta_pred = self._decode_meta_actions(prefix_for_meta, suffix_for_meta)
-        meta_loss = self._meta_loss(observation, meta_pred)
+        meta_loss = self._meta_loss(target_observation, meta_pred)
         action_component = self.action_loss_weight * base_loss
         meta_component = self.meta_loss_weight * meta_loss
         contrastive_component = self.meta_contrastive_loss_weight * contrastive_loss[:, None]
@@ -396,6 +419,17 @@ class Pi0MetaReferenceStudent(Pi0Meta):
         observation = _model.preprocess_observation(None, observation, train=False)
         observation = self._prepare_observation(observation)
         meta_tokens = self._condition_meta_tokens(observation)
+        return self._sample_actions_with_aux_prepared(rng, observation, meta_tokens, num_steps=num_steps, noise=noise)
+
+    def _sample_actions_with_aux_prepared(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        meta_tokens: at.Float[at.Array, "b m emb"],
+        *,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+    ) -> dict[str, _model.Actions | at.Array]:
         prefix = self._build_external_meta_prefix(observation, meta_tokens)
         prefix_positions = jnp.cumsum(prefix.input_mask, axis=1) - 1
         prefix_outputs, kv_cache = self.PaliGemma.llm(

@@ -202,7 +202,11 @@ images, prompt+32D `condition_state` after the normal OpenPI tokenizer path, 14D
 plus the current chunk2 14D qpos anchor from `state[:14]`, and produces replacement meta tokens for the frozen structured executor. This makes reference
 conditioning a teacher/student adapter on top of the known-good structured policy instead of changing
 the executor itself. The optional beta3 contrastive token-alignment loss is available through
-`model.meta_contrastive_loss_weight`, but the current beta3 configs keep it at `0.0`.
+`model.meta_contrastive_loss_weight`, but the current beta3 configs keep it at `0.0`. A separate
+optional distillation mode, `model.meta_reference_teacher_student_learning`, defaults to `False`; when
+enabled, the frozen structured executor with direct execution meta-area tokens supplies the action and
+meta-action targets for the reference-student branch, while the existing beta3 sampling ratios and
+loss masks remain unchanged.
 
 Retarget cache supports the same structured fields. For 12D line/surface tools, if `approach3` is
 active, retargeting aligns the shape matrix and approach direction together instead of only
@@ -770,6 +774,8 @@ Beta3 preserves the frozen structured executor slot layout: `model.max_meta_area
 Reference conditioning replaces only the first `min(K, M)` meta tokens; remaining executor slots stay
 as the old structured model's default/empty slots. Retarget cache payloads are therefore padded into
 the leading slots instead of shrinking `M`-slot arrays.
+Set `--overrides model.meta_reference_teacher_student_learning=true` only for the beta3 teacher-student
+distillation variant; leaving it unset preserves the original dataset/pair-retarget supervision path.
 The analogous upper45/18type config is
 `pi05_xtrainer_meta_aux_structured_12d_delta_beta3_reference_black_ring_hookNewUpper45_60_stick10_18type_12D_classified_stride3`;
 override its `weight_loader` checkpoint path if a later structured backbone checkpoint is selected.

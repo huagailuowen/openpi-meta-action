@@ -77,6 +77,11 @@ class Pi0Config(_model.BaseModelConfig):
     # meta-area-conditioned refined meta tokens and reference-action-conditioned
     # refined meta tokens for the same chunk1/source observation.
     meta_contrastive_loss_weight: float = 0.0
+    # Beta3/reference-student distillation mode. When enabled, the frozen
+    # structured executor with direct execution meta-area tokens supplies the
+    # action/meta-action targets. When disabled, beta3 keeps the original
+    # supervised targets from the dataset/pair-retarget pipeline.
+    meta_reference_teacher_student_learning: bool = False
     # When True, stop gradients from the meta loss from flowing back into the shared
     # backbone (prefix_out / suffix_out). The meta head still receives full gradients
     # through its own new parameters. Recommended while loading from a pre-trained
